@@ -1,16 +1,17 @@
 # Lycoris 架构总览、开发计划与评测方案
 
-更新日期：2026-04-30
+更新日期：2026-05-01
 状态：架构草案 v1
 
 ## 1. 文档拆分
 
-本组文档现在拆成四层：
+本组文档现在拆成五层：
 
 - 总览与阶段计划：本文 [lycoris-architecture-plan.md](lycoris-architecture-plan.md)
 - 协议、数据模型与存储：见 [lycoris-protocol-and-storage.md](lycoris-protocol-and-storage.md)
 - shell 集成、git 检测、worktree 与 merge 生命周期：见 [lycoris-shell-worktree-lifecycle.md](lycoris-shell-worktree-lifecycle.md)
 - 长期记忆与技能树：见 [lycoris-memory-and-skill-tree.md](lycoris-memory-and-skill-tree.md)
+- 个人知识库与检索：见 [lycoris-knowledge-base-and-retrieval.md](lycoris-knowledge-base-and-retrieval.md)
 
 本文只保留：
 
@@ -31,7 +32,8 @@ Lycoris 是一个中心化 daemon 驱动的 AI agent 系统：
 - `engineering session` 面向 git 工程任务，拥有完整能力集，支持 run 内有界 sub-agent，并强制通过独立 worktree 工作与 merge-back 收口；
 - `general session` 面向非工程任务，是 engineering session 的受限子集；
 - Lycoris 维护两类长期记忆：面向 actor 的通用长期记忆，以及面向 project root 的项目路径长期记忆；
-- Lycoris 维护 skill tree，用长期记忆和历史操作频率发现可沉淀的技能，并在用户审核后写入 skill；
+- Lycoris 维护 skill tree，用长期记忆和历史操作频率发现可沉淀的技能；同时允许用户手动导入或下载 skill；
+- Lycoris 维护本地优先的个人知识库，允许用户主动添加信息来源、本地化、索引并在会话中按需检索；
 - 命令行调用遵循 Unix 哲学：一次调用只完成一件 task，task 结束后前端立即退出，长期状态靠磁盘持久化的 session 维持。
 
 ## 3. 不可变产品约束
@@ -55,7 +57,9 @@ Lycoris 是一个中心化 daemon 驱动的 AI agent 系统：
 13. sub-agent 只能作为 engineering run 内的有界子执行单元，不能成为第三类 session、常驻 worker 或默认自治 agent team。
 14. 通用长期记忆只能保存跨对话、跨项目长期有效的用户偏好、约束和重复模式，不能吸收大量临时对话信息。
 15. 项目路径长期记忆只能保存 project root 下长期有效的上下文、约定和工作流，不能吸收太具体的某次工程实现。
-16. skill tree 只能提出 skill candidate；真正写入 skill 必须经过用户审核。
+16. skill tree 只能提出 skill candidate；用户也可以手动导入或下载 skill；真正写入 installed skill 必须经过用户审核或显式确认。
+17. 个人知识库只能从用户主动添加或授权的 source 构建，source 必须先本地化再索引，索引是衍生层而不是事实来源。
+18. 临时对话可以判断并搜索个人知识库，但必须遵守 global / project scope、记录检索事件，并向用户展示来源引用。
 
 ## 4. 外部使用架构
 
@@ -69,7 +73,8 @@ Lycoris 是一个中心化 daemon 驱动的 AI agent 系统：
 - 管理权限审批、历史回放、attach、输入缓冲；
 - 管理 engineering run 内 sub-agent 的创建、收口、审计与资源边界；
 - 管理长期记忆的候选提取、检索、审核和写入；
-- 管理 skill tree 的频率统计、候选建议、用户审核和 skill 安装；
+- 管理 skill tree 的频率统计、候选建议、手动导入、下载、用户审核和 skill 安装；
+- 管理个人知识库 source 的添加、本地化、索引、刷新、删除和检索；
 - 管理 engineering session 的 repo、worktree、merge-back；
 - 将所有关键状态持久化到磁盘。
 
@@ -263,6 +268,12 @@ Lycoris 的长期记忆分两层：
 
 skill tree 用来发现“值得沉淀为 skill 的重复操作”，而不是自动生成隐藏能力。
 
+skill 的来源有三类：
+
+- 长期沉淀：由 skill tree 发现重复模式并生成 candidate。
+- 手动导入：用户从本地目录、压缩包或已有 skill 集合导入。
+- 下载安装：用户从 registry、URL 或 git repository 下载。
+
 skill tree 的输入包括：
 
 - 长期记忆中的重复偏好和工作流；
@@ -279,6 +290,31 @@ skill tree 的输出只能是 skill candidate。每个 candidate 必须说明：
 - 安全边界和验证方式是什么。
 
 用户审核通过后，Lycoris 才能把 candidate 写入 skill。拒绝或未审核的 candidate 只能留在候选区，不能被 runtime 当作已安装 skill 使用。
+
+手动导入和下载安装不需要先经过 skill tree，但必须有显式用户确认、来源记录、权限检查和安装事件。
+
+### 5.7 个人知识库边界
+
+个人知识库是用户主动添加的信息来源集合，形态接近 RAG，但必须本地优先。
+
+它的边界是：
+
+- source 必须由用户主动添加或授权获取。
+- 远程 source 必须先本地化，再解析、切 chunk 和索引。
+- 原始 source 本地副本是事实来源，搜索索引只是衍生层。
+- source 可以是 global scope，也可以绑定 project root。
+- general session 可以按需检索 global knowledge。
+- engineering session 可以检索 global knowledge 和匹配 project root 的 project knowledge。
+- project knowledge 不能在不匹配 project root 或未显式选择时泄漏到临时会话。
+- 检索结果必须带 source 引用和 chunk id。
+
+索引引擎必须可替换：
+
+- Phase 1 / Phase 2 可以用 `sqlite_fts` 做低依赖 fallback。
+- 本地嵌入式全文索引优先考虑 `tantivy`。
+- 需要独立服务和更复杂 ranking 时可考虑 `meilisearch`。
+
+知识库不能替代长期记忆。长期记忆保存 Lycoris 提炼出的稳定结论；知识库保存用户提供的资料和其本地索引。
 
 ## 6. engineering session 的 worktree 模型
 
@@ -459,6 +495,8 @@ sequenceDiagram
   见 [lycoris-shell-worktree-lifecycle.md](lycoris-shell-worktree-lifecycle.md)
 - 长期记忆分层、skill tree、skill candidate 审核：
   见 [lycoris-memory-and-skill-tree.md](lycoris-memory-and-skill-tree.md)
+- 个人知识库 source、本地化、索引与检索：
+  见 [lycoris-knowledge-base-and-retrieval.md](lycoris-knowledge-base-and-retrieval.md)
 
 这里仅保留实现约束：
 
@@ -493,6 +531,7 @@ sequenceDiagram
 - 开放基础 API；
 - 建立 session / run / history / attach 持久化；
 - 建立通用长期记忆、项目路径长期记忆和 skill candidate 的存储骨架；
+- 建立 knowledge source、local copy、chunk、index metadata 的存储骨架；
 - 建立 general session 的完整数据路径。
 
 验收：
@@ -502,6 +541,7 @@ sequenceDiagram
 - 可查询历史；
 - 可 attach 回放。
 - 可持久化 memory candidate 和 skill candidate，但不自动写入长期记忆或安装 skill。
+- 可记录 knowledge source metadata，但不要求完成全文索引。
 
 ### 12.3 Phase 2：shell integration 与 session 路由
 
@@ -579,7 +619,24 @@ sequenceDiagram
 - 同一项目路径下的 engineering session 能检索项目记忆；
 - skill candidate 只在用户审核后变成 installed skill。
 
-### 12.8 Phase 7：Web / Messenger 控制面
+### 12.8 Phase 7：个人知识库与本地检索
+
+目标：
+
+- 实现用户主动添加 knowledge source；
+- 实现 source 本地化、解析、chunk 和索引；
+- 抽象 `KnowledgeIndex`，支持 `sqlite_fts` fallback，并预留 `tantivy` / `meilisearch` backend；
+- 允许 general session 判断并检索 global personal knowledge；
+- 允许 engineering session 检索匹配 project root 的 project knowledge。
+
+验收：
+
+- source add 后有本地副本和可重建索引；
+- 检索结果包含 source 引用和 chunk id；
+- 临时会话能按需搜索个人知识库；
+- project knowledge 不会泄漏到不匹配 project root 的会话。
+
+### 12.9 Phase 8：Web / Messenger 控制面
 
 目标：
 
@@ -615,6 +672,10 @@ sequenceDiagram
 - `skill-tree`
   - 重复操作是否能生成 skill candidate
   - 未经用户审核的 candidate 是否不会变成 installed skill
+- `knowledge-base`
+  - 用户添加 source 后是否能本地化和索引
+  - 临时会话是否能按需搜索 global knowledge
+  - project knowledge 是否遵守 project root scope
 
 ### 13.2 engineering 专项
 
@@ -658,6 +719,8 @@ sequenceDiagram
 | subagent boundary correctness   | sub-agent 不越过 parent run 边界      | 100%                   |
 | memory admission precision      | 长期记忆写入是否足够克制              | >95%                   |
 | skill approval correctness      | skill 是否只在用户审核后安装          | 100%                   |
+| knowledge source locality       | source 检索是否基于本地副本           | 100%                   |
+| knowledge scope isolation       | project knowledge 是否正确隔离        | 100%                   |
 | idle AI worker count            | daemon 空闲时 AI worker 数量          | 0                      |
 
 ## 14. 最终结论
@@ -671,7 +734,8 @@ Lycoris 的外部使用架构应明确为：
 - engineering session 具备完整能力、run 内有界 sub-agent、独立 worktree、强制 commit + merge-back；
 - general session 是 engineering session 的受限子集；
 - 长期记忆分为 actor 级通用记忆和 project root 级项目路径记忆，并且都必须避免污染；
-- skill tree 只负责发现和建议高频操作，用户审核后才写入 skill；
+- skill 可以长期沉淀、手动导入或下载，安装必须经过用户审核或显式确认；
+- 个人知识库从用户添加的 source 本地化和索引而来，临时会话可以按 scope 检索；
 - CLI 一次只做一个 task，完成即退出；
 - 长期状态靠磁盘 session、历史查询、attach、输入缓冲来维持；
 - Web / Messenger 必须提供显式 session 管理命令，而不是只依赖自然语言。

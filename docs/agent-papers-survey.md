@@ -1,11 +1,12 @@
 # AI Agent 代表性论文调研
 
-更新日期：2026-04-30
+更新日期：2026-05-01
 
 本文只挑对 Lycoris 架构决策有直接帮助的论文，不追求“全收录”，重点关注以下四类问题：
 
 - agent 如何把“推理”与“执行”串起来；
 - 长会话、长任务如何做 memory / compaction / skills；
+- 用户知识库和 RAG 式检索如何补充 session 上下文；
 - multi-agent 到底是不是必须；
 - 如何评测真实 agent，而不是只评测静态问答能力。
 
@@ -22,7 +23,7 @@
 | 论文                                                             | 年份 | 关键贡献                                                  | 对 Lycoris 的启发                                                         |
 | ---------------------------------------------------------------- | ---- | --------------------------------------------------------- | ------------------------------------------------------------------------- |
 | Generative Agents: Interactive Simulacra of Human Behavior       | 2023 | 提出 observation、memory、reflection、planning 的分层结构 | Lycoris 应把原始事件、提炼摘要、当前计划拆开存，而不是混成一份上下文      |
-| Voyager: An Open-Ended Embodied Agent with Large Language Models | 2023 | 技能库、自动课程、长期积累能力                            | skills 应该由重复任务沉淀而来，但 Lycoris 必须加入用户审核门槛           |
+| Voyager: An Open-Ended Embodied Agent with Large Language Models | 2023 | 技能库、自动课程、长期积累能力                            | skills 可以由重复任务沉淀，也可以由用户导入/下载，但必须加入审核门槛     |
 | MemGPT: Towards LLMs as Operating Systems                        | 2023 | 用分层 memory 管理突破上下文窗口限制                      | Lycoris 的 session 存储应是“磁盘为真相，内存为窗口”，而不是反过来         |
 
 ## 3. 多代理与编排
@@ -75,7 +76,9 @@
 - 通用长期记忆只吸收跨场景稳定偏好，不能把临时对话大量写进去。
 - 项目路径长期记忆只吸收长期项目上下文，不能把某次工程实现的具体 patch 当成项目事实。
 - skills 更像可发现的能力目录，而不是神秘系统 prompt 的附录。
-- skill tree 应从长期记忆和重复操作频率中产生候选，并在用户审核后才写入 skill。
+- skill tree 应从长期记忆和重复操作频率中产生候选；手动导入和下载安装是并列来源，但都必须可审计。
+- 个人知识库应独立于长期记忆：长期记忆是提炼结论，知识库是用户主动添加的资料 source 和本地索引。
+- RAG 式检索应先本地化 source，再建立可重建索引；临时会话只按 scope 检索相关 chunk。
 
 ### 6.2 产品边界
 

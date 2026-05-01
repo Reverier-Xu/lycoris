@@ -1,6 +1,6 @@
 # Lycoris 协议、数据模型与存储设计
 
-更新日期：2026-04-30
+更新日期：2026-05-01
 状态：设计草案 v1
 
 ## 1. 文档范围
@@ -12,6 +12,7 @@
 - session / run / history / approval 如何持久化；
 - engineering run 内 sub-agent 如何建模和审计；
 - 通用长期记忆、项目路径长期记忆和 skill tree 如何持久化；
+- 个人知识库 source、本地副本、chunk 和索引如何持久化；
 - engineering session 和 general session 的能力边界如何在协议层落地。
 
 Shell 集成、git 检测、worktree 生命周期、merge-back 生命周期，见 [lycoris-shell-worktree-lifecycle.md](./lycoris-shell-worktree-lifecycle.md)。
@@ -28,6 +29,7 @@ Lycoris 的控制面必须满足以下原则：
 - sub-agent 是 engineering parent run 的 child run，不是独立 session，也不是外部前端可以直接驱动的常驻 agent。
 - 长期记忆和 skill tree 都必须由持久化事件和候选对象驱动，不能只存在于运行时 prompt。
 - skill 安装必须可审计，并且必须有用户审核事件。
+- 个人知识库必须 source-first，先本地化再索引，搜索索引不能成为唯一事实来源。
 
 ## 3. 对外协议
 
@@ -151,6 +153,27 @@ Lycoris 的控制面必须满足以下原则：
   - 查询已安装 skill。
 - `POST /v1/skills`
   - 写入用户审核后的 skill。
+- `POST /v1/skills/import`
+  - 从本地路径或压缩包导入 skill。
+- `POST /v1/skills/download`
+  - 从 registry、URL 或 git repository 下载 skill 到 staging，并等待确认安装。
+
+#### 3.2.7 个人知识库
+
+- `POST /v1/knowledge/sources`
+  - 添加用户授权的信息来源。
+- `GET /v1/knowledge/sources`
+  - 列出 knowledge source。
+- `GET /v1/knowledge/sources/{source_id}`
+  - 查看 source 元数据、本地化状态和索引状态。
+- `POST /v1/knowledge/sources/{source_id}/refresh`
+  - 按 fetch policy 刷新 source。
+- `DELETE /v1/knowledge/sources/{source_id}`
+  - 删除 source、本地副本、chunk 和索引条目。
+- `POST /v1/knowledge/index/rebuild`
+  - 重建索引。
+- `POST /v1/knowledge/search`
+  - 显式搜索个人知识库。
 
 ### 3.3 前端与协议的职责划分
 
@@ -470,6 +493,8 @@ installed skill 是用户审核后写入的技能资产。
   "project_id": "proj_123",
   "name": "rust-quality-gates",
   "path": "skills/projects/proj_123/rust-quality-gates/SKILL.md",
+  "origin": "generated",
+  "source_ref": "skillcand_123",
   "installed_from_candidate_id": "skillcand_123",
   "approved_by": "local:1000",
   "installed_at": "2026-05-01T02:00:00Z"
@@ -481,6 +506,102 @@ installed skill 是用户审核后写入的技能资产。
 - `global` skill 写入用户级 skill 目录。
 - `project` skill 写入项目级或 repo-local skill 目录。
 - skill 内容必须避免携带临时对话、大段日志、敏感信息和单次 patch 细节。
+- `origin` 可以是 `generated`、`local_import` 或 `remote_download`。
+
+### 4.15 KnowledgeSource
+
+用户主动添加的信息来源。
+
+```json
+{
+  "source_id": "ksrc_123",
+  "owner_actor_id": "local:1000",
+  "scope": "project",
+  "project_id": "proj_123",
+  "source_kind": "url",
+  "original_ref": "https://example.com/docs",
+  "local_ref": "knowledge/sources/ksrc_123/snapshot",
+  "fetch_policy": "manual",
+  "index_policy": "full_text",
+  "status": "indexed",
+  "created_at": "2026-05-01T02:00:00Z",
+  "last_indexed_at": "2026-05-01T02:05:00Z"
+}
+```
+
+### 4.16 KnowledgeDocument
+
+source 本地化后的文档单位。
+
+```json
+{
+  "document_id": "kdoc_123",
+  "source_id": "ksrc_123",
+  "local_path": "knowledge/sources/ksrc_123/documents/page.md",
+  "content_hash": "sha256:...",
+  "mime_type": "text/markdown",
+  "title": "project deployment notes",
+  "created_at": "2026-05-01T02:03:00Z"
+}
+```
+
+### 4.17 KnowledgeChunk
+
+索引和检索使用的 chunk。
+
+```json
+{
+  "chunk_id": "kchunk_123",
+  "document_id": "kdoc_123",
+  "source_id": "ksrc_123",
+  "ordinal": 12,
+  "text_ref": "knowledge/chunks/kchunk_123.txt",
+  "metadata": {
+    "heading": "deployment",
+    "path": "docs/deploy.md"
+  }
+}
+```
+
+### 4.18 KnowledgeIndex
+
+索引 backend 的元数据。
+
+```json
+{
+  "index_id": "kidx_123",
+  "backend": "tantivy",
+  "scope": "project",
+  "project_id": "proj_123",
+  "path": "knowledge/indexes/kidx_123",
+  "status": "ready",
+  "last_built_at": "2026-05-01T02:05:00Z"
+}
+```
+
+backend 候选：
+
+- `sqlite_fts`
+- `tantivy`
+- `meilisearch`
+
+### 4.19 KnowledgeSearchResult
+
+检索结果必须保留来源引用。
+
+```json
+{
+  "chunk_id": "kchunk_123",
+  "source_id": "ksrc_123",
+  "document_id": "kdoc_123",
+  "score": 0.84,
+  "snippet": "deployment uses the internal release checklist",
+  "citation": {
+    "title": "project deployment notes",
+    "local_ref": "knowledge/sources/ksrc_123/documents/page.md"
+  }
+}
+```
 
 ## 5. 事件流模型
 
@@ -514,7 +635,16 @@ Lycoris 必须把 attach 和历史查询统一建立在事件流之上。
 - `skill.pattern_observed`
 - `skill.candidate_created`
 - `skill.candidate_resolved`
+- `skill.imported`
+- `skill.downloaded`
 - `skill.installed`
+- `knowledge.source_created`
+- `knowledge.source_localized`
+- `knowledge.index_started`
+- `knowledge.indexed`
+- `knowledge.search_requested`
+- `knowledge.search_completed`
+- `knowledge.source_removed`
 - `merge.started`
 - `merge.completed`
 - `merge.blocked`
@@ -564,6 +694,14 @@ skill tree 额外支持：
 - 按审核状态查询 skill candidate
 - 按 installed skill 查询来源 candidate 和审核事件
 
+个人知识库额外支持：
+
+- 按 actor 查询 global knowledge source
+- 按 project root 查询 project knowledge source
+- 按 source kind 查询 source
+- 按 source / document / chunk 查询索引状态
+- 按 session / run 查询知识库检索事件
+
 ## 7. 存储布局
 
 ```text
@@ -584,6 +722,14 @@ $XDG_STATE_HOME/lycoris/
       skills/
         <skill-name>/
           SKILL.md
+      knowledge/
+        sources/
+          <source-id>/
+            source.json
+            documents/
+            chunks/
+        indexes/
+          <index-id>/
   projects/
     <project-id>/
       project.json
@@ -598,6 +744,14 @@ $XDG_STATE_HOME/lycoris/
       skills/
         <skill-name>/
           SKILL.md
+      knowledge/
+        sources/
+          <source-id>/
+            source.json
+            documents/
+            chunks/
+        indexes/
+          <index-id>/
   repos/
     <repo-id>/
       repo.json
@@ -637,6 +791,7 @@ $XDG_STATE_HOME/lycoris/
     runs.sqlite
     memory.sqlite
     skills.sqlite
+    knowledge.sqlite
 ```
 
 ### 7.1 哪些是事实来源
@@ -658,6 +813,12 @@ $XDG_STATE_HOME/lycoris/
 - `projects/*/skill-tree/candidates.jsonl`
 - `actors/*/skill-tree/installed.jsonl`
 - `projects/*/skill-tree/installed.jsonl`
+- `actors/*/knowledge/sources/*/source.json`
+- `projects/*/knowledge/sources/*/source.json`
+- `actors/*/knowledge/sources/*/documents/*`
+- `projects/*/knowledge/sources/*/documents/*`
+- `actors/*/knowledge/sources/*/chunks/*`
+- `projects/*/knowledge/sources/*/chunks/*`
 
 衍生层：
 
@@ -667,6 +828,8 @@ $XDG_STATE_HOME/lycoris/
 - `projects/*/memory/summaries.jsonl`
 - `actors/*/skill-tree/patterns.jsonl`
 - `projects/*/skill-tree/patterns.jsonl`
+- `actors/*/knowledge/indexes/*`
+- `projects/*/knowledge/indexes/*`
 - `indexes/*.sqlite`
 
 ### 7.2 为什么不是纯数据库
@@ -703,6 +866,9 @@ $XDG_STATE_HOME/lycoris/
 | 项目路径记忆   | 读取 / 候选写入  | 显式绑定后读取     |
 | skill tree     | 观察 / 建议      | 观察 / 建议        |
 | skill 安装     | 用户审核后       | 用户审核后         |
+| skill 导入/下载 | 显式确认         | 显式确认           |
+| global knowledge | 读取 / 检索      | 读取 / 检索        |
+| project knowledge | 匹配项目后检索  | 显式绑定后检索     |
 
 ### 8.3 强约束
 
@@ -713,6 +879,9 @@ $XDG_STATE_HOME/lycoris/
 - 通用长期记忆不能写入大量临时对话信息。
 - 项目路径长期记忆不能写入太具体的单次工程实现。
 - skill candidate 未经用户审核不能进入 installed skill。
+- 手动导入和远程下载的 skill 未经显式确认不能启用。
+- knowledge source 必须由用户主动添加或授权。
+- knowledge search 必须遵守 global / project scope，并记录检索事件。
 - 超出默认作用域的读取和高风险操作必须可审批、可审计。
 
 ## 9. 协议层测试建议
@@ -749,11 +918,22 @@ $XDG_STATE_HOME/lycoris/
 - memory candidate 是否能追溯到 source run；
 - rejected memory candidate 是否不会写入 long-term memory；
 - skill candidate 是否只来自频率信号或用户显式要求；
+- local import / remote download skill 是否记录 origin 和 source ref；
 - installed skill 是否总有审核事件；
 - 未审核 skill candidate 是否不会被 runtime 发现为可用 skill。
+
+### 9.6 个人知识库
+
+- knowledge source 是否先本地化再 index；
+- index 是否能从 source local copy 重建；
+- 删除 source 是否清理 document、chunk 和 index；
+- general session 是否只默认检索 global knowledge；
+- project knowledge 是否只在 project root 匹配或显式绑定时检索；
+- search result 是否总带 source、document 和 chunk 引用。
 
 ## 10. 与其他文档的关系
 
 - 产品总览与阶段计划：见 [lycoris-architecture-plan.md](lycoris-architecture-plan.md)
 - shell 集成、git 检测、worktree、merge 生命周期：见 [lycoris-shell-worktree-lifecycle.md](lycoris-shell-worktree-lifecycle.md)
 - 长期记忆分层与技能树流程：见 [lycoris-memory-and-skill-tree.md](lycoris-memory-and-skill-tree.md)
+- 个人知识库与检索：见 [lycoris-knowledge-base-and-retrieval.md](lycoris-knowledge-base-and-retrieval.md)

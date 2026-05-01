@@ -1,6 +1,6 @@
 # AI Agent 架构调研：Codex、OpenCode、OpenClaw
 
-更新日期：2026-04-30
+更新日期：2026-05-01
 
 ## 1. 结论先行
 
@@ -110,7 +110,8 @@
 - engineering session 需要支持 parent run 内的有界 sub-agent，以覆盖代码探索、分片实现、验证和复核等真实工程需求。
 - sub-agent 必须继承 parent run 的 worktree、权限、事件流和终止条件，不能拥有独立 session 生命周期。
 - 长期记忆应分为 actor 级通用记忆和 project root 级项目路径记忆，分别服务跨项目偏好和项目上下文。
-- skill tree 应从长期记忆与重复操作频率中发现 skill candidate，但安装 skill 必须经过用户审核。
+- skill 可以来自长期沉淀、手动导入或下载；skill tree 只负责从长期记忆与重复操作频率中发现 candidate。
+- 个人知识库应作为用户主动添加 source 的本地化检索层，使用可替换索引 backend 支撑临时会话搜索。
 - session 要直接存盘，最好是可检查、可 replay、可 rebuild index 的文件优先结构。
 - run 必须独立于 shell 进程生命周期。
 - 自动 session 选择必须可解释、可覆盖、可回退，并且能够把同一工作线程上的多次交互长期归并到同一 session。
