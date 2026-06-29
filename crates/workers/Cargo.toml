@@ -1,5 +1,5 @@
 [package]
-name = "lycoris-messenger"
+name = "lycoris-workers"
 
 authors.workspace      = true
 description.workspace  = true

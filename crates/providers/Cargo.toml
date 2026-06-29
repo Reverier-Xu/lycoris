@@ -1,5 +1,5 @@
 [package]
-name = "lycoris-web"
+name = "lycoris-providers"
 
 authors.workspace      = true
 description.workspace  = true

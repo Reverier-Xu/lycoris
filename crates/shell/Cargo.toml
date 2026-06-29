@@ -1,5 +1,5 @@
 [package]
-name = "lycoris-shell"
+name = "lycoris"
 
 authors.workspace      = true
 description.workspace  = true
@@ -12,3 +12,7 @@ rust-version.workspace = true
 version.workspace      = true
 
 [dependencies]
+clap.workspace       = true
+owo-colors.workspace = true
+thiserror.workspace  = true
+tracing.workspace    = true
