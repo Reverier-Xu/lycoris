@@ -1,0 +1,22 @@
+[Unit]
+Description=Lycoris server daemon (user)
+Documentation=https://lycoris.woooo.tech
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/lycoris-daemon --config %h/.config/lycoris/lycoris.toml
+WorkingDirectory=%h/.local/share/lycoris
+
+Restart=on-failure
+RestartSec=5s
+StartLimitInterval=60s
+StartLimitBurst=3
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lycoris-server
+
+[Install]
+WantedBy=default.target
