@@ -1,0 +1,78 @@
+syntax = "proto3";
+
+package lycoris.daemon;
+
+service Cluster {
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
+  rpc SetPrimaryEndpoint(SetPrimaryEndpointRequest) returns (SetPrimaryEndpointResponse);
+}
+
+service Sync {
+  rpc SyncNodes(SyncNodesRequest) returns (SyncNodesResponse);
+  rpc PushNode(PushNodeRequest) returns (PushNodeResponse);
+}
+
+message NodeInfo {
+  string id = 1;
+  string address = 2;
+  map<string, string> labels = 3;
+  map<string, string> annotations = 4;
+  int64 last_heartbeat_unix_ms = 5;
+}
+
+message RegisterRequest {
+  NodeInfo info = 1;
+}
+
+message RegisterResponse {
+  bool accepted = 1;
+  string reason = 2;
+}
+
+message HeartbeatRequest {
+  string node_id = 1;
+  NodeInfo info = 2;
+}
+
+message HeartbeatResponse {
+  bool accepted = 1;
+  string reason = 2;
+}
+
+message ListNodesRequest {
+  // Optional label selector. Empty means "all alive nodes".
+  map<string, string> selector = 1;
+}
+
+message ListNodesResponse {
+  repeated NodeInfo nodes = 1;
+}
+
+message SyncNodesRequest {
+  repeated NodeInfo nodes = 1;
+}
+
+message SyncNodesResponse {
+  repeated NodeInfo nodes = 1;
+}
+
+message PushNodeRequest {
+  NodeInfo info = 1;
+  string origin_node_id = 2;
+  uint64 sequence = 3;
+}
+
+message PushNodeResponse {
+  bool accepted = 1;
+}
+
+message SetPrimaryEndpointRequest {
+  string address = 1;
+}
+
+message SetPrimaryEndpointResponse {
+  bool accepted = 1;
+  string reason = 2;
+}

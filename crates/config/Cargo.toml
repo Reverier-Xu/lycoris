@@ -1,5 +1,5 @@
 [package]
-name = "lycoris-clients"
+name = "lycoris-config"
 
 authors.workspace      = true
 description.workspace  = true
@@ -12,3 +12,9 @@ rust-version.workspace = true
 version.workspace      = true
 
 [dependencies]
+serde     = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+toml      = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

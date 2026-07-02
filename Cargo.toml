@@ -20,8 +20,24 @@ opt-level     = "z"
 strip         = true
 
 [workspace.dependencies]
-clap       = "4.6"
-owo-colors = "4.3"
-thiserror  = "2.0"
-tokio      = { version = "1.52", features = ["full"] }
-tracing    = "0.1"
+anyhow        = "1.0"
+clap          = "4.6"
+dashmap       = "6.1"
+lycoris-api    = { path = "crates/api" }
+lycoris-config = { path = "crates/config" }
+owo-colors    = "4.3"
+prost         = "0.13"
+rcgen         = "0.13"
+rusqlite      = { version = "0.34", features = ["bundled"] }
+rustls        = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2.2"
+serde         = { version = "1.0", features = ["derive"] }
+tempfile      = "3.27"
+thiserror     = "2.0"
+tokio         = { version = "1.52", features = ["full"] }
+tokio-rustls  = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+toml          = "0.8"
+tonic         = { version = "0.13", features = ["tls-ring"] }
+tonic-build   = "0.13"
+tracing       = "0.1"
+tracing-subscriber = "0.3"
