@@ -16,6 +16,13 @@ pub enum Command {
   /// Query cluster information.
   #[command(subcommand)]
   Cluster(ClusterCommand),
+
+  /// Install lycoris-server as a user-mode systemd service.
+  Setup {
+    /// Name of the server binary to look for next to the lycoris binary.
+    #[arg(long, default_value = "lycoris-server")]
+    binary_name: String,
+  },
 }
 
 #[derive(Subcommand, Debug)]

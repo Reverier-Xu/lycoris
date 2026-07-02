@@ -599,6 +599,7 @@ dependencies = [
  "owo-colors",
  "rustls",
  "serde",
+ "tempfile",
  "thiserror",
  "tokio",
  "toml",

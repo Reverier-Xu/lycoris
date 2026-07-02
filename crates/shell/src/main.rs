@@ -14,10 +14,10 @@ fn main() -> anyhow::Result<()> {
   tracing_subscriber::fmt::init();
 
   let cli = Cli::parse();
-  let runtime = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
 
   match cli.command {
     Command::Cluster(cluster) => {
+      let runtime = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
       let client_config = load_client_config().with_context(
         || "failed to load client configuration; run a local daemon or create a client config",
       )?;
@@ -29,6 +29,7 @@ fn main() -> anyhow::Result<()> {
         }
       })?;
     }
+    Command::Setup { binary_name } => commands::setup::run(&binary_name)?,
   }
 
   Ok(())
