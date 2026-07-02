@@ -5,13 +5,12 @@ lycoris server daemon as a persistent system service, either system-wide or
 per-user.
 
 > The server binary produced by this repository is named `lycoris-daemon`. The
-> service itself is named `lycoris-server.service` to match the common role of the
-> daemon.
+> systemd service itself is named `lycoris.service`.
 
 ## Files
 
-- `lycoris-server.service` — system-wide systemd unit file.
-- `lycoris-server.user.service` — per-user systemd unit file.
+- `lycoris.service` — system-wide systemd unit file.
+- `lycoris.user.service` — per-user systemd unit file.
 - `install.sh` — convenience installer that supports both modes.
 
 ## System-wide Install
@@ -33,8 +32,8 @@ per-user.
 4. Start and inspect the service:
 
    ```bash
-   sudo systemctl start lycoris-server
-   sudo systemctl status lycoris-server
+   sudo systemctl start lycoris
+   sudo systemctl status lycoris
    ```
 
 The installer creates a dedicated `lycoris` system user, the configuration
@@ -62,12 +61,12 @@ root privileges.
 4. Start and inspect the service:
 
    ```bash
-   systemctl --user start lycoris-server
-   systemctl --user status lycoris-server
+   systemctl --user start lycoris
+   systemctl --user status lycoris
    ```
 
 The installer places the binary in `~/.local/bin`, the unit file in
-`~/.config/systemd/user/lycoris-server.service`, and creates the configuration
+`~/.config/systemd/user/lycoris.service`, and creates the configuration
 and data directories under `~/.config/lycoris` and `~/.local/share/lycoris`.
 
 If you want the service to start automatically on login, make sure your user
@@ -78,8 +77,8 @@ systemd instance is enabled (this is the default on most modern distributions).
 If you prefer to install manually, copy the appropriate unit file to the correct
 systemd directory:
 
-- System: `/etc/systemd/system/lycoris-server.service`
-- User: `~/.config/systemd/user/lycoris-server.service`
+- System: `/etc/systemd/system/lycoris.service`
+- User: `~/.config/systemd/user/lycoris.service`
 
 Adjust the following paths as needed:
 
@@ -93,27 +92,27 @@ After editing, reload systemd and enable the service:
 ```bash
 # system mode
 sudo systemctl daemon-reload
-sudo systemctl enable --now lycoris-server
+sudo systemctl enable --now lycoris
 
 # user mode
 systemctl --user daemon-reload
-systemctl --user enable --now lycoris-server
+systemctl --user enable --now lycoris
 ```
 
 ## Service Management
 
 ```bash
 # system mode
-sudo systemctl start lycoris-server
-sudo systemctl stop lycoris-server
-sudo systemctl restart lycoris-server
-sudo journalctl -u lycoris-server -f
+sudo systemctl start lycoris
+sudo systemctl stop lycoris
+sudo systemctl restart lycoris
+sudo journalctl -u lycoris -f
 
 # user mode
-systemctl --user start lycoris-server
-systemctl --user stop lycoris-server
-systemctl --user restart lycoris-server
-journalctl --user -u lycoris-server -f
+systemctl --user start lycoris
+systemctl --user stop lycoris
+systemctl --user restart lycoris
+journalctl --user -u lycoris -f
 ```
 
 ## Hardening

@@ -4,7 +4,7 @@ set -euo pipefail
 # Install lycoris-server as a systemd service.
 # Supports both system-wide (root) and per-user (--user) installations.
 
-SERVICE_NAME="lycoris-server"
+SERVICE_NAME="lycoris"
 BINARY_NAME="lycoris-daemon"
 
 user_mode=false
@@ -48,7 +48,7 @@ if [[ "${user_mode}" == true ]]; then
   config_dir="${home}/.config/lycoris"
   data_dir="${home}/.local/share/lycoris"
   systemd_user_dir="${home}/.config/systemd/user"
-  service_file="lycoris-server.user.service"
+  service_file="lycoris.user.service"
   systemd_args=("--user")
 else
   if [[ "$(id -u)" -ne 0 ]]; then
@@ -60,7 +60,7 @@ else
   config_dir="/etc/lycoris"
   data_dir="/var/lib/lycoris"
   systemd_user_dir="/etc/systemd/system"
-  service_file="lycoris-server.service"
+  service_file="lycoris.service"
   systemd_args=()
 fi
 
@@ -110,14 +110,14 @@ systemctl "${systemd_args[@]}" enable "${SERVICE_NAME}.service"
 
 echo ""
 if [[ "${user_mode}" == true ]]; then
-  echo "lycoris-server has been installed as a user-mode systemd service."
+  echo "lycoris has been installed as a user-mode systemd service."
   echo ""
   echo "next steps:"
   echo "  1. create or edit the daemon configuration at ${config_dir}/lycoris.toml"
   echo "  2. run: systemctl --user start ${SERVICE_NAME}.service"
   echo "  3. check status with: systemctl --user status ${SERVICE_NAME}.service"
 else
-  echo "lycoris-server has been installed as a system-wide systemd service."
+  echo "lycoris has been installed as a system-wide systemd service."
   echo ""
   echo "next steps:"
   echo "  1. create or edit the daemon configuration at ${config_dir}/lycoris.toml"

@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, bail};
 
-const SERVICE_NAME: &str = "lycoris-server";
+const SERVICE_NAME: &str = "lycoris";
 const DEFAULT_CONFIG_NAME: &str = "lycoris.toml";
 
 /// Install `lycoris-server` as a user-mode systemd service.
@@ -178,11 +178,11 @@ mod tests {
     )
     .unwrap();
 
-    assert!(systemd_dir.join("lycoris-server.service").is_file());
+    assert!(systemd_dir.join("lycoris.service").is_file());
     assert!(config_dir.is_dir());
     assert!(data_dir.is_dir());
 
-    let content = fs::read_to_string(systemd_dir.join("lycoris-server.service")).unwrap();
+    let content = fs::read_to_string(systemd_dir.join("lycoris.service")).unwrap();
     assert!(content.contains(&format!("ExecStart=\"{}\"", server_binary.display())));
     assert!(content.contains("WorkingDirectory=%h/.local/share/lycoris"));
     assert!(content.contains("--config \"%h/.config/lycoris/lycoris.toml\""));

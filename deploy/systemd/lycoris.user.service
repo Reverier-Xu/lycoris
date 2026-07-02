@@ -16,7 +16,7 @@ StartLimitBurst=3
 
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=lycoris-server
+SyslogIdentifier=lycoris
 
 [Install]
 WantedBy=default.target

@@ -20,7 +20,7 @@ StartLimitBurst=3
 # Logging
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=lycoris-server
+SyslogIdentifier=lycoris
 
 # Security hardening
 NoNewPrivileges=true
