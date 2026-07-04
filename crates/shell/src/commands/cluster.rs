@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use anyhow::Context;
 use lycoris_api::{ClusterRpcClient, tls::load_client_tls};
-use lycoris_config::ClientConfig;
+use lycoris_config::{ClientConfig, NodeInfo};
 use owo_colors::OwoColorize;
 
 pub async fn list_nodes(client_config: &ClientConfig, selectors: &[String]) -> anyhow::Result<()> {
@@ -35,6 +35,55 @@ pub async fn list_nodes(client_config: &ClientConfig, selectors: &[String]) -> a
   }
   println!("total: {}", response.nodes.len());
   Ok(())
+}
+
+pub async fn register(
+  client_config: &ClientConfig, id: String, address: String,
+) -> anyhow::Result<()> {
+  let tls = load_client_tls(
+    &client_config.cert,
+    &client_config.key,
+    &client_config.ca_cert,
+  )
+  .with_context(|| "failed to load client TLS material")?;
+  let client = ClusterRpcClient::connect(&client_config.api_address, tls)
+    .await
+    .with_context(|| format!("failed to connect to {}", client_config.api_address))?;
+
+  let node = SimpleNode {
+    id: id.clone(),
+    address,
+  };
+  client
+    .register(&node)
+    .await
+    .context("failed to register node")?;
+  println!("registered node {}", id.cyan());
+  Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct SimpleNode {
+  id: String,
+  address: String,
+}
+
+impl NodeInfo for SimpleNode {
+  fn id(&self) -> &str {
+    &self.id
+  }
+
+  fn address(&self) -> &str {
+    &self.address
+  }
+
+  fn labels(&self) -> HashMap<String, String> {
+    HashMap::new()
+  }
+
+  fn annotations(&self) -> HashMap<String, String> {
+    HashMap::new()
+  }
 }
 
 fn parse_selectors(raw: &[String]) -> anyhow::Result<HashMap<String, String>> {

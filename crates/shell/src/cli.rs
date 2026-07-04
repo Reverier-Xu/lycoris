@@ -34,4 +34,13 @@ pub enum ClusterCommand {
     #[arg(long = "selector", value_name = "KEY=VALUE")]
     selectors: Vec<String>,
   },
+  /// Register a new node with the cluster.
+  Register {
+    /// Unique node id.
+    #[arg(long)]
+    id: String,
+    /// Node address in host:port form.
+    #[arg(long)]
+    address: String,
+  },
 }

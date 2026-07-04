@@ -29,6 +29,9 @@ fn main() -> anyhow::Result<()> {
           ClusterCommand::Nodes { selectors } => {
             commands::cluster::list_nodes(&client_config, &selectors).await
           }
+          ClusterCommand::Register { id, address } => {
+            commands::cluster::register(&client_config, id, address).await
+          }
         }
       })?;
     }
