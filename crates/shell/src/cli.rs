@@ -18,6 +18,7 @@ pub enum Command {
   Cluster(ClusterCommand),
 
   /// Install lycoris-server as a user-mode systemd service.
+  #[cfg(target_os = "linux")]
   Setup {
     /// Name of the server binary to look for next to the lycoris binary.
     #[arg(long, default_value = "lycoris-server")]
