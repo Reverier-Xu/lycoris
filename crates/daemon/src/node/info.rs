@@ -1,19 +1,18 @@
 use std::{collections::HashMap, sync::Arc};
 
 use lycoris_config::{NodeConfig, NodeInfo};
-
-use crate::storage::Storage;
+use lycoris_storage::ClusterStorage;
 
 /// The local node representation built from configuration and dynamic storage.
 #[derive(Debug, Clone)]
 pub struct LocalNode {
   id: String,
   address: String,
-  storage: Arc<Storage>,
+  storage: Arc<ClusterStorage>,
 }
 
 impl LocalNode {
-  pub fn from_config(config: &NodeConfig, storage: Storage) -> Self {
+  pub fn from_config(config: &NodeConfig, storage: ClusterStorage) -> Self {
     Self {
       id: config.id.clone(),
       address: config.address.clone(),
@@ -49,7 +48,7 @@ mod tests {
   #[test]
   fn local_node_from_config_and_storage() {
     let dir = TempDir::new().unwrap();
-    let storage = Storage::open(dir.path().join("node.db")).unwrap();
+    let storage = ClusterStorage::open(dir.path().join("node.db")).unwrap();
     storage.set_local_label("arch", "x86_64").unwrap();
 
     let config = NodeConfig {

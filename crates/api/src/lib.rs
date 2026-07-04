@@ -25,9 +25,11 @@ pub fn install_crypto_provider() -> Result<(), std::sync::Arc<rustls::crypto::Cr
 }
 
 use proto::{
-  HeartbeatRequest, ListNodesRequest, ListNodesResponse, NodeInfo as ProtoNodeInfo,
-  PushNodeRequest, RegisterRequest, SetPrimaryEndpointRequest, SyncNodesRequest, SyncNodesResponse,
-  cluster_client::ClusterClient, sync_client::SyncClient,
+  FetchRegistersRequest, GossipMessage, GossipResponse, HeartbeatRequest, LeafHash,
+  ListNodesRequest, ListNodesResponse, MerkleRootRequest, NodeInfo as ProtoNodeInfo, ProbeRequest,
+  ProbeResponse, PushNodeRequest, PushRegistersRequest, RegisterRequest, SetPrimaryEndpointRequest,
+  SyncNodesRequest, SyncNodesResponse, cluster_client::ClusterClient,
+  membership_client::MembershipClient, sync_client::SyncClient,
 };
 
 impl NodeInfo for ProtoNodeInfo {
@@ -159,16 +161,73 @@ impl SyncRpcClient {
 }
 
 #[derive(Debug, Clone)]
+pub struct MembershipRpcClient {
+  inner: Arc<Mutex<MembershipClient<Channel>>>,
+}
+
+impl MembershipRpcClient {
+  pub async fn connect(address: &str, tls: ClientTlsConfig) -> Result<Self, ClusterClientError> {
+    let endpoint = Channel::from_shared(address.to_string())?
+      .tls_config(tls)?
+      .connect_timeout(Duration::from_secs(5));
+    let channel = endpoint.connect().await?;
+    Ok(Self {
+      inner: Arc::new(Mutex::new(MembershipClient::new(channel))),
+    })
+  }
+
+  pub async fn probe(&self, seq: u64, target: &str) -> Result<ProbeResponse, ClusterClientError> {
+    let request = Request::new(ProbeRequest {
+      seq,
+      target: target.to_string(),
+    });
+    let response = self.inner.lock().await.probe(request).await?;
+    Ok(response.into_inner())
+  }
+
+  pub async fn fetch_registers(
+    &self, node_ids: Vec<String>,
+  ) -> Result<Vec<ProtoNodeInfo>, ClusterClientError> {
+    let request = Request::new(FetchRegistersRequest { node_ids });
+    let response = self.inner.lock().await.fetch_registers(request).await?;
+    Ok(response.into_inner().registers)
+  }
+
+  pub async fn merkle_root(&self) -> Result<(Vec<u8>, Vec<LeafHash>), ClusterClientError> {
+    let request = Request::new(MerkleRootRequest {});
+    let response = self.inner.lock().await.merkle_root(request).await?;
+    let inner = response.into_inner();
+    Ok((inner.root_hash, inner.leaf_hashes))
+  }
+
+  pub async fn push_registers(
+    &self, registers: Vec<ProtoNodeInfo>,
+  ) -> Result<Vec<ProtoNodeInfo>, ClusterClientError> {
+    let request = Request::new(PushRegistersRequest { registers });
+    let response = self.inner.lock().await.push_registers(request).await?;
+    Ok(response.into_inner().registers)
+  }
+
+  pub async fn gossip(&self, message: GossipMessage) -> Result<GossipResponse, ClusterClientError> {
+    let request = Request::new(message);
+    let response = self.inner.lock().await.gossip(request).await?;
+    Ok(response.into_inner())
+  }
+}
+
+#[derive(Debug, Clone)]
 pub struct PeerClient {
   pub cluster: ClusterRpcClient,
   pub sync: SyncRpcClient,
+  pub membership: MembershipRpcClient,
 }
 
 impl PeerClient {
   pub async fn connect(address: &str, tls: ClientTlsConfig) -> Result<Self, ClusterClientError> {
     Ok(Self {
       cluster: ClusterRpcClient::connect(address, tls.clone()).await?,
-      sync: SyncRpcClient::connect(address, tls).await?,
+      sync: SyncRpcClient::connect(address, tls.clone()).await?,
+      membership: MembershipRpcClient::connect(address, tls).await?,
     })
   }
 }
@@ -180,6 +239,9 @@ fn proto_from_node<T: NodeInfo>(node: &T) -> ProtoNodeInfo {
     labels: node.labels(),
     annotations: node.annotations(),
     last_heartbeat_unix_ms: now_ms(),
+    state: "active".to_string(),
+    incarnation: 1,
+    heartbeat: 0,
   }
 }
 

@@ -2,7 +2,8 @@ use std::{collections::HashMap, time::Duration};
 
 use lycoris_api::{ClusterRpcClient, tls::load_client_tls};
 use lycoris_config::NodeConfig;
-use lycoris_daemon::{node::info::LocalNode, storage::Storage};
+use lycoris_daemon::node::info::LocalNode;
+use lycoris_storage::ClusterStorage;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -30,7 +31,7 @@ async fn main() -> anyhow::Result<()> {
   let client = ClusterRpcClient::connect(register_addr, tls.clone()).await?;
   let storage_dir = std::env::temp_dir().join(format!("lycoris-client-{expected_id}"));
   std::fs::create_dir_all(&storage_dir)?;
-  let storage = Storage::open(storage_dir.join("client.db"))?;
+  let storage = ClusterStorage::open(storage_dir.join("client.db"))?;
   let node = LocalNode::from_config(
     &NodeConfig {
       id: expected_id.clone(),

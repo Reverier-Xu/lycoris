@@ -20,6 +20,73 @@ message NodeInfo {
   map<string, string> labels = 3;
   map<string, string> annotations = 4;
   int64 last_heartbeat_unix_ms = 5;
+  string state = 6;
+  uint64 incarnation = 7;
+  uint64 heartbeat = 8;
+}
+
+message MerkleRootRequest {}
+
+message MerkleRootResponse {
+  bytes root_hash = 1;
+  repeated LeafHash leaf_hashes = 2;
+}
+
+message LeafHash {
+  string node_id = 1;
+  bytes hash = 2;
+}
+
+message FetchRegistersRequest {
+  repeated string node_ids = 1;
+}
+
+message FetchRegistersResponse {
+  repeated NodeInfo registers = 1;
+}
+
+message PushRegistersRequest {
+  repeated NodeInfo registers = 1;
+}
+
+message ProbeRequest {
+  uint64 seq = 1;
+  string target = 2;
+}
+
+message ProbeResponse {
+  bool ack = 1;
+  uint64 seq = 2;
+}
+
+service Membership {
+  rpc MerkleRoot(MerkleRootRequest) returns (MerkleRootResponse);
+  rpc FetchRegisters(FetchRegistersRequest) returns (FetchRegistersResponse);
+  rpc PushRegisters(PushRegistersRequest) returns (FetchRegistersResponse);
+  rpc Probe(ProbeRequest) returns (ProbeResponse);
+  rpc Gossip(GossipMessage) returns (GossipResponse);
+}
+
+message GossipMessage {
+  oneof payload {
+    NodeInfo alive = 1;
+    SuspectMessage suspect = 2;
+    LeaveMessage leave = 3;
+  }
+}
+
+message SuspectMessage {
+  string node_id = 1;
+  uint64 incarnation = 2;
+}
+
+message LeaveMessage {
+  string node_id = 1;
+  uint64 incarnation = 2;
+}
+
+message GossipResponse {
+  bool accepted = 1;
 }
 
 message RegisterRequest {

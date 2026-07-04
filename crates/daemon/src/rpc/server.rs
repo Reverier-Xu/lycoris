@@ -1,26 +1,29 @@
+use std::sync::Arc;
+
 use lycoris_api::proto::{
   HeartbeatRequest, HeartbeatResponse, ListNodesRequest, ListNodesResponse,
   NodeInfo as ProtoNodeInfo, RegisterRequest, RegisterResponse, SetPrimaryEndpointRequest,
   SetPrimaryEndpointResponse,
   cluster_server::{Cluster, ClusterServer},
 };
+use lycoris_storage::{ClusterNodeRecord, ClusterStorage, NodeState};
 use tonic::{Request, Response, Status};
 
-use crate::{gossip::Gossip, node::registry::NodeRegistry, storage::Storage};
+use crate::{gossip::Gossip, membership::MembershipService};
 
 pub type ClusterServerHandle = ClusterServer<ClusterService>;
 
 #[derive(Debug, Clone)]
 pub struct ClusterService {
-  registry: NodeRegistry,
-  storage: Storage,
+  service: Arc<MembershipService>,
+  storage: ClusterStorage,
   gossip: Option<Gossip>,
 }
 
 impl ClusterService {
-  pub fn new(registry: NodeRegistry, storage: Storage) -> Self {
+  pub fn new(service: Arc<MembershipService>, storage: ClusterStorage) -> Self {
     Self {
-      registry,
+      service,
       storage,
       gossip: None,
     }
@@ -34,11 +37,26 @@ impl ClusterService {
   pub fn into_server(self) -> ClusterServerHandle {
     ClusterServer::new(self)
   }
+}
 
-  async fn propagate_change(&self, info: ProtoNodeInfo) {
-    if let Some(gossip) = &self.gossip {
-      gossip.push_change(info).await;
-    }
+fn persist_node_info(storage: &ClusterStorage, info: &ProtoNodeInfo) {
+  let record = ClusterNodeRecord {
+    id: info.id.clone(),
+    address: info.address.clone(),
+    last_heartbeat_ms: info.last_heartbeat_unix_ms,
+    state: proto_state_to_storage(&info.state),
+    labels: info.labels.clone(),
+    annotations: info.annotations.clone(),
+  };
+  if let Err(error) = storage.upsert_cluster_node(&record) {
+    tracing::warn!(%error, node_id = %info.id, "failed to persist node info");
+  }
+}
+
+fn proto_state_to_storage(state: &str) -> NodeState {
+  match state {
+    "offline" | "leaving" => NodeState::Offline,
+    _ => NodeState::Alive,
   }
 }
 
@@ -59,8 +77,12 @@ impl Cluster for ClusterService {
       }));
     }
 
-    self.registry.register_or_update(&info);
-    self.propagate_change(info).await;
+    persist_node_info(&self.storage, &info);
+    let actions = self.service.register(&info).await;
+    if let Some(gossip) = &self.gossip {
+      gossip.dispatch(actions).await;
+      gossip.push_change(info.clone()).await;
+    }
 
     Ok(Response::new(RegisterResponse {
       accepted: true,
@@ -83,8 +105,12 @@ impl Cluster for ClusterService {
       }));
     }
 
-    self.registry.heartbeat(&info);
-    self.propagate_change(info).await;
+    persist_node_info(&self.storage, &info);
+    let actions = self.service.heartbeat(&info).await;
+    if let Some(gossip) = &self.gossip {
+      gossip.dispatch(actions).await;
+      gossip.push_change(info.clone()).await;
+    }
 
     Ok(Response::new(HeartbeatResponse {
       accepted: true,
@@ -96,7 +122,7 @@ impl Cluster for ClusterService {
     &self, request: Request<ListNodesRequest>,
   ) -> Result<Response<ListNodesResponse>, Status> {
     let selector = request.into_inner().selector;
-    let nodes = self.registry.list_alive(&selector);
+    let nodes = self.service.list_nodes(&selector).await;
     Ok(Response::new(ListNodesResponse { nodes }))
   }
 

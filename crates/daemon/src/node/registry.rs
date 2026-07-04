@@ -2,18 +2,17 @@ use std::{collections::HashMap, time::Duration};
 
 use lycoris_api::proto::NodeInfo as ProtoNodeInfo;
 use lycoris_config::{NodeInfo, time::now_ms};
-
-use crate::storage::{ClusterNodeRecord, NodeState, Storage};
+use lycoris_storage::{ClusterNodeRecord, ClusterStorage, NodeState};
 
 /// In-memory/registry view of cluster nodes, backed by persistent storage.
 #[derive(Debug, Clone)]
 pub struct NodeRegistry {
-  storage: Storage,
+  storage: ClusterStorage,
   ttl: Duration,
 }
 
 impl NodeRegistry {
-  pub fn new(storage: Storage, ttl: Duration) -> Self {
+  pub fn new(storage: ClusterStorage, ttl: Duration) -> Self {
     Self { storage, ttl }
   }
 
@@ -109,6 +108,13 @@ fn record_to_proto(record: ClusterNodeRecord) -> ProtoNodeInfo {
     labels: record.labels,
     annotations: record.annotations,
     last_heartbeat_unix_ms: record.last_heartbeat_ms,
+    state: if record.state == NodeState::Alive {
+      "active".to_string()
+    } else {
+      "offline".to_string()
+    },
+    incarnation: 1,
+    heartbeat: 0,
   }
 }
 
@@ -131,13 +137,13 @@ mod tests {
 
   fn test_registry() -> (TempDir, NodeRegistry) {
     let dir = TempDir::new().unwrap();
-    let storage = Storage::open(dir.path().join("registry.db")).unwrap();
+    let storage = ClusterStorage::open(dir.path().join("registry.db")).unwrap();
     (dir, NodeRegistry::new(storage, Duration::from_secs(60)))
   }
 
-  fn node_storage() -> (TempDir, Storage) {
+  fn node_storage() -> (TempDir, ClusterStorage) {
     let dir = TempDir::new().unwrap();
-    let storage = Storage::open(dir.path().join("node.db")).unwrap();
+    let storage = ClusterStorage::open(dir.path().join("node.db")).unwrap();
     (dir, storage)
   }
 
@@ -166,6 +172,9 @@ mod tests {
       labels: HashMap::new(),
       annotations: HashMap::new(),
       last_heartbeat_unix_ms: 100,
+      state: "active".to_string(),
+      incarnation: 1,
+      heartbeat: 0,
     };
     let new = ProtoNodeInfo {
       id: "node-1".to_string(),
@@ -173,6 +182,9 @@ mod tests {
       labels: HashMap::new(),
       annotations: HashMap::new(),
       last_heartbeat_unix_ms: 200,
+      state: "active".to_string(),
+      incarnation: 1,
+      heartbeat: 0,
     };
 
     registry.merge(vec![new.clone()]);

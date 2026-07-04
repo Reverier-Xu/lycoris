@@ -1,8 +1,9 @@
 use std::{collections::HashMap, path::PathBuf, time::Duration};
 
-use lycoris_api::ClusterRpcClient;
+use lycoris_api::{ClusterRpcClient, PeerClient};
 use lycoris_config::{ClusterConfig, DaemonConfig, NodeConfig, TlsConfig};
-use lycoris_daemon::{node::info::LocalNode, storage::Storage};
+use lycoris_daemon::node::info::LocalNode;
+use lycoris_storage::ClusterStorage;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
 use tempfile::TempDir;
 use tokio::time;
@@ -125,7 +126,7 @@ async fn registry_converges_across_three_node_chain() {
 
   let external_dir = TempDir::new().unwrap();
   let external_storage =
-    Storage::open(external_dir.path().join("external.db")).expect("open external storage");
+    ClusterStorage::open(external_dir.path().join("external.db")).expect("open external storage");
   let external = LocalNode::from_config(
     &NodeConfig {
       id: "external-node".to_string(),
@@ -206,7 +207,7 @@ async fn primary_failure_falls_back_and_promotes() {
   // fallback (node-1) because the primary is unreachable.
   let external_dir = TempDir::new().unwrap();
   let external_storage =
-    Storage::open(external_dir.path().join("external.db")).expect("open external storage");
+    ClusterStorage::open(external_dir.path().join("external.db")).expect("open external storage");
   let external = LocalNode::from_config(
     &NodeConfig {
       id: "fallback-external-node".to_string(),
@@ -235,10 +236,171 @@ async fn primary_failure_falls_back_and_promotes() {
 
   // Verify node-0 promoted the reachable fallback to primary in storage.
   let node0_storage =
-    Storage::open(data_dirs[0].path().join("lycoris.db")).expect("reopen node-0 storage");
+    ClusterStorage::open(data_dirs[0].path().join("lycoris.db")).expect("reopen node-0 storage");
   let primary = node0_storage
     .get_primary()
     .expect("read primary")
     .expect("primary should be set after successful fallback sync");
   assert_eq!(primary, node1_url);
+}
+
+#[tokio::test]
+async fn partition_merge_reconciles_bidirectional_membership() {
+  let _ = lycoris_daemon::install_crypto_provider();
+
+  let (node_count, base_port) = (2, 56201);
+  let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
+  let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
+
+  let configs: Vec<DaemonConfig> = (0..node_count)
+    .map(|i| {
+      let port = base_port + i as u16;
+      let peer = format!("https://127.0.0.1:{}", base_port + ((i + 1) % 2) as u16);
+      build_config(
+        &format!("node-{i}"),
+        port,
+        vec![peer],
+        data_dirs[i].path().to_path_buf(),
+        &ca_cert_path,
+        &ca_key_path,
+        &cert_paths[i],
+        &key_paths[i],
+      )
+    })
+    .collect();
+
+  for config in configs.clone() {
+    tokio::spawn(async move {
+      let _ = lycoris_daemon::runtime::run(config).await;
+    });
+  }
+
+  time::sleep(Duration::from_millis(300)).await;
+
+  let node0_url = format!("https://127.0.0.1:{base_port}");
+  let node1_url = format!("https://127.0.0.1:{}", base_port + 1);
+  let client_tls = client_tls_config(&cert_paths[0], &key_paths[0], &ca_cert_path);
+  let client = ClusterRpcClient::connect(&node0_url, client_tls.clone())
+    .await
+    .expect("failed to connect to node-0");
+
+  let alpha_dir = TempDir::new().unwrap();
+  let alpha_storage =
+    ClusterStorage::open(alpha_dir.path().join("alpha.db")).expect("open alpha storage");
+  let alpha = LocalNode::from_config(
+    &NodeConfig {
+      id: "alpha".to_string(),
+      address: "127.0.0.1:56299".to_string(),
+    },
+    alpha_storage,
+  );
+  client
+    .register(&alpha)
+    .await
+    .expect("register alpha failed");
+
+  let client = ClusterRpcClient::connect(&node1_url, client_tls.clone())
+    .await
+    .expect("failed to connect to node-1");
+
+  let beta_dir = TempDir::new().unwrap();
+  let beta_storage =
+    ClusterStorage::open(beta_dir.path().join("beta.db")).expect("open beta storage");
+  let beta = LocalNode::from_config(
+    &NodeConfig {
+      id: "beta".to_string(),
+      address: "127.0.0.1:56298".to_string(),
+    },
+    beta_storage,
+  );
+  client.register(&beta).await.expect("register beta failed");
+
+  time::sleep(Duration::from_millis(1500)).await;
+
+  for url in [&node0_url, &node1_url] {
+    let client = ClusterRpcClient::connect(url, client_tls.clone())
+      .await
+      .expect("failed to connect");
+    let ids: Vec<String> = client
+      .list_nodes(HashMap::new())
+      .await
+      .expect("list_nodes failed")
+      .nodes
+      .into_iter()
+      .map(|n| n.id)
+      .collect();
+    assert!(ids.contains(&"alpha".to_string()));
+    assert!(ids.contains(&"beta".to_string()));
+    assert!(ids.contains(&"node-0".to_string()));
+    assert!(ids.contains(&"node-1".to_string()));
+  }
+}
+
+#[tokio::test]
+async fn failure_detector_marks_unresponsive_peer() {
+  let _ = lycoris_daemon::install_crypto_provider();
+
+  let (node_count, base_port) = (2, 56301);
+  let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
+  let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
+
+  let configs: Vec<DaemonConfig> = (0..node_count)
+    .map(|i| {
+      let port = base_port + i as u16;
+      let peer = format!("https://127.0.0.1:{}", base_port + ((i + 1) % 2) as u16);
+      build_config(
+        &format!("node-{i}"),
+        port,
+        vec![peer],
+        data_dirs[i].path().to_path_buf(),
+        &ca_cert_path,
+        &ca_key_path,
+        &cert_paths[i],
+        &key_paths[i],
+      )
+    })
+    .collect();
+
+  let mut handles = Vec::new();
+  for config in configs.clone() {
+    handles.push(tokio::spawn(async move {
+      let _ = lycoris_daemon::runtime::run(config).await;
+    }));
+  }
+
+  time::sleep(Duration::from_millis(300)).await;
+
+  let node0_url = format!("https://127.0.0.1:{base_port}");
+  let _node1_url = format!("https://127.0.0.1:{}", base_port + 1);
+  let client_tls = client_tls_config(&cert_paths[0], &key_paths[0], &ca_cert_path);
+  let client = ClusterRpcClient::connect(&node0_url, client_tls.clone())
+    .await
+    .expect("failed to connect to node-0");
+
+  let peers = client
+    .list_nodes(HashMap::new())
+    .await
+    .expect("list_nodes failed")
+    .nodes;
+  assert!(peers.iter().any(|n| n.id == "node-1"));
+
+  // Stop node-1 so that node-0's SWIM probes begin to fail.
+  handles[1].abort();
+
+  // Wait long enough for the SWIM tick (1s) plus the ping timeout (5s).
+  time::sleep(Duration::from_secs(7)).await;
+
+  let peer = PeerClient::connect(&node0_url, client_tls.clone())
+    .await
+    .expect("failed to connect membership client");
+  let registers = peer
+    .membership
+    .fetch_registers(vec!["node-1".to_string()])
+    .await
+    .expect("fetch_registers failed");
+  assert_eq!(registers.len(), 1);
+  assert_eq!(
+    registers[0].state, "suspected",
+    "node-1 should be suspected after probes time out"
+  );
 }

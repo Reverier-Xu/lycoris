@@ -6,17 +6,18 @@ use std::{
 
 use lycoris_config::time::now_ms;
 use rusqlite::{Connection, params};
-use thiserror::Error;
 use tokio::sync::Notify;
 
-/// Persistent storage for dynamic node state.
+use crate::error::StorageError;
+
+/// Persistent storage for dynamic cluster node state.
 ///
-/// The daemon keeps peer list, primary endpoint, node labels/annotations, and
-/// peer reachability information in a local SQLite database. The on-disk config
-/// file only supplies bootstrap identity and networking information; all
-/// runtime-discovered and runtime-modified state lives here.
+/// Each daemon node keeps its own local SQLite database for peer list, primary
+/// endpoint, node labels/annotations, and peer reachability information. The
+/// on-disk config file only supplies bootstrap identity and networking
+/// information; all runtime-discovered and runtime-modified state lives here.
 #[derive(Debug, Clone)]
-pub struct Storage {
+pub struct ClusterStorage {
   connection: Arc<Mutex<Connection>>,
   change_notify: Arc<Notify>,
 }
@@ -46,7 +47,7 @@ pub enum NodeState {
   Offline,
 }
 
-impl Storage {
+impl ClusterStorage {
   /// Open or create the SQLite database at the given path.
   pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
     let connection = Connection::open(path)?;
@@ -371,16 +372,6 @@ fn string_to_state(s: &str) -> Result<NodeState, StorageError> {
   }
 }
 
-#[derive(Debug, Error)]
-pub enum StorageError {
-  #[error("sqlite error: {0}")]
-  Sqlite(#[from] rusqlite::Error),
-  #[error("storage lock poisoned")]
-  LockPoisoned,
-  #[error("corrupt node state in database: {0}")]
-  CorruptState(String),
-}
-
 #[cfg(test)]
 mod tests {
   use tempfile::TempDir;
@@ -390,7 +381,7 @@ mod tests {
   #[test]
   fn seed_and_list_peers() {
     let dir = TempDir::new().unwrap();
-    let storage = Storage::open(dir.path().join("peers.db")).unwrap();
+    let storage = ClusterStorage::open(dir.path().join("peers.db")).unwrap();
     storage.seed_peer("https://peer-a:5000").unwrap();
     storage.seed_peer("https://peer-b:5000").unwrap();
 
@@ -401,7 +392,7 @@ mod tests {
   #[test]
   fn primary_round_trip() {
     let dir = TempDir::new().unwrap();
-    let storage = Storage::open(dir.path().join("peers.db")).unwrap();
+    let storage = ClusterStorage::open(dir.path().join("peers.db")).unwrap();
     storage.seed_peer("https://peer-a:5000").unwrap();
     storage.set_primary("https://peer-a:5000").unwrap();
 
@@ -412,7 +403,7 @@ mod tests {
   #[test]
   fn local_and_cluster_attributes() {
     let dir = TempDir::new().unwrap();
-    let storage = Storage::open(dir.path().join("nodes.db")).unwrap();
+    let storage = ClusterStorage::open(dir.path().join("nodes.db")).unwrap();
 
     storage.set_local_label("zone", "cn").unwrap();
     storage.set_local_annotation("note", "test").unwrap();

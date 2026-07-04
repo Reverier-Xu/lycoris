@@ -1,20 +1,19 @@
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
-use lycoris_config::{ClientConfig, DaemonConfig, NodeInfo, paths};
+use lycoris_config::{ClientConfig, DaemonConfig, paths, time::now_ms};
+use lycoris_storage::{ClusterStorage, StorageError};
 use thiserror::Error;
 use tonic::transport::ServerTlsConfig;
 
 use crate::{
   gossip::Gossip,
-  node::{info::LocalNode, registry::NodeRegistry},
+  membership::{MemberRegister, MembershipService, SwimConfig},
   rpc::server::ClusterService,
-  storage::{Storage, StorageError},
   tls::{TlsError, ensure_tls_bundle},
 };
 
-const NODE_TTL: Duration = Duration::from_secs(60);
-const CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
 const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_secs(5);
+const DEFAULT_SWIM_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -35,9 +34,8 @@ pub async fn run(config: DaemonConfig) -> Result<(), RuntimeError> {
 
   let data_dir = PathBuf::from(&config.data_dir);
   std::fs::create_dir_all(&data_dir)?;
-  let storage = Storage::open(data_dir.join("lycoris.db"))?;
+  let storage = ClusterStorage::open(data_dir.join("lycoris.db"))?;
 
-  let local_node = LocalNode::from_config(&config.node, storage.clone());
   let tls_bundle = ensure_tls_bundle(
     &config.tls.ca_cert,
     &config.tls.ca_key,
@@ -53,33 +51,38 @@ pub async fn run(config: DaemonConfig) -> Result<(), RuntimeError> {
     storage.seed_peer(peer)?;
   }
 
-  let registry = NodeRegistry::new(storage.clone(), NODE_TTL);
-  // Seed the registry with information about the local node.
-  registry.register_or_update(&local_node);
+  let mut local_register = MemberRegister::new(&config.node.id, &config.node.address, 1, 0);
+  local_register.labels = storage.local_labels().unwrap_or_default();
+  local_register.annotations = storage.local_annotations().unwrap_or_default();
+  local_register.updated_at_ms = now_ms();
+
+  let membership_service = Arc::new(MembershipService::new(
+    &config.node.id,
+    SwimConfig::default(),
+    local_register,
+  ));
 
   let gossip = Gossip::new(
-    local_node.id().to_string(),
-    registry.clone(),
+    config.node.id.clone(),
+    membership_service.clone(),
     storage.clone(),
     &tls_bundle,
   );
 
   let cluster_service =
-    ClusterService::new(registry.clone(), storage.clone()).with_gossip(gossip.clone());
-  let sync_service = gossip.clone().into_sync_server();
+    ClusterService::new(membership_service.clone(), storage.clone()).with_gossip(gossip.clone());
 
-  let cleanup_registry = registry.clone();
+  let ae_gossip = gossip.clone();
   tokio::spawn(async move {
-    let mut interval = tokio::time::interval(CLEANUP_INTERVAL);
-    loop {
-      interval.tick().await;
-      cleanup_registry.cleanup_offline();
-    }
+    ae_gossip.run(DEFAULT_SYNC_INTERVAL).await;
   });
 
+  let swim_gossip = gossip.clone();
   tokio::spawn(async move {
-    gossip.run(DEFAULT_SYNC_INTERVAL).await;
+    swim_gossip.run_swim(DEFAULT_SWIM_INTERVAL).await;
   });
+
+  let (sync_service, membership_service_rpc) = gossip.into_servers();
 
   let addr: SocketAddr = config.cluster.listen_address.parse()?;
   tracing::info!(%addr, "node api server listening");
@@ -89,6 +92,7 @@ pub async fn run(config: DaemonConfig) -> Result<(), RuntimeError> {
     .timeout(Duration::from_secs(30))
     .add_service(cluster_service.into_server())
     .add_service(sync_service)
+    .add_service(membership_service_rpc)
     .serve(addr)
     .await?;
 
