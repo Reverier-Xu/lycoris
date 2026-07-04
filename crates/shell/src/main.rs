@@ -32,7 +32,6 @@ fn main() -> anyhow::Result<()> {
         }
       })?;
     }
-    #[cfg(target_os = "linux")]
     Command::Setup { binary_name } => commands::setup::run(&binary_name)?,
   }
 

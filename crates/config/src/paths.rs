@@ -96,7 +96,7 @@ fn system_data_dir() -> Option<PathBuf> {
   BaseDirs::new().map(|dirs| dirs.data_local_dir().join("lycoris"))
 }
 
-fn user_data_dir() -> Option<PathBuf> {
+pub fn user_data_dir() -> Option<PathBuf> {
   project_dirs().map(|dirs| dirs.data_dir().to_path_buf())
 }
 
