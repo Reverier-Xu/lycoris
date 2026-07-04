@@ -18,7 +18,7 @@ use lycoris_api::{
   },
 };
 use lycoris_config::time::now_ms;
-use lycoris_storage::ClusterStorage;
+use lycoris_storage::NodeDomain;
 use tokio::{sync::Mutex, time::timeout};
 use tonic::{Request, Response, Status, transport::ClientTlsConfig};
 
@@ -36,7 +36,7 @@ use crate::{
 pub struct Gossip {
   local_node_id: String,
   service: Arc<MembershipService>,
-  storage: ClusterStorage,
+  storage: NodeDomain,
   tls: ClientTlsConfig,
   clients: Arc<Mutex<HashMap<String, PeerClient>>>,
   seen_pushes: Arc<Mutex<HashSet<(String, u64)>>>,
@@ -47,7 +47,7 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl Gossip {
   pub fn new(
-    local_node_id: String, service: Arc<MembershipService>, storage: ClusterStorage,
+    local_node_id: String, service: Arc<MembershipService>, storage: NodeDomain,
     tls_bundle: &TlsBundle,
   ) -> Self {
     let tls = ClientTlsConfig::new()
@@ -216,7 +216,7 @@ impl Gossip {
     let snapshot = self.service.list_nodes(&HashMap::new()).await;
     let mut primary_set = false;
 
-    if let Some(primary) = self.storage.get_primary().unwrap_or(None) {
+    if let Some(primary) = self.storage.peers.get_primary().unwrap_or(None) {
       match timeout(RPC_TIMEOUT, self.sync_with_peer(&primary, snapshot.clone())).await {
         Ok(Ok(())) => {
           primary_set = true;
@@ -232,13 +232,13 @@ impl Gossip {
       }
     }
 
-    let fallbacks = self.storage.fallback_peers().unwrap_or_default();
+    let fallbacks = self.storage.peers.fallback_addresses().unwrap_or_default();
     for peer in fallbacks {
       let result = timeout(RPC_TIMEOUT, self.sync_with_peer(&peer, snapshot.clone())).await;
       match result {
         Ok(Ok(())) => {
           if !primary_set {
-            if let Err(error) = self.storage.set_primary(&peer) {
+            if let Err(error) = self.storage.peers.set_primary(&peer) {
               tracing::warn!(%peer, %error, "failed to promote fallback to primary");
             }
             primary_set = true;
@@ -283,7 +283,7 @@ impl Gossip {
     let local_root = self.service.merkle_root().await;
     if remote_root == local_root.root_hash {
       let now = now_ms();
-      let _ = self.storage.mark_peer_seen(peer, now);
+      let _ = self.storage.peers.mark_seen(peer, now);
       return Ok(());
     }
 
@@ -334,11 +334,11 @@ impl Gossip {
     }
 
     for info in self.service.list_nodes(&HashMap::new()).await {
-      let _ = self.storage.seed_peer(&info.address);
+      let _ = self.storage.peers.seed(&info.address);
     }
 
     let now = now_ms();
-    if let Err(error) = self.storage.mark_peer_seen(peer, now) {
+    if let Err(error) = self.storage.peers.mark_seen(peer, now) {
       tracing::warn!(%peer, %error, "failed to record peer seen state");
     }
     Ok(())
@@ -351,11 +351,11 @@ impl Gossip {
     let _ = self.service.sync_nodes(response.nodes).await;
 
     for info in self.service.list_nodes(&HashMap::new()).await {
-      let _ = self.storage.seed_peer(&info.address);
+      let _ = self.storage.peers.seed(&info.address);
     }
 
     let now = now_ms();
-    if let Err(error) = self.storage.mark_peer_seen(peer, now) {
+    if let Err(error) = self.storage.peers.mark_seen(peer, now) {
       tracing::warn!(%peer, %error, "failed to record peer seen state");
     }
     Ok(())
@@ -373,16 +373,16 @@ impl Gossip {
       .await
       {
         Ok(Ok(())) => {
-          let _ = self.storage.mark_peer_seen(&peer, now_ms());
+          let _ = self.storage.peers.mark_seen(&peer, now_ms());
         }
         Ok(Err(error)) => {
           tracing::warn!(%peer, %error, "push to peer failed");
-          let _ = self.storage.mark_peer_attempt(&peer, false);
+          let _ = self.storage.peers.mark_attempt(&peer, false);
           self.remove_client(&peer).await;
         }
         Err(_) => {
           tracing::warn!(%peer, "push to peer timed out");
-          let _ = self.storage.mark_peer_attempt(&peer, false);
+          let _ = self.storage.peers.mark_attempt(&peer, false);
           self.remove_client(&peer).await;
         }
       }
@@ -403,16 +403,16 @@ impl Gossip {
       let message = message.clone();
       match timeout(RPC_TIMEOUT, self.gossip_to_peer(&peer, message)).await {
         Ok(Ok(())) => {
-          let _ = self.storage.mark_peer_seen(&peer, now_ms());
+          let _ = self.storage.peers.mark_seen(&peer, now_ms());
         }
         Ok(Err(error)) => {
           tracing::warn!(%peer, %error, "gossip to peer failed");
-          let _ = self.storage.mark_peer_attempt(&peer, false);
+          let _ = self.storage.peers.mark_attempt(&peer, false);
           self.remove_client(&peer).await;
         }
         Err(_) => {
           tracing::warn!(%peer, "gossip to peer timed out");
-          let _ = self.storage.mark_peer_attempt(&peer, false);
+          let _ = self.storage.peers.mark_attempt(&peer, false);
           self.remove_client(&peer).await;
         }
       }
@@ -430,11 +430,11 @@ impl Gossip {
   async fn current_targets(&self) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut targets = Vec::new();
-    if let Ok(Some(primary)) = self.storage.get_primary() {
+    if let Ok(Some(primary)) = self.storage.peers.get_primary() {
       seen.insert(primary.clone());
       targets.push(primary);
     }
-    if let Ok(fallbacks) = self.storage.fallback_peers() {
+    if let Ok(fallbacks) = self.storage.peers.fallback_addresses() {
       for peer in fallbacks {
         if seen.insert(peer.clone()) {
           targets.push(peer);
@@ -483,7 +483,7 @@ impl Gossip {
   ) -> Result<Response<SyncNodesResponse>, Status> {
     let nodes = request.into_inner().nodes;
     for info in &nodes {
-      let _ = self.storage.seed_peer(&info.address);
+      let _ = self.storage.peers.seed(&info.address);
     }
     let snapshot = self.service.sync_nodes(nodes).await;
     Ok(Response::new(SyncNodesResponse { nodes: snapshot }))
@@ -505,7 +505,7 @@ impl Gossip {
       return Ok(Response::new(PushNodeResponse { accepted: true }));
     }
 
-    let _ = self.storage.seed_peer(&info.address);
+    let _ = self.storage.peers.seed(&info.address);
     let actions = self.service.register(&info).await;
     self.dispatch(actions).await;
 

@@ -13,7 +13,9 @@ version.workspace      = true
 
 [dependencies]
 lycoris-config = { workspace = true }
-rusqlite       = { workspace = true }
+postcard       = { workspace = true }
+redb           = { workspace = true }
+serde          = { workspace = true }
 thiserror      = { workspace = true }
 tokio          = { workspace = true }
 

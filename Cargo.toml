@@ -32,9 +32,10 @@ lycoris-api     = { path = "crates/api" }
 lycoris-config  = { path = "crates/config" }
 lycoris-storage = { path = "crates/storage" }
 owo-colors    = "4.3"
+postcard      = { version = "1", features = ["use-std"] }
 prost         = "0.13"
 rcgen         = "0.13"
-rusqlite      = { version = "0.34", features = ["bundled"] }
+redb          = "3"
 rustls        = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2.2"
 serde         = { version = "1.0", features = ["derive"] }

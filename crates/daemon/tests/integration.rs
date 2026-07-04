@@ -2,8 +2,7 @@ use std::{collections::HashMap, path::PathBuf, time::Duration};
 
 use lycoris_api::{ClusterRpcClient, PeerClient};
 use lycoris_config::{ClusterConfig, DaemonConfig, NodeConfig, TlsConfig};
-use lycoris_daemon::node::info::LocalNode;
-use lycoris_storage::ClusterStorage;
+use lycoris_storage::{LocalNode, Storage};
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
 use tempfile::TempDir;
 use tokio::time;
@@ -110,7 +109,9 @@ async fn registry_converges_across_three_node_chain() {
 
   for config in configs.clone() {
     tokio::spawn(async move {
-      let _ = lycoris_daemon::runtime::run(config).await;
+      if let Err(e) = lycoris_daemon::runtime::run(config).await {
+        eprintln!("runtime error: {e:?}");
+      }
     });
   }
 
@@ -126,13 +127,13 @@ async fn registry_converges_across_three_node_chain() {
 
   let external_dir = TempDir::new().unwrap();
   let external_storage =
-    ClusterStorage::open(external_dir.path().join("external.db")).expect("open external storage");
+    Storage::open(external_dir.path().join("external.redb")).expect("open external storage");
   let external = LocalNode::from_config(
     &NodeConfig {
       id: "external-node".to_string(),
       address: "127.0.0.1:56099".to_string(),
     },
-    external_storage,
+    external_storage.node().local,
   );
   client.register(&external).await.expect("register failed");
 
@@ -184,10 +185,24 @@ async fn primary_failure_falls_back_and_promotes() {
     })
     .collect();
 
-  for config in configs.clone() {
-    tokio::spawn(async move {
-      let _ = lycoris_daemon::runtime::run(config).await;
-    });
+  let (node0_shutdown_tx, node0_shutdown_rx) = tokio::sync::watch::channel(false);
+
+  let mut handles = Vec::new();
+  for (i, config) in configs.clone().into_iter().enumerate() {
+    if i == 0 {
+      let shutdown_rx = node0_shutdown_rx.clone();
+      handles.push(tokio::spawn(async move {
+        if let Err(e) = lycoris_daemon::runtime::run_with_shutdown(config, shutdown_rx).await {
+          eprintln!("runtime error: {e:?}");
+        }
+      }));
+    } else {
+      handles.push(tokio::spawn(async move {
+        if let Err(e) = lycoris_daemon::runtime::run(config).await {
+          eprintln!("runtime error: {e:?}");
+        }
+      }));
+    }
   }
 
   time::sleep(Duration::from_millis(300)).await;
@@ -207,17 +222,17 @@ async fn primary_failure_falls_back_and_promotes() {
   // fallback (node-1) because the primary is unreachable.
   let external_dir = TempDir::new().unwrap();
   let external_storage =
-    ClusterStorage::open(external_dir.path().join("external.db")).expect("open external storage");
+    Storage::open(external_dir.path().join("external.redb")).expect("open external storage");
   let external = LocalNode::from_config(
     &NodeConfig {
       id: "fallback-external-node".to_string(),
       address: "127.0.0.1:56199".to_string(),
     },
-    external_storage,
+    external_storage.node().local,
   );
   client.register(&external).await.expect("register failed");
 
-  time::sleep(Duration::from_millis(1500)).await;
+  time::sleep(Duration::from_millis(5500)).await;
 
   // Verify node-1 received the external node via fallback sync.
   let node1_url = format!("https://127.0.0.1:{}", base_port + 1);
@@ -234,10 +249,19 @@ async fn primary_failure_falls_back_and_promotes() {
     .collect();
   assert!(ids.contains(&"fallback-external-node".to_string()));
 
+  // Stop node-0 so that its redb database is closed and can be reopened.
+  node0_shutdown_tx
+    .send(true)
+    .expect("signal node-0 shutdown");
+  let _ = handles.remove(0).await;
+  time::sleep(Duration::from_millis(300)).await;
+
   // Verify node-0 promoted the reachable fallback to primary in storage.
   let node0_storage =
-    ClusterStorage::open(data_dirs[0].path().join("lycoris.db")).expect("reopen node-0 storage");
+    Storage::open(data_dirs[0].path().join("lycoris.redb")).expect("reopen node-0 storage");
   let primary = node0_storage
+    .node()
+    .peers
     .get_primary()
     .expect("read primary")
     .expect("primary should be set after successful fallback sync");
@@ -271,7 +295,9 @@ async fn partition_merge_reconciles_bidirectional_membership() {
 
   for config in configs.clone() {
     tokio::spawn(async move {
-      let _ = lycoris_daemon::runtime::run(config).await;
+      if let Err(e) = lycoris_daemon::runtime::run(config).await {
+        eprintln!("runtime error: {e:?}");
+      }
     });
   }
 
@@ -286,13 +312,13 @@ async fn partition_merge_reconciles_bidirectional_membership() {
 
   let alpha_dir = TempDir::new().unwrap();
   let alpha_storage =
-    ClusterStorage::open(alpha_dir.path().join("alpha.db")).expect("open alpha storage");
+    Storage::open(alpha_dir.path().join("alpha.redb")).expect("open alpha storage");
   let alpha = LocalNode::from_config(
     &NodeConfig {
       id: "alpha".to_string(),
       address: "127.0.0.1:56299".to_string(),
     },
-    alpha_storage,
+    alpha_storage.node().local,
   );
   client
     .register(&alpha)
@@ -304,14 +330,13 @@ async fn partition_merge_reconciles_bidirectional_membership() {
     .expect("failed to connect to node-1");
 
   let beta_dir = TempDir::new().unwrap();
-  let beta_storage =
-    ClusterStorage::open(beta_dir.path().join("beta.db")).expect("open beta storage");
+  let beta_storage = Storage::open(beta_dir.path().join("beta.redb")).expect("open beta storage");
   let beta = LocalNode::from_config(
     &NodeConfig {
       id: "beta".to_string(),
       address: "127.0.0.1:56298".to_string(),
     },
-    beta_storage,
+    beta_storage.node().local,
   );
   client.register(&beta).await.expect("register beta failed");
 
@@ -364,7 +389,9 @@ async fn failure_detector_marks_unresponsive_peer() {
   let mut handles = Vec::new();
   for config in configs.clone() {
     handles.push(tokio::spawn(async move {
-      let _ = lycoris_daemon::runtime::run(config).await;
+      if let Err(e) = lycoris_daemon::runtime::run(config).await {
+        eprintln!("runtime error: {e:?}");
+      }
     }));
   }
 

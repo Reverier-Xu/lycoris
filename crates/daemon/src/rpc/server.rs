@@ -6,7 +6,7 @@ use lycoris_api::proto::{
   SetPrimaryEndpointResponse,
   cluster_server::{Cluster, ClusterServer},
 };
-use lycoris_storage::{ClusterNodeRecord, ClusterStorage, NodeState};
+use lycoris_storage::{ClusterNodeRecord, NodeDomain, NodeState};
 use tonic::{Request, Response, Status};
 
 use crate::{gossip::Gossip, membership::MembershipService};
@@ -16,12 +16,12 @@ pub type ClusterServerHandle = ClusterServer<ClusterService>;
 #[derive(Debug, Clone)]
 pub struct ClusterService {
   service: Arc<MembershipService>,
-  storage: ClusterStorage,
+  storage: NodeDomain,
   gossip: Option<Gossip>,
 }
 
 impl ClusterService {
-  pub fn new(service: Arc<MembershipService>, storage: ClusterStorage) -> Self {
+  pub fn new(service: Arc<MembershipService>, storage: NodeDomain) -> Self {
     Self {
       service,
       storage,
@@ -39,7 +39,7 @@ impl ClusterService {
   }
 }
 
-fn persist_node_info(storage: &ClusterStorage, info: &ProtoNodeInfo) {
+fn persist_node_info(storage: &NodeDomain, info: &ProtoNodeInfo) {
   let record = ClusterNodeRecord {
     id: info.id.clone(),
     address: info.address.clone(),
@@ -48,7 +48,7 @@ fn persist_node_info(storage: &ClusterStorage, info: &ProtoNodeInfo) {
     labels: info.labels.clone(),
     annotations: info.annotations.clone(),
   };
-  if let Err(error) = storage.upsert_cluster_node(&record) {
+  if let Err(error) = storage.cluster.upsert(&record) {
     tracing::warn!(%error, node_id = %info.id, "failed to persist node info");
   }
 }
@@ -139,6 +139,7 @@ impl Cluster for ClusterService {
 
     self
       .storage
+      .peers
       .set_primary(&address)
       .map_err(|error| Status::internal(format!("failed to set primary endpoint: {error}")))?;
 

@@ -4,7 +4,6 @@
 pub mod api;
 pub mod gossip;
 pub mod membership;
-pub mod node;
 pub mod rpc;
 pub mod runtime;
 pub mod tls;

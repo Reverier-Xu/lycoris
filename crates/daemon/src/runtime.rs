@@ -1,8 +1,9 @@
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use lycoris_config::{ClientConfig, DaemonConfig, paths, time::now_ms};
-use lycoris_storage::{ClusterStorage, StorageError};
+use lycoris_storage::{Storage, StorageError};
 use thiserror::Error;
+use tokio::sync::watch;
 use tonic::transport::ServerTlsConfig;
 
 use crate::{
@@ -29,12 +30,24 @@ pub enum RuntimeError {
   Transport(#[from] tonic::transport::Error),
 }
 
+/// Run the daemon until the process is interrupted.
 pub async fn run(config: DaemonConfig) -> Result<(), RuntimeError> {
+  // Hold the sender so the receiver never sees the channel close. The
+  // daemon then runs until the surrounding task/runtime is shut down.
+  let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+  run_with_shutdown(config, shutdown_rx).await
+}
+
+/// Run the daemon until the supplied shutdown signal becomes `true`.
+pub async fn run_with_shutdown(
+  config: DaemonConfig, shutdown: watch::Receiver<bool>,
+) -> Result<(), RuntimeError> {
   write_client_config(&config);
 
   let data_dir = PathBuf::from(&config.data_dir);
   std::fs::create_dir_all(&data_dir)?;
-  let storage = ClusterStorage::open(data_dir.join("lycoris.db"))?;
+  let storage = Storage::open(data_dir.join("lycoris.redb"))?;
+  let node = storage.node();
 
   let tls_bundle = ensure_tls_bundle(
     &config.tls.ca_cert,
@@ -48,18 +61,18 @@ pub async fn run(config: DaemonConfig) -> Result<(), RuntimeError> {
     .client_ca_root(tls_bundle.ca.clone());
 
   for peer in &config.cluster.bootstrap_peers {
-    storage.seed_peer(peer)?;
+    node.peers.seed(peer)?;
   }
 
-  if storage.get_primary()?.is_none()
+  if node.peers.get_primary()?.is_none()
     && let Some(first_peer) = config.cluster.bootstrap_peers.first()
   {
-    storage.set_primary(first_peer)?;
+    node.peers.set_primary(first_peer)?;
   }
 
   let mut local_register = MemberRegister::new(&config.node.id, &config.node.address, 1, 0);
-  local_register.labels = storage.local_labels().unwrap_or_default();
-  local_register.annotations = storage.local_annotations().unwrap_or_default();
+  local_register.labels = node.local.labels().unwrap_or_default();
+  local_register.annotations = node.local.annotations().unwrap_or_default();
   local_register.updated_at_ms = now_ms();
 
   let membership_service = Arc::new(MembershipService::new(
@@ -71,21 +84,31 @@ pub async fn run(config: DaemonConfig) -> Result<(), RuntimeError> {
   let gossip = Gossip::new(
     config.node.id.clone(),
     membership_service.clone(),
-    storage.clone(),
+    node.clone(),
     &tls_bundle,
   );
 
   let cluster_service =
-    ClusterService::new(membership_service.clone(), storage.clone()).with_gossip(gossip.clone());
+    ClusterService::new(membership_service.clone(), node.clone()).with_gossip(gossip.clone());
+
+  let mut background = tokio::task::JoinSet::new();
 
   let ae_gossip = gossip.clone();
-  tokio::spawn(async move {
-    ae_gossip.run(DEFAULT_SYNC_INTERVAL).await;
+  let ae_shutdown = shutdown.clone();
+  background.spawn(async move {
+    tokio::select! {
+      _ = ae_gossip.run(DEFAULT_SYNC_INTERVAL) => {}
+      _ = wait_shutdown(ae_shutdown) => {}
+    }
   });
 
   let swim_gossip = gossip.clone();
-  tokio::spawn(async move {
-    swim_gossip.run_swim(DEFAULT_SWIM_INTERVAL).await;
+  let swim_shutdown = shutdown.clone();
+  background.spawn(async move {
+    tokio::select! {
+      _ = swim_gossip.run_swim(DEFAULT_SWIM_INTERVAL) => {}
+      _ = wait_shutdown(swim_shutdown) => {}
+    }
   });
 
   let (sync_service, membership_service_rpc) = gossip.into_servers();
@@ -93,16 +116,29 @@ pub async fn run(config: DaemonConfig) -> Result<(), RuntimeError> {
   let addr: SocketAddr = config.cluster.listen_address.parse()?;
   tracing::info!(%addr, "node api server listening");
 
-  tonic::transport::Server::builder()
+  let server_shutdown = shutdown.clone();
+  let result = tonic::transport::Server::builder()
     .tls_config(server_tls)?
     .timeout(Duration::from_secs(30))
     .add_service(cluster_service.into_server())
     .add_service(sync_service)
     .add_service(membership_service_rpc)
-    .serve(addr)
-    .await?;
+    .serve_with_shutdown(addr, wait_shutdown(server_shutdown))
+    .await;
 
+  background.abort_all();
+  while background.join_next().await.is_some() {}
+
+  result?;
   Ok(())
+}
+
+async fn wait_shutdown(mut shutdown: watch::Receiver<bool>) {
+  while !*shutdown.borrow() {
+    if shutdown.changed().await.is_err() {
+      break;
+    }
+  }
 }
 
 fn write_client_config(config: &DaemonConfig) {
