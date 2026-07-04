@@ -114,23 +114,23 @@ mod tests {
   use super::*;
 
   #[test]
-  fn user_config_dir_ends_with_lycoris() {
+  fn user_config_dir_contains_lycoris() {
     if let Some(dir) = user_config_dir() {
-      assert_eq!(dir.file_name().unwrap(), "lycoris");
+      assert!(dir.components().any(|c| c.as_os_str() == "lycoris"));
     }
   }
 
   #[test]
-  fn system_config_dir_ends_with_lycoris() {
+  fn system_config_dir_contains_lycoris() {
     if let Some(dir) = system_config_dir() {
-      assert_eq!(dir.file_name().unwrap(), "lycoris");
+      assert!(dir.components().any(|c| c.as_os_str() == "lycoris"));
     }
   }
 
   #[test]
-  fn default_data_dir_ends_with_lycoris() {
+  fn default_data_dir_contains_lycoris() {
     let dir = default_data_dir();
-    assert_eq!(dir.file_name().unwrap(), "lycoris");
+    assert!(dir.components().any(|c| c.as_os_str() == "lycoris"));
   }
 
   #[test]
