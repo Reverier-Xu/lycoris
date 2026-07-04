@@ -239,7 +239,7 @@ mod platform {
 
 #[cfg(target_os = "macos")]
 mod platform {
-  use std::{fs, path::Path, process::Command};
+  use std::{env, fs, path::Path, process::Command};
 
   use anyhow::{Context, bail};
 
