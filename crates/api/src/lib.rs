@@ -59,11 +59,15 @@ impl ClusterRpcClient {
   pub async fn connect(address: &str, tls: ClientTlsConfig) -> Result<Self, ClusterClientError> {
     let endpoint = Channel::from_shared(address.to_string())?
       .tls_config(tls)?
-      .connect_timeout(Duration::from_secs(5));
+      .connect_timeout(Duration::from_secs(3));
     let channel = endpoint.connect().await?;
-    Ok(Self {
+    Ok(Self::from_channel(channel))
+  }
+
+  pub fn from_channel(channel: Channel) -> Self {
+    Self {
       inner: Arc::new(Mutex::new(ClusterClient::new(channel))),
-    })
+    }
   }
 
   pub async fn register<T: NodeInfo>(&self, node: &T) -> Result<(), ClusterClientError> {
@@ -128,11 +132,15 @@ impl SyncRpcClient {
   pub async fn connect(address: &str, tls: ClientTlsConfig) -> Result<Self, ClusterClientError> {
     let endpoint = Channel::from_shared(address.to_string())?
       .tls_config(tls)?
-      .connect_timeout(Duration::from_secs(5));
+      .connect_timeout(Duration::from_secs(3));
     let channel = endpoint.connect().await?;
-    Ok(Self {
+    Ok(Self::from_channel(channel))
+  }
+
+  pub fn from_channel(channel: Channel) -> Self {
+    Self {
       inner: Arc::new(Mutex::new(SyncClient::new(channel))),
-    })
+    }
   }
 
   pub async fn sync_nodes(
@@ -169,11 +177,15 @@ impl MembershipRpcClient {
   pub async fn connect(address: &str, tls: ClientTlsConfig) -> Result<Self, ClusterClientError> {
     let endpoint = Channel::from_shared(address.to_string())?
       .tls_config(tls)?
-      .connect_timeout(Duration::from_secs(5));
+      .connect_timeout(Duration::from_secs(3));
     let channel = endpoint.connect().await?;
-    Ok(Self {
+    Ok(Self::from_channel(channel))
+  }
+
+  pub fn from_channel(channel: Channel) -> Self {
+    Self {
       inner: Arc::new(Mutex::new(MembershipClient::new(channel))),
-    })
+    }
   }
 
   pub async fn probe(&self, seq: u64, target: &str) -> Result<ProbeResponse, ClusterClientError> {
@@ -224,10 +236,14 @@ pub struct PeerClient {
 
 impl PeerClient {
   pub async fn connect(address: &str, tls: ClientTlsConfig) -> Result<Self, ClusterClientError> {
+    let endpoint = Channel::from_shared(address.to_string())?
+      .tls_config(tls)?
+      .connect_timeout(Duration::from_secs(3));
+    let channel = endpoint.connect().await?;
     Ok(Self {
-      cluster: ClusterRpcClient::connect(address, tls.clone()).await?,
-      sync: SyncRpcClient::connect(address, tls.clone()).await?,
-      membership: MembershipRpcClient::connect(address, tls).await?,
+      cluster: ClusterRpcClient::from_channel(channel.clone()),
+      sync: SyncRpcClient::from_channel(channel.clone()),
+      membership: MembershipRpcClient::from_channel(channel),
     })
   }
 }
@@ -255,6 +271,8 @@ pub enum ClusterClientError {
   Status(Box<tonic::Status>),
   #[error("{0} rejected by peer")]
   Rejected(String),
+  #[error("peer connection timed out")]
+  Timeout,
 }
 
 impl From<tonic::Status> for ClusterClientError {

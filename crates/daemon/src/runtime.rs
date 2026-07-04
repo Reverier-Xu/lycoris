@@ -51,6 +51,12 @@ pub async fn run(config: DaemonConfig) -> Result<(), RuntimeError> {
     storage.seed_peer(peer)?;
   }
 
+  if storage.get_primary()?.is_none()
+    && let Some(first_peer) = config.cluster.bootstrap_peers.first()
+  {
+    storage.set_primary(first_peer)?;
+  }
+
   let mut local_register = MemberRegister::new(&config.node.id, &config.node.address, 1, 0);
   local_register.labels = storage.local_labels().unwrap_or_default();
   local_register.annotations = storage.local_annotations().unwrap_or_default();

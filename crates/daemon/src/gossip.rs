@@ -19,7 +19,7 @@ use lycoris_api::{
 };
 use lycoris_config::time::now_ms;
 use lycoris_storage::ClusterStorage;
-use tokio::sync::Mutex;
+use tokio::{sync::Mutex, time::timeout};
 use tonic::{Request, Response, Status, transport::ClientTlsConfig};
 
 use crate::{
@@ -42,6 +42,8 @@ pub struct Gossip {
   seen_pushes: Arc<Mutex<HashSet<(String, u64)>>>,
   sequence: Arc<AtomicU64>,
 }
+
+const RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl Gossip {
   pub fn new(
@@ -215,24 +217,41 @@ impl Gossip {
     let mut primary_set = false;
 
     if let Some(primary) = self.storage.get_primary().unwrap_or(None) {
-      if self
-        .sync_with_peer(&primary, snapshot.clone())
-        .await
-        .is_ok()
-      {
-        primary_set = true;
-      } else {
-        tracing::warn!(%primary, "primary endpoint unreachable, trying fallbacks");
+      match timeout(RPC_TIMEOUT, self.sync_with_peer(&primary, snapshot.clone())).await {
+        Ok(Ok(())) => {
+          primary_set = true;
+        }
+        Ok(Err(error)) => {
+          tracing::warn!(%primary, %error, "primary endpoint unreachable, trying fallbacks");
+          self.remove_client(&primary).await;
+        }
+        Err(_) => {
+          tracing::warn!(%primary, "primary endpoint timed out, trying fallbacks");
+          self.remove_client(&primary).await;
+        }
       }
     }
 
     let fallbacks = self.storage.fallback_peers().unwrap_or_default();
     for peer in fallbacks {
-      if self.sync_with_peer(&peer, snapshot.clone()).await.is_ok() && !primary_set {
-        if let Err(error) = self.storage.set_primary(&peer) {
-          tracing::warn!(%peer, %error, "failed to promote fallback to primary");
+      let result = timeout(RPC_TIMEOUT, self.sync_with_peer(&peer, snapshot.clone())).await;
+      match result {
+        Ok(Ok(())) => {
+          if !primary_set {
+            if let Err(error) = self.storage.set_primary(&peer) {
+              tracing::warn!(%peer, %error, "failed to promote fallback to primary");
+            }
+            primary_set = true;
+          }
         }
-        primary_set = true;
+        Ok(Err(error)) => {
+          tracing::warn!(%peer, %error, "fallback peer sync failed");
+          self.remove_client(&peer).await;
+        }
+        Err(_) => {
+          tracing::warn!(%peer, "fallback peer sync timed out");
+          self.remove_client(&peer).await;
+        }
       }
     }
   }
@@ -242,13 +261,24 @@ impl Gossip {
   ) -> Result<(), ClusterClientError> {
     let client = self.connect_peer(peer).await?;
 
-    let (remote_root, remote_leaves) = match client.membership.merkle_root().await {
-      Ok(root) => root,
-      Err(error) => {
-        tracing::warn!(%peer, %error, "merkle root failed, falling back to full sync");
-        return self.full_sync_with_peer(peer).await;
-      }
-    };
+    let (remote_root, remote_leaves) =
+      match timeout(RPC_TIMEOUT, client.membership.merkle_root()).await {
+        Ok(Ok(root)) => root,
+        Ok(Err(error)) => {
+          tracing::warn!(%peer, %error, "merkle root failed, falling back to full sync");
+          return timeout(RPC_TIMEOUT, self.full_sync_with_peer(peer))
+            .await
+            .map_err(|_| ClusterClientError::Timeout)
+            .and_then(|result| result);
+        }
+        Err(_) => {
+          tracing::warn!(%peer, "merkle root timed out, falling back to full sync");
+          return timeout(RPC_TIMEOUT, self.full_sync_with_peer(peer))
+            .await
+            .map_err(|_| ClusterClientError::Timeout)
+            .and_then(|result| result);
+        }
+      };
 
     let local_root = self.service.merkle_root().await;
     if remote_root == local_root.root_hash {
@@ -336,42 +366,65 @@ impl Gossip {
     for peer in targets {
       let info = info.clone();
       let origin = origin.clone();
-      match self.connect_peer(&peer).await {
-        Ok(client) => {
-          if let Err(error) = client.sync.push_node(info, origin, sequence).await {
-            tracing::warn!(%peer, %error, "push to peer failed");
-            let _ = self.storage.mark_peer_attempt(&peer, false);
-          } else {
-            let _ = self.storage.mark_peer_seen(&peer, now_ms());
-          }
+      match timeout(
+        RPC_TIMEOUT,
+        self.push_to_peer(&peer, info, origin, sequence),
+      )
+      .await
+      {
+        Ok(Ok(())) => {
+          let _ = self.storage.mark_peer_seen(&peer, now_ms());
         }
-        Err(error) => {
-          tracing::warn!(%peer, %error, "failed to connect to peer for push");
+        Ok(Err(error)) => {
+          tracing::warn!(%peer, %error, "push to peer failed");
           let _ = self.storage.mark_peer_attempt(&peer, false);
+          self.remove_client(&peer).await;
+        }
+        Err(_) => {
+          tracing::warn!(%peer, "push to peer timed out");
+          let _ = self.storage.mark_peer_attempt(&peer, false);
+          self.remove_client(&peer).await;
         }
       }
     }
+  }
+
+  async fn push_to_peer(
+    &self, peer: &str, info: ProtoNodeInfo, origin: String, sequence: u64,
+  ) -> Result<(), ClusterClientError> {
+    let client = self.connect_peer(peer).await?;
+    client.sync.push_node(info, origin, sequence).await?;
+    Ok(())
   }
 
   async fn broadcast_gossip(&self, message: GossipMessage) {
     let targets = self.current_targets().await;
     for peer in targets {
       let message = message.clone();
-      match self.connect_peer(&peer).await {
-        Ok(client) => {
-          if let Err(error) = client.membership.gossip(message).await {
-            tracing::warn!(%peer, %error, "gossip to peer failed");
-            let _ = self.storage.mark_peer_attempt(&peer, false);
-          } else {
-            let _ = self.storage.mark_peer_seen(&peer, now_ms());
-          }
+      match timeout(RPC_TIMEOUT, self.gossip_to_peer(&peer, message)).await {
+        Ok(Ok(())) => {
+          let _ = self.storage.mark_peer_seen(&peer, now_ms());
         }
-        Err(error) => {
-          tracing::warn!(%peer, %error, "failed to connect to peer for gossip");
+        Ok(Err(error)) => {
+          tracing::warn!(%peer, %error, "gossip to peer failed");
           let _ = self.storage.mark_peer_attempt(&peer, false);
+          self.remove_client(&peer).await;
+        }
+        Err(_) => {
+          tracing::warn!(%peer, "gossip to peer timed out");
+          let _ = self.storage.mark_peer_attempt(&peer, false);
+          self.remove_client(&peer).await;
         }
       }
     }
+  }
+
+  async fn gossip_to_peer(
+    &self, peer: &str, message: GossipMessage,
+  ) -> Result<(), ClusterClientError> {
+    let client = self.connect_peer(peer).await?;
+    client.membership.gossip(message).await?;
+    Ok(())
   }
 
   async fn current_targets(&self) -> Vec<String> {
@@ -392,13 +445,34 @@ impl Gossip {
   }
 
   async fn connect_peer(&self, address: &str) -> Result<PeerClient, ClusterClientError> {
-    let mut clients = self.clients.lock().await;
-    if let Some(client) = clients.get(address) {
-      return Ok(client.clone());
+    {
+      let clients = self.clients.lock().await;
+      if let Some(client) = clients.get(address) {
+        return Ok(client.clone());
+      }
     }
-    let client = PeerClient::connect(address, self.tls.clone()).await?;
+
+    let connect = PeerClient::connect(address, self.tls.clone());
+    let client = match timeout(Duration::from_secs(3), connect).await {
+      Ok(Ok(client)) => client,
+      Ok(Err(error)) => {
+        tracing::warn!(%address, %error, "peer connect failed");
+        return Err(error);
+      }
+      Err(_) => {
+        tracing::warn!(%address, "peer connect timed out");
+        return Err(ClusterClientError::Timeout);
+      }
+    };
+
+    let mut clients = self.clients.lock().await;
     clients.insert(address.to_string(), client.clone());
     Ok(client)
+  }
+
+  async fn remove_client(&self, address: &str) {
+    let mut clients = self.clients.lock().await;
+    clients.remove(address);
   }
 
   /// Handle an incoming `SyncNodes` RPC: merge remote state and return our
