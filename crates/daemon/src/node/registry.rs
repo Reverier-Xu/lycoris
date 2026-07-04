@@ -1,7 +1,7 @@
 use std::{collections::HashMap, time::Duration};
 
 use lycoris_api::proto::NodeInfo as ProtoNodeInfo;
-use lycoris_config::NodeInfo;
+use lycoris_config::{NodeInfo, time::now_ms};
 
 use crate::storage::{ClusterNodeRecord, NodeState, Storage};
 
@@ -38,18 +38,19 @@ impl NodeRegistry {
   /// Merge a batch of nodes into the registry, keeping the latest heartbeat per
   /// node.
   pub fn merge(&self, nodes: Vec<ProtoNodeInfo>) {
-    for info in nodes {
-      let existing = self
-        .storage
-        .list_cluster_nodes()
-        .unwrap_or_default()
-        .into_iter()
-        .find(|n| n.id == info.id);
+    let existing: HashMap<String, ClusterNodeRecord> = self
+      .storage
+      .list_cluster_nodes()
+      .unwrap_or_default()
+      .into_iter()
+      .map(|record| (record.id.clone(), record))
+      .collect();
 
-      let keep = match existing {
-        Some(existing) => info.last_heartbeat_unix_ms >= existing.last_heartbeat_ms,
-        None => true,
-      };
+    for info in nodes {
+      let keep = existing
+        .get(&info.id)
+        .map(|record| info.last_heartbeat_unix_ms >= record.last_heartbeat_ms)
+        .unwrap_or(true);
 
       if keep {
         let record = ClusterNodeRecord {
@@ -118,14 +119,6 @@ fn matches_selector(labels: &HashMap<String, String>, selector: &HashMap<String,
   selector
     .iter()
     .all(|(key, value)| labels.get(key) == Some(value))
-}
-
-fn now_ms() -> i64 {
-  use std::time::{SystemTime, UNIX_EPOCH};
-  SystemTime::now()
-    .duration_since(UNIX_EPOCH)
-    .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(0))
-    .unwrap_or(0)
 }
 
 #[cfg(test)]

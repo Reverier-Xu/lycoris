@@ -6,7 +6,6 @@ use lycoris_daemon::{node::info::LocalNode, storage::Storage};
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
 use tempfile::TempDir;
 use tokio::time;
-use tonic::transport::ClientTlsConfig;
 
 fn generate_test_certs(
   node_count: usize,
@@ -45,13 +44,8 @@ fn generate_test_certs(
 
 fn client_tls_config(
   cert_path: &std::path::Path, key_path: &std::path::Path, ca_path: &std::path::Path,
-) -> ClientTlsConfig {
-  let cert = std::fs::read_to_string(cert_path).unwrap();
-  let key = std::fs::read_to_string(key_path).unwrap();
-  let ca = std::fs::read_to_string(ca_path).unwrap();
-  ClientTlsConfig::new()
-    .identity(tonic::transport::Identity::from_pem(cert, key))
-    .ca_certificate(tonic::transport::Certificate::from_pem(ca))
+) -> tonic::transport::ClientTlsConfig {
+  lycoris_api::tls::load_client_tls(cert_path, key_path, ca_path).unwrap()
 }
 
 #[allow(clippy::too_many_arguments)]

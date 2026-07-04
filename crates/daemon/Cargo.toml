@@ -39,3 +39,6 @@ tracing-subscriber.workspace = true
 lycoris-api.workspace = true
 lycoris-config.workspace  = true
 tempfile.workspace        = true
+
+[lints]
+workspace = true

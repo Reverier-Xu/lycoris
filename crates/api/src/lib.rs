@@ -1,6 +1,9 @@
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use lycoris_config::NodeInfo;
+use lycoris_config::{NodeInfo, time::now_ms};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tonic::{
@@ -12,6 +15,8 @@ pub mod proto {
   #![allow(clippy::result_large_err)]
   tonic::include_proto!("lycoris.daemon");
 }
+
+pub mod tls;
 
 /// Install the rustls ring crypto provider as the process default.
 /// This must be called before any TLS connection is established.
@@ -176,14 +181,6 @@ fn proto_from_node<T: NodeInfo>(node: &T) -> ProtoNodeInfo {
     annotations: node.annotations(),
     last_heartbeat_unix_ms: now_ms(),
   }
-}
-
-fn now_ms() -> i64 {
-  use std::time::{SystemTime, UNIX_EPOCH};
-  SystemTime::now()
-    .duration_since(UNIX_EPOCH)
-    .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(0))
-    .unwrap_or(0)
 }
 
 #[derive(Debug, Error)]

@@ -38,7 +38,7 @@ where
   let ca_cert_pem = std::fs::read_to_string(ca_cert_path)?;
   let ca_key_pem = std::fs::read_to_string(ca_key_path)?;
   let ca_key = KeyPair::from_pem(&ca_key_pem)?;
-  let ca_cert = reconstruct_ca(&ca_key);
+  let ca_cert = reconstruct_ca(&ca_key)?;
 
   if !cert_path.exists() || !key_path.exists() {
     let key = KeyPair::generate()?;
@@ -82,13 +82,10 @@ fn node_cert_params(node_id: &str) -> Result<CertificateParams, TlsError> {
   Ok(CertificateParams::new(names)?)
 }
 
-fn reconstruct_ca(ca_key: &KeyPair) -> rcgen::Certificate {
-  let mut params =
-    CertificateParams::new(vec![CA_SUBJECT.to_string()]).expect("static subject is valid");
+fn reconstruct_ca(ca_key: &KeyPair) -> Result<rcgen::Certificate, TlsError> {
+  let mut params = CertificateParams::new(vec![CA_SUBJECT.to_string()])?;
   params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-  params
-    .self_signed(ca_key)
-    .expect("CA reconstruction with loaded key must succeed")
+  Ok(params.self_signed(ca_key)?)
 }
 
 fn write_file<P: AsRef<Path>>(path: P, content: String) -> Result<(), TlsError> {

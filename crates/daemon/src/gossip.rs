@@ -15,6 +15,7 @@ use lycoris_api::{
     sync_server::{Sync, SyncServer},
   },
 };
+use lycoris_config::time::now_ms;
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status, transport::ClientTlsConfig};
 
@@ -144,13 +145,15 @@ impl Gossip {
   }
 
   async fn current_targets(&self) -> Vec<String> {
+    let mut seen = HashSet::new();
     let mut targets = Vec::new();
     if let Ok(Some(primary)) = self.storage.get_primary() {
+      seen.insert(primary.clone());
       targets.push(primary);
     }
     if let Ok(fallbacks) = self.storage.fallback_peers() {
       for peer in fallbacks {
-        if !targets.contains(&peer) {
+        if seen.insert(peer.clone()) {
           targets.push(peer);
         }
       }
@@ -234,12 +237,4 @@ impl Sync for Gossip {
   ) -> Result<Response<PushNodeResponse>, Status> {
     self.handle_push_node(request).await
   }
-}
-
-fn now_ms() -> i64 {
-  use std::time::{SystemTime, UNIX_EPOCH};
-  SystemTime::now()
-    .duration_since(UNIX_EPOCH)
-    .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(0))
-    .unwrap_or(0)
 }

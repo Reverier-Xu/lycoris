@@ -1,44 +1,42 @@
-use std::{
-  env,
-  ffi::OsString,
-  path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
+
+use directories::{BaseDirs, ProjectDirs};
 
 pub const DAEMON_CONFIG_FILE_NAME: &str = "lycoris.toml";
 pub const CLIENT_CONFIG_FILE_NAME: &str = "lycoris.client.conf";
 
-/// Return the path to the user-specific configuration directory for lycoris.
-///
-/// Respects `$XDG_CONFIG_HOME`; otherwise falls back to
-/// `$HOME/.config/lycoris`. Returns `None` when neither variable is set.
-pub fn user_config_dir() -> Option<PathBuf> {
-  user_config_dir_from_env(env::var_os("XDG_CONFIG_HOME"), env::var_os("HOME"))
+fn project_dirs() -> Option<ProjectDirs> {
+  ProjectDirs::from("", "", "lycoris")
 }
 
-fn user_config_dir_from_env(
-  xdg_config_home: Option<OsString>, home: Option<OsString>,
-) -> Option<PathBuf> {
-  xdg_config_home
-    .map(PathBuf::from)
-    .or_else(|| home.map(|home| PathBuf::from(home).join(".config")))
-    .map(|dir| dir.join("lycoris"))
+/// Return the path to the user-specific configuration directory for lycoris.
+///
+/// Uses the platform's user configuration directory:
+/// - Linux: `$XDG_CONFIG_HOME/lycoris` or `$HOME/.config/lycoris`
+/// - macOS: `$HOME/Library/Application Support/lycoris`
+/// - Windows: `%APPDATA%\lycoris\config`
+pub fn user_config_dir() -> Option<PathBuf> {
+  project_dirs().map(|dirs| dirs.config_dir().to_path_buf())
 }
 
 /// Return the system-wide configuration directory for lycoris.
-pub fn system_config_dir() -> PathBuf {
-  PathBuf::from("/etc/lycoris")
+///
+/// Uses the platform's system configuration directory:
+/// - Linux: `/etc/lycoris`
+/// - macOS: `/Library/Application Support/lycoris`
+/// - Windows: `%PROGRAMDATA%\lycoris`
+pub fn system_config_dir() -> Option<PathBuf> {
+  BaseDirs::new().map(|dirs| dirs.config_dir().join("lycoris"))
 }
 
 /// Return candidate configuration directories in precedence order.
 ///
 /// User configuration takes precedence over system configuration.
 pub fn config_dirs() -> Vec<PathBuf> {
-  let mut dirs = Vec::with_capacity(2);
-  if let Some(user) = user_config_dir() {
-    dirs.push(user);
-  }
-  dirs.push(system_config_dir());
-  dirs
+  user_config_dir()
+    .into_iter()
+    .chain(system_config_dir())
+    .collect()
 }
 
 /// Select the best configuration file path from a list of candidate
@@ -74,44 +72,36 @@ pub fn default_client_config_path() -> Option<PathBuf> {
 
 /// Return the default data directory for lycoris.
 ///
-/// On Linux, root processes use `/var/lib/lycoris`; unprivileged processes use
-/// `$XDG_DATA_HOME/lycoris` or `$HOME/.local/share/lycoris`. On other platforms
-/// the function falls back to a user-local directory under `$HOME`.
-pub fn default_data_dir() -> PathBuf {
-  default_data_dir_from_env(is_root(), env::var_os("XDG_DATA_HOME"), env::var_os("HOME"))
-}
-
-fn default_data_dir_from_env(
-  root: bool, xdg_data_home: Option<OsString>, home: Option<OsString>,
-) -> PathBuf {
-  if root {
-    return PathBuf::from("/var/lib/lycoris");
-  }
-
-  xdg_data_home
-    .map(PathBuf::from)
-    .or_else(|| home.map(|home| PathBuf::from(home).join(".local/share")))
-    .map(|dir| dir.join("lycoris"))
-    .unwrap_or_else(|| PathBuf::from("/tmp/lycoris"))
-}
-
-/// Best-effort root detection on Linux by reading `/proc/self/status`.
+/// Privileged processes use the platform's system data directory:
+/// - Linux: `/var/lib/lycoris`
+/// - macOS: `/Library/Application Support/lycoris`
+/// - Windows: `%PROGRAMDATA%\lycoris`
 ///
-/// Falls back to `false` on non-Linux platforms or if the status file cannot be
-/// parsed.
-fn is_root() -> bool {
-  current_uid() == Some(0)
+/// Unprivileged processes use the user-local data directory:
+/// - Linux: `$XDG_DATA_HOME/lycoris` or `$HOME/.local/share/lycoris`
+/// - macOS: `$HOME/Library/Application Support/lycoris`
+/// - Windows: `%LOCALAPPDATA%\lycoris`
+///
+/// If the platform directories cannot be determined, falls back to a
+/// temporary directory.
+pub fn default_data_dir() -> PathBuf {
+  if is_root::is_root() {
+    system_data_dir().unwrap_or_else(fallback_data_dir)
+  } else {
+    user_data_dir().unwrap_or_else(fallback_data_dir)
+  }
 }
 
-fn current_uid() -> Option<u32> {
-  let status = std::fs::read_to_string("/proc/self/status").ok()?;
-  status
-    .lines()
-    .find(|line| line.starts_with("Uid:"))?
-    .split_whitespace()
-    .nth(1)?
-    .parse()
-    .ok()
+fn system_data_dir() -> Option<PathBuf> {
+  BaseDirs::new().map(|dirs| dirs.data_local_dir().join("lycoris"))
+}
+
+fn user_data_dir() -> Option<PathBuf> {
+  project_dirs().map(|dirs| dirs.data_dir().to_path_buf())
+}
+
+fn fallback_data_dir() -> PathBuf {
+  std::env::temp_dir().join("lycoris")
 }
 
 /// Ensure a directory exists, creating it and its parents if necessary.
@@ -124,25 +114,28 @@ mod tests {
   use super::*;
 
   #[test]
-  fn user_config_dir_uses_xdg_when_set() {
-    let base = PathBuf::from("/tmp/lycoris-xdg-test");
-    let dir = user_config_dir_from_env(
-      Some(OsString::from(&base)),
-      Some(OsString::from("/unused/home")),
-    );
-    assert_eq!(dir, Some(base.join("lycoris")));
+  fn user_config_dir_ends_with_lycoris() {
+    if let Some(dir) = user_config_dir() {
+      assert_eq!(dir.file_name().unwrap(), "lycoris");
+    }
   }
 
   #[test]
-  fn user_config_dir_falls_back_to_home() {
-    let home = PathBuf::from("/tmp/lycoris-home-test");
-    let dir = user_config_dir_from_env(None, Some(OsString::from(&home)));
-    assert_eq!(dir, Some(home.join(".config/lycoris")));
+  fn system_config_dir_ends_with_lycoris() {
+    if let Some(dir) = system_config_dir() {
+      assert_eq!(dir.file_name().unwrap(), "lycoris");
+    }
+  }
+
+  #[test]
+  fn default_data_dir_ends_with_lycoris() {
+    let dir = default_data_dir();
+    assert_eq!(dir.file_name().unwrap(), "lycoris");
   }
 
   #[test]
   fn select_config_path_prefers_existing_user_file() {
-    let tmp = env::temp_dir().join("lycoris-config-precedence");
+    let tmp = std::env::temp_dir().join("lycoris-config-precedence");
     let _ = std::fs::remove_dir_all(&tmp);
     let user_dir = tmp.join("user");
     let system_dir = tmp.join("system");
@@ -171,25 +164,5 @@ mod tests {
     assert_eq!(path, Some(user_dir.join(DAEMON_CONFIG_FILE_NAME)));
 
     let _ = std::fs::remove_dir_all(&tmp);
-  }
-
-  #[test]
-  fn default_data_dir_uses_xdg_when_set() {
-    let base = PathBuf::from("/tmp/lycoris-xdg-data");
-    let dir = default_data_dir_from_env(false, Some(OsString::from(&base)), None);
-    assert_eq!(dir, base.join("lycoris"));
-  }
-
-  #[test]
-  fn default_data_dir_falls_back_to_home_local_share() {
-    let home = PathBuf::from("/tmp/lycoris-home-data");
-    let dir = default_data_dir_from_env(false, None, Some(OsString::from(&home)));
-    assert_eq!(dir, home.join(".local/share/lycoris"));
-  }
-
-  #[test]
-  fn default_data_dir_for_root_uses_var_lib() {
-    let dir = default_data_dir_from_env(true, None, None);
-    assert_eq!(dir, PathBuf::from("/var/lib/lycoris"));
   }
 }

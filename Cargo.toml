@@ -19,10 +19,15 @@ lto           = "thin"
 opt-level     = "z"
 strip         = true
 
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
 [workspace.dependencies]
 anyhow        = "1.0"
 clap          = "4.6"
 dashmap       = "6.1"
+directories   = "6.0"
+is-root       = "0.1.3"
 lycoris-api    = { path = "crates/api" }
 lycoris-config = { path = "crates/config" }
 owo-colors    = "4.3"

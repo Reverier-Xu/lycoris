@@ -3,18 +3,23 @@ use std::{fs, path::Path};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::daemon::DaemonConfig;
+use crate::{daemon::DaemonConfig, validation::non_empty_string};
 
 /// Client configuration used by the `lycoris` CLI to talk to a daemon node.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientConfig {
   /// gRPC API endpoint of the daemon node, e.g. `https://127.0.0.1:5001`.
+  #[serde(deserialize_with = "non_empty_string")]
   pub api_address: String,
   /// Path to the CA certificate used to verify the daemon's TLS identity.
+  #[serde(deserialize_with = "non_empty_string")]
   pub ca_cert: String,
   /// Path to the client certificate used for mutual TLS.
+  #[serde(deserialize_with = "non_empty_string")]
   pub cert: String,
   /// Path to the client private key used for mutual TLS.
+  #[serde(deserialize_with = "non_empty_string")]
   pub key: String,
 }
 
@@ -22,7 +27,6 @@ impl ClientConfig {
   pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, ClientConfigError> {
     let content = fs::read_to_string(path.as_ref())?;
     let config: ClientConfig = toml::from_str(&content)?;
-    config.validate()?;
     Ok(config)
   }
 
@@ -44,30 +48,6 @@ impl ClientConfig {
     fs::write(path.as_ref(), toml::to_string_pretty(self)?)?;
     Ok(())
   }
-
-  fn validate(&self) -> Result<(), ClientConfigError> {
-    if self.api_address.is_empty() {
-      return Err(ClientConfigError::Invalid(
-        "api_address must not be empty".to_string(),
-      ));
-    }
-    if self.ca_cert.is_empty() {
-      return Err(ClientConfigError::Invalid(
-        "ca_cert must not be empty".to_string(),
-      ));
-    }
-    if self.cert.is_empty() {
-      return Err(ClientConfigError::Invalid(
-        "cert must not be empty".to_string(),
-      ));
-    }
-    if self.key.is_empty() {
-      return Err(ClientConfigError::Invalid(
-        "key must not be empty".to_string(),
-      ));
-    }
-    Ok(())
-  }
 }
 
 #[derive(Debug, Error)]
@@ -78,8 +58,6 @@ pub enum ClientConfigError {
   Parse(#[from] toml::de::Error),
   #[error("serialize error: {0}")]
   Serialize(#[from] toml::ser::Error),
-  #[error("invalid client config: {0}")]
-  Invalid(String),
 }
 
 #[cfg(test)]
@@ -118,5 +96,17 @@ mod tests {
     let loaded = ClientConfig::from_file(&path).unwrap();
     assert_eq!(loaded.api_address, original.api_address);
     assert_eq!(loaded.ca_cert, original.ca_cert);
+  }
+
+  #[test]
+  fn reject_empty_api_address() {
+    let toml = r#"
+      api_address = ""
+      ca_cert = "ca.crt"
+      cert = "node.crt"
+      key = "node.key"
+    "#;
+    let result: Result<ClientConfig, _> = toml::from_str(toml);
+    assert!(result.is_err());
   }
 }

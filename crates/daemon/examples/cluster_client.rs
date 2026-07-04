@@ -1,9 +1,8 @@
 use std::{collections::HashMap, time::Duration};
 
-use lycoris_api::ClusterRpcClient;
+use lycoris_api::{ClusterRpcClient, tls::load_client_tls};
 use lycoris_config::NodeConfig;
 use lycoris_daemon::{node::info::LocalNode, storage::Storage};
-use tonic::transport::ClientTlsConfig;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -26,7 +25,7 @@ async fn main() -> anyhow::Result<()> {
   let key_path = &args[5];
   let expected_id = &args[6];
 
-  let tls = client_tls_config(cert_path, key_path, ca_path);
+  let tls = load_client_tls(cert_path, key_path, ca_path)?;
 
   let client = ClusterRpcClient::connect(register_addr, tls.clone()).await?;
   let storage_dir = std::env::temp_dir().join(format!("lycoris-client-{expected_id}"));
@@ -55,13 +54,4 @@ async fn main() -> anyhow::Result<()> {
   } else {
     anyhow::bail!("{expected_id} not visible on {query_addr}");
   }
-}
-
-fn client_tls_config(cert_path: &str, key_path: &str, ca_path: &str) -> ClientTlsConfig {
-  let cert = std::fs::read_to_string(cert_path).unwrap();
-  let key = std::fs::read_to_string(key_path).unwrap();
-  let ca = std::fs::read_to_string(ca_path).unwrap();
-  ClientTlsConfig::new()
-    .identity(tonic::transport::Identity::from_pem(cert, key))
-    .ca_certificate(tonic::transport::Certificate::from_pem(ca))
 }

@@ -4,6 +4,7 @@ use std::{
   sync::{Arc, Mutex},
 };
 
+use lycoris_config::time::now_ms;
 use rusqlite::{Connection, params};
 use thiserror::Error;
 use tokio::sync::Notify;
@@ -65,6 +66,24 @@ impl Storage {
     self.change_notify.notify_one();
   }
 
+  fn with_connection<R, F>(&self, operation: F) -> Result<R, StorageError>
+  where
+    F: FnOnce(&Connection) -> Result<R, StorageError>, {
+    let connection = self
+      .connection
+      .lock()
+      .map_err(|_| StorageError::LockPoisoned)?;
+    operation(&connection)
+  }
+
+  fn with_connection_mutating<R, F>(&self, operation: F) -> Result<R, StorageError>
+  where
+    F: FnOnce(&Connection) -> Result<R, StorageError>, {
+    let result = self.with_connection(operation)?;
+    self.notify_change();
+    Ok(result)
+  }
+
   fn init_schema(connection: &Connection) -> Result<(), StorageError> {
     connection.execute(
       "CREATE TABLE IF NOT EXISTS local_node_labels (
@@ -116,76 +135,75 @@ impl Storage {
   // info) ---
 
   pub fn set_local_label(&self, key: &str, value: &str) -> Result<(), StorageError> {
-    let connection = self.connection.lock().unwrap();
-    connection.execute(
-      "INSERT INTO local_node_labels (key, value) VALUES (?1, ?2)
+    self.with_connection_mutating(|conn| {
+      conn.execute(
+        "INSERT INTO local_node_labels (key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-      params![key, value],
-    )?;
-    drop(connection);
-    self.notify_change();
-    Ok(())
+        params![key, value],
+      )?;
+      Ok(())
+    })
   }
 
   pub fn set_local_annotation(&self, key: &str, value: &str) -> Result<(), StorageError> {
-    let connection = self.connection.lock().unwrap();
-    connection.execute(
-      "INSERT INTO local_node_annotations (key, value) VALUES (?1, ?2)
+    self.with_connection_mutating(|conn| {
+      conn.execute(
+        "INSERT INTO local_node_annotations (key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-      params![key, value],
-    )?;
-    drop(connection);
-    self.notify_change();
-    Ok(())
+        params![key, value],
+      )?;
+      Ok(())
+    })
   }
 
   pub fn local_labels(&self) -> Result<HashMap<String, String>, StorageError> {
-    let connection = self.connection.lock().unwrap();
-    let mut statement = connection.prepare("SELECT key, value FROM local_node_labels")?;
-    let rows = statement.query_map([], |row| {
-      Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
-    rows
-      .collect::<Result<HashMap<_, _>, _>>()
-      .map_err(Into::into)
+    self.with_connection(|conn| {
+      let mut statement = conn.prepare("SELECT key, value FROM local_node_labels")?;
+      let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+      })?;
+      rows
+        .collect::<Result<HashMap<_, _>, _>>()
+        .map_err(Into::into)
+    })
   }
 
   pub fn local_annotations(&self) -> Result<HashMap<String, String>, StorageError> {
-    let connection = self.connection.lock().unwrap();
-    let mut statement = connection.prepare("SELECT key, value FROM local_node_annotations")?;
-    let rows = statement.query_map([], |row| {
-      Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
-    rows
-      .collect::<Result<HashMap<_, _>, _>>()
-      .map_err(Into::into)
+    self.with_connection(|conn| {
+      let mut statement = conn.prepare("SELECT key, value FROM local_node_annotations")?;
+      let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+      })?;
+      rows
+        .collect::<Result<HashMap<_, _>, _>>()
+        .map_err(Into::into)
+    })
   }
 
   // --- Cluster node registry (synced) ---
 
   pub fn upsert_cluster_node(&self, node: &ClusterNodeRecord) -> Result<(), StorageError> {
-    let connection = self.connection.lock().unwrap();
-    connection.execute(
-      "INSERT INTO cluster_nodes (id, address, last_heartbeat_ms, state)
+    self.with_connection_mutating(|conn| {
+      conn.execute(
+        "INSERT INTO cluster_nodes (id, address, last_heartbeat_ms, state)
              VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(id) DO UPDATE SET
                 address = excluded.address,
                 last_heartbeat_ms = excluded.last_heartbeat_ms,
                 state = excluded.state",
-      params![
-        node.id,
-        node.address,
-        node.last_heartbeat_ms,
-        state_to_string(node.state),
-      ],
-    )?;
+        params![
+          node.id,
+          node.address,
+          node.last_heartbeat_ms,
+          state_to_string(node.state),
+        ],
+      )?;
 
-    connection.execute(
-      "DELETE FROM cluster_node_attributes WHERE node_id = ?1",
-      [&node.id],
-    )?;
-    {
-      let mut stmt = connection.prepare(
+      conn.execute(
+        "DELETE FROM cluster_node_attributes WHERE node_id = ?1",
+        [&node.id],
+      )?;
+      let mut stmt = conn.prepare(
         "INSERT INTO cluster_node_attributes (node_id, kind, key, value) VALUES (?1, ?2, ?3, ?4)",
       )?;
       for (key, value) in &node.labels {
@@ -194,37 +212,46 @@ impl Storage {
       for (key, value) in &node.annotations {
         stmt.execute(params![&node.id, "annotation", key, value])?;
       }
-    }
-    drop(connection);
-    self.notify_change();
-    Ok(())
+      Ok(())
+    })
   }
 
   pub fn list_cluster_nodes(&self) -> Result<Vec<ClusterNodeRecord>, StorageError> {
-    let connection = self.connection.lock().unwrap();
-    let mut statement =
-      connection.prepare("SELECT id, address, last_heartbeat_ms, state FROM cluster_nodes")?;
-    let rows = statement.query_map([], |row| {
-      let id: String = row.get(0)?;
-      Ok(ClusterNodeRecord {
-        id: id.clone(),
-        address: row.get(1)?,
-        last_heartbeat_ms: row.get(2)?,
-        state: string_to_state(&row.get::<_, String>(3)?),
-        labels: Self::node_attributes(&connection, &id, "label").unwrap_or_default(),
-        annotations: Self::node_attributes(&connection, &id, "annotation").unwrap_or_default(),
-      })
-    })?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    self.with_connection(|conn| {
+      let mut statement =
+        conn.prepare("SELECT id, address, last_heartbeat_ms, state FROM cluster_nodes")?;
+      let rows = statement.query_map([], |row| {
+        Ok((
+          row.get::<_, String>(0)?,
+          row.get::<_, String>(1)?,
+          row.get::<_, i64>(2)?,
+          row.get::<_, String>(3)?,
+        ))
+      })?;
+      rows
+        .map(|row| {
+          let (id, address, last_heartbeat_ms, state_str) = row?;
+          Ok(ClusterNodeRecord {
+            id: id.clone(),
+            address,
+            last_heartbeat_ms,
+            state: string_to_state(&state_str)?,
+            labels: Self::node_attributes(conn, &id, "label").unwrap_or_default(),
+            annotations: Self::node_attributes(conn, &id, "annotation").unwrap_or_default(),
+          })
+        })
+        .collect()
+    })
   }
 
   pub fn cleanup_offline_nodes(&self, cutoff_ms: i64) -> Result<(), StorageError> {
-    let connection = self.connection.lock().unwrap();
-    connection.execute(
-      "UPDATE cluster_nodes SET state = 'offline' WHERE last_heartbeat_ms < ?1 AND state = 'alive'",
-      [cutoff_ms],
-    )?;
-    Ok(())
+    self.with_connection(|conn| {
+      conn.execute(
+        "UPDATE cluster_nodes SET state = 'offline' WHERE last_heartbeat_ms < ?1 AND state = 'alive'",
+        [cutoff_ms],
+      )?;
+      Ok(())
+    })
   }
 
   fn node_attributes(
@@ -244,82 +271,88 @@ impl Storage {
 
   /// Insert a bootstrap peer if it is not already known.
   pub fn seed_peer(&self, address: &str) -> Result<(), StorageError> {
-    let connection = self.connection.lock().unwrap();
-    connection.execute(
-      "INSERT OR IGNORE INTO peers (address, is_primary, online)
+    self.with_connection(|conn| {
+      conn.execute(
+        "INSERT OR IGNORE INTO peers (address, is_primary, online)
              VALUES (?1, 0, 0)",
-      [address],
-    )?;
-    Ok(())
+        [address],
+      )?;
+      Ok(())
+    })
   }
 
   /// Record that a peer was reachable at the given timestamp.
   pub fn mark_peer_seen(&self, address: &str, seen_ms: i64) -> Result<(), StorageError> {
-    let connection = self.connection.lock().unwrap();
-    connection.execute(
-      "INSERT INTO peers (address, is_primary, online, last_seen_ms, last_attempt_ms)
+    self.with_connection(|conn| {
+      conn.execute(
+        "INSERT INTO peers (address, is_primary, online, last_seen_ms, last_attempt_ms)
              VALUES (?1, 0, 1, ?2, ?2)
              ON CONFLICT(address) DO UPDATE SET
                 online = 1,
                 last_seen_ms = excluded.last_seen_ms,
                 last_attempt_ms = excluded.last_attempt_ms",
-      params![address, seen_ms],
-    )?;
-    Ok(())
+        params![address, seen_ms],
+      )?;
+      Ok(())
+    })
   }
 
   /// Record that a communication attempt with a peer happened now.
   pub fn mark_peer_attempt(&self, address: &str, online: bool) -> Result<(), StorageError> {
     let now = now_ms();
-    let connection = self.connection.lock().unwrap();
-    connection.execute(
-      "INSERT INTO peers (address, is_primary, online, last_attempt_ms)
+    self.with_connection(|conn| {
+      conn.execute(
+        "INSERT INTO peers (address, is_primary, online, last_attempt_ms)
              VALUES (?1, ?2, ?3)
              ON CONFLICT(address) DO UPDATE SET
                 online = excluded.online,
                 last_attempt_ms = excluded.last_attempt_ms",
-      params![address, online as i32, now],
-    )?;
-    Ok(())
+        params![address, online as i32, now],
+      )?;
+      Ok(())
+    })
   }
 
   /// Promote a peer to primary communication endpoint.
   pub fn set_primary(&self, address: &str) -> Result<(), StorageError> {
-    let connection = self.connection.lock().unwrap();
-    connection.execute("UPDATE peers SET is_primary = 0", [])?;
-    connection.execute(
-      "INSERT INTO peers (address, is_primary, online, last_attempt_ms)
+    self.with_connection(|conn| {
+      conn.execute("UPDATE peers SET is_primary = 0", [])?;
+      conn.execute(
+        "INSERT INTO peers (address, is_primary, online, last_attempt_ms)
              VALUES (?1, 1, 1, ?2)
              ON CONFLICT(address) DO UPDATE SET
                 is_primary = 1,
                 online = 1,
                 last_attempt_ms = excluded.last_attempt_ms",
-      params![address, now_ms()],
-    )?;
-    Ok(())
+        params![address, now_ms()],
+      )?;
+      Ok(())
+    })
   }
 
   /// Get the current primary endpoint, if any.
   pub fn get_primary(&self) -> Result<Option<String>, StorageError> {
-    let connection = self.connection.lock().unwrap();
-    let mut statement =
-      connection.prepare("SELECT address FROM peers WHERE is_primary = 1 LIMIT 1")?;
-    let mut rows = statement.query([])?;
-    if let Some(row) = rows.next()? {
-      Ok(Some(row.get(0)?))
-    } else {
-      Ok(None)
-    }
+    self.with_connection(|conn| {
+      let mut statement = conn.prepare("SELECT address FROM peers WHERE is_primary = 1 LIMIT 1")?;
+      let mut rows = statement.query([])?;
+      Ok(
+        rows
+          .next()?
+          .map(|row| row.get::<_, String>(0))
+          .transpose()?,
+      )
+    })
   }
 
   /// Return candidate peer addresses excluding the current primary.
   pub fn fallback_peers(&self) -> Result<Vec<String>, StorageError> {
-    let connection = self.connection.lock().unwrap();
-    let mut statement = connection.prepare(
-      "SELECT address FROM peers WHERE is_primary = 0 ORDER BY online DESC, last_seen_ms DESC",
-    )?;
-    let rows = statement.query_map([], |row| row.get(0))?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    self.with_connection(|conn| {
+      let mut statement = conn.prepare(
+        "SELECT address FROM peers WHERE is_primary = 0 ORDER BY online DESC, last_seen_ms DESC",
+      )?;
+      let rows = statement.query_map([], |row| row.get(0))?;
+      rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    })
   }
 }
 
@@ -330,25 +363,22 @@ fn state_to_string(state: NodeState) -> &'static str {
   }
 }
 
-fn string_to_state(s: &str) -> NodeState {
+fn string_to_state(s: &str) -> Result<NodeState, StorageError> {
   match s {
-    "offline" => NodeState::Offline,
-    _ => NodeState::Alive,
+    "alive" => Ok(NodeState::Alive),
+    "offline" => Ok(NodeState::Offline),
+    other => Err(StorageError::CorruptState(other.to_string())),
   }
-}
-
-fn now_ms() -> i64 {
-  use std::time::{SystemTime, UNIX_EPOCH};
-  SystemTime::now()
-    .duration_since(UNIX_EPOCH)
-    .map(|d| i64::try_from(d.as_millis()).unwrap_or(0))
-    .unwrap_or(0)
 }
 
 #[derive(Debug, Error)]
 pub enum StorageError {
   #[error("sqlite error: {0}")]
   Sqlite(#[from] rusqlite::Error),
+  #[error("storage lock poisoned")]
+  LockPoisoned,
+  #[error("corrupt node state in database: {0}")]
+  CorruptState(String),
 }
 
 #[cfg(test)]

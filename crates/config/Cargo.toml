@@ -12,9 +12,14 @@ rust-version.workspace = true
 version.workspace      = true
 
 [dependencies]
-serde     = { workspace = true, features = ["derive"] }
-thiserror = { workspace = true }
-toml      = { workspace = true }
+directories = { workspace = true }
+is-root     = { workspace = true }
+serde       = { workspace = true, features = ["derive"] }
+thiserror   = { workspace = true }
+toml        = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[lints]
+workspace = true

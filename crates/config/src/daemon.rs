@@ -3,7 +3,7 @@ use std::{fs, path::Path};
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::paths::default_data_dir;
+use crate::{paths::default_data_dir, validation::non_empty_string};
 
 /// Node bootstrap configuration.
 ///
@@ -13,11 +13,15 @@ use crate::paths::default_data_dir;
 /// primary endpoint, node labels/annotations, and peer reachability is stored
 /// in the SQLite database under `data_dir`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DaemonConfig {
   pub node: NodeConfig,
   pub cluster: ClusterConfig,
   pub tls: TlsConfig,
-  #[serde(default = "default_data_dir_string")]
+  #[serde(
+    default = "default_data_dir_string",
+    deserialize_with = "non_empty_string"
+  )]
   pub data_dir: String,
 }
 
@@ -29,43 +33,21 @@ impl DaemonConfig {
   pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
     let content = fs::read_to_string(path.as_ref())?;
     let config: DaemonConfig = toml::from_str(&content)?;
-    config.validate()?;
     Ok(config)
-  }
-
-  fn validate(&self) -> Result<(), ConfigError> {
-    if self.node.id.is_empty() {
-      return Err(ConfigError::Invalid(
-        "node.id must not be empty".to_string(),
-      ));
-    }
-    if self.node.address.is_empty() {
-      return Err(ConfigError::Invalid(
-        "node.address must not be empty".to_string(),
-      ));
-    }
-    if self.cluster.listen_address.is_empty() {
-      return Err(ConfigError::Invalid(
-        "cluster.listen_address must not be empty".to_string(),
-      ));
-    }
-    if self.data_dir.is_empty() {
-      return Err(ConfigError::Invalid(
-        "data_dir must not be empty".to_string(),
-      ));
-    }
-    Ok(())
   }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct NodeConfig {
+  #[serde(deserialize_with = "non_empty_string")]
   pub id: String,
+  #[serde(deserialize_with = "non_empty_string")]
   pub address: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClusterConfig {
+  #[serde(deserialize_with = "non_empty_string")]
   pub listen_address: String,
   /// Optional list of peers to seed on first startup. After bootstrap, peer
   /// state is maintained in the database.
@@ -86,8 +68,6 @@ pub enum ConfigError {
   Io(#[from] std::io::Error),
   #[error("parse error: {0}")]
   Parse(#[from] toml::de::Error),
-  #[error("invalid config: {0}")]
-  Invalid(String),
 }
 
 #[cfg(test)]
@@ -138,7 +118,7 @@ mod tests {
             cert = "c"
             key = "k"
         "#;
-    let cfg: DaemonConfig = toml::from_str(toml).unwrap();
-    assert!(cfg.validate().is_err());
+    let result: Result<DaemonConfig, _> = toml::from_str(toml);
+    assert!(result.is_err());
   }
 }
