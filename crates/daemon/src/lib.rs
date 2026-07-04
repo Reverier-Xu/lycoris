@@ -2,7 +2,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod api;
-pub mod gossip;
+pub mod cluster_sync;
 pub mod membership;
 pub mod rpc;
 pub mod runtime;

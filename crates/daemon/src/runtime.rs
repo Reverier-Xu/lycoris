@@ -7,7 +7,7 @@ use tokio::sync::watch;
 use tonic::transport::ServerTlsConfig;
 
 use crate::{
-  gossip::Gossip,
+  cluster_sync::ClusterSync,
   membership::{MemberRegister, MembershipService, SwimConfig},
   rpc::server::ClusterService,
   tls::{TlsError, ensure_tls_bundle},
@@ -81,37 +81,37 @@ pub async fn run_with_shutdown(
     local_register,
   ));
 
-  let gossip = Gossip::new(
+  let cluster_sync = ClusterSync::new(
     config.node.id.clone(),
     membership_service.clone(),
     node.clone(),
     &tls_bundle,
   );
 
-  let cluster_service =
-    ClusterService::new(membership_service.clone(), node.clone()).with_gossip(gossip.clone());
+  let cluster_service = ClusterService::new(membership_service.clone(), node.clone())
+    .with_cluster_sync(cluster_sync.clone());
 
   let mut background = tokio::task::JoinSet::new();
 
-  let ae_gossip = gossip.clone();
+  let ae_sync = cluster_sync.clone();
   let ae_shutdown = shutdown.clone();
   background.spawn(async move {
     tokio::select! {
-      _ = ae_gossip.run(DEFAULT_SYNC_INTERVAL) => {}
+      _ = ae_sync.run(DEFAULT_SYNC_INTERVAL) => {}
       _ = wait_shutdown(ae_shutdown) => {}
     }
   });
 
-  let swim_gossip = gossip.clone();
+  let swim_sync = cluster_sync.clone();
   let swim_shutdown = shutdown.clone();
   background.spawn(async move {
     tokio::select! {
-      _ = swim_gossip.run_swim(DEFAULT_SWIM_INTERVAL) => {}
+      _ = swim_sync.run_swim(DEFAULT_SWIM_INTERVAL) => {}
       _ = wait_shutdown(swim_shutdown) => {}
     }
   });
 
-  let (sync_service, membership_service_rpc) = gossip.into_servers();
+  let (sync_service, membership_service_rpc) = cluster_sync.into_servers();
 
   let addr: SocketAddr = config.cluster.listen_address.parse()?;
   tracing::info!(%addr, "node api server listening");

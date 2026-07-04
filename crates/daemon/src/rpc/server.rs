@@ -9,7 +9,7 @@ use lycoris_api::proto::{
 use lycoris_storage::{ClusterNodeRecord, NodeDomain, NodeState};
 use tonic::{Request, Response, Status};
 
-use crate::{gossip::Gossip, membership::MembershipService};
+use crate::{cluster_sync::ClusterSync, membership::MembershipService};
 
 pub type ClusterServerHandle = ClusterServer<ClusterService>;
 
@@ -17,7 +17,7 @@ pub type ClusterServerHandle = ClusterServer<ClusterService>;
 pub struct ClusterService {
   service: Arc<MembershipService>,
   storage: NodeDomain,
-  gossip: Option<Gossip>,
+  cluster_sync: Option<ClusterSync>,
 }
 
 impl ClusterService {
@@ -25,12 +25,12 @@ impl ClusterService {
     Self {
       service,
       storage,
-      gossip: None,
+      cluster_sync: None,
     }
   }
 
-  pub fn with_gossip(mut self, gossip: Gossip) -> Self {
-    self.gossip = Some(gossip);
+  pub fn with_cluster_sync(mut self, cluster_sync: ClusterSync) -> Self {
+    self.cluster_sync = Some(cluster_sync);
     self
   }
 
@@ -79,9 +79,9 @@ impl Cluster for ClusterService {
 
     persist_node_info(&self.storage, &info);
     let actions = self.service.register(&info).await;
-    if let Some(gossip) = &self.gossip {
-      gossip.dispatch(actions).await;
-      gossip.push_change(info.clone()).await;
+    if let Some(cluster_sync) = &self.cluster_sync {
+      cluster_sync.dispatch(actions).await;
+      cluster_sync.push_change(info.clone()).await;
     }
 
     Ok(Response::new(RegisterResponse {
@@ -107,9 +107,9 @@ impl Cluster for ClusterService {
 
     persist_node_info(&self.storage, &info);
     let actions = self.service.heartbeat(&info).await;
-    if let Some(gossip) = &self.gossip {
-      gossip.dispatch(actions).await;
-      gossip.push_change(info.clone()).await;
+    if let Some(cluster_sync) = &self.cluster_sync {
+      cluster_sync.dispatch(actions).await;
+      cluster_sync.push_change(info.clone()).await;
     }
 
     Ok(Response::new(HeartbeatResponse {

@@ -29,11 +29,11 @@ use crate::{
 
 /// Orchestrates peer-to-peer membership synchronization.
 ///
-/// `Gossip` combines backward-compatible `Sync` RPCs, the new `Membership`
+/// `ClusterSync` combines backward-compatible `Sync` RPCs, the new `Membership`
 /// RPCs (Merkle anti-entropy, SWIM probes), and a background loop that drives
 /// the SWIM failure detector.
 #[derive(Debug, Clone)]
-pub struct Gossip {
+pub struct ClusterSync {
   local_node_id: String,
   service: Arc<MembershipService>,
   storage: NodeDomain,
@@ -45,7 +45,7 @@ pub struct Gossip {
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
-impl Gossip {
+impl ClusterSync {
   pub fn new(
     local_node_id: String, service: Arc<MembershipService>, storage: NodeDomain,
     tls_bundle: &TlsBundle,
@@ -597,10 +597,10 @@ impl Gossip {
   }
 }
 
-pub type SyncServerHandle = SyncServer<Gossip>;
-pub type MembershipServerHandle = MembershipServer<Gossip>;
+pub type SyncServerHandle = SyncServer<ClusterSync>;
+pub type MembershipServerHandle = MembershipServer<ClusterSync>;
 
-impl Gossip {
+impl ClusterSync {
   pub fn into_sync_server(self) -> SyncServerHandle {
     SyncServer::new(self.clone())
   }
@@ -616,7 +616,7 @@ impl Gossip {
 
 #[tonic::async_trait]
 #[allow(clippy::result_large_err)]
-impl Sync for Gossip {
+impl Sync for ClusterSync {
   async fn sync_nodes(
     &self, request: Request<SyncNodesRequest>,
   ) -> Result<Response<SyncNodesResponse>, Status> {
@@ -632,7 +632,7 @@ impl Sync for Gossip {
 
 #[tonic::async_trait]
 #[allow(clippy::result_large_err)]
-impl Membership for Gossip {
+impl Membership for ClusterSync {
   async fn merkle_root(
     &self, _request: Request<lycoris_api::proto::MerkleRootRequest>,
   ) -> Result<Response<lycoris_api::proto::MerkleRootResponse>, Status> {
