@@ -1,0 +1,54 @@
+services:
+  node-0:
+    build:
+      context: ..
+      dockerfile: e2e/Dockerfile
+    image: lycoris-e2e
+    container_name: lycoris-e2e-node-0
+    hostname: node-0
+    volumes:
+      - ./certs:/etc/lycoris/certs:ro
+      - ./config/node-0.toml:/etc/lycoris/config.toml:ro
+      - node-0-data:/var/lib/lycoris
+    networks:
+      - left
+
+  node-1:
+    build:
+      context: ..
+      dockerfile: e2e/Dockerfile
+    image: lycoris-e2e
+    container_name: lycoris-e2e-node-1
+    hostname: node-1
+    volumes:
+      - ./certs:/etc/lycoris/certs:ro
+      - ./config/node-1.toml:/etc/lycoris/config.toml:ro
+      - node-1-data:/var/lib/lycoris
+    networks:
+      - left
+      - right
+
+  node-2:
+    build:
+      context: ..
+      dockerfile: e2e/Dockerfile
+    image: lycoris-e2e
+    container_name: lycoris-e2e-node-2
+    hostname: node-2
+    volumes:
+      - ./certs:/etc/lycoris/certs:ro
+      - ./config/node-2.toml:/etc/lycoris/config.toml:ro
+      - node-2-data:/var/lib/lycoris
+    networks:
+      - right
+
+volumes:
+  node-0-data:
+  node-1-data:
+  node-2-data:
+
+networks:
+  left:
+    name: lycoris-e2e-left
+  right:
+    name: lycoris-e2e-right

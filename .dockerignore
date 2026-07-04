@@ -1,0 +1,17 @@
+target
+!target/release/lycoris
+!target/release/lycoris-daemon
+.git
+cache
+deploy
+.github
+e2e/certs
+e2e/config
+e2e/*.sh
+e2e/docker-compose.yml
+*.md
+Cargo.lock
+rustfmt.toml
+taplo.toml
+.codex
+AGENTS.md
