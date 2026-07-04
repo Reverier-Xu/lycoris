@@ -64,10 +64,10 @@ service Membership {
   rpc FetchRegisters(FetchRegistersRequest) returns (FetchRegistersResponse);
   rpc PushRegisters(PushRegistersRequest) returns (FetchRegistersResponse);
   rpc Probe(ProbeRequest) returns (ProbeResponse);
-  rpc Gossip(GossipMessage) returns (GossipResponse);
+  rpc State(StateMessage) returns (StateResponse);
 }
 
-message GossipMessage {
+message StateMessage {
   oneof payload {
     NodeInfo alive = 1;
     SuspectMessage suspect = 2;
@@ -85,7 +85,7 @@ message LeaveMessage {
   uint64 incarnation = 2;
 }
 
-message GossipResponse {
+message StateResponse {
   bool accepted = 1;
 }
 

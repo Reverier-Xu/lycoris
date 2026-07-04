@@ -25,9 +25,9 @@ pub fn install_crypto_provider() -> Result<(), std::sync::Arc<rustls::crypto::Cr
 }
 
 use proto::{
-  FetchRegistersRequest, GossipMessage, GossipResponse, HeartbeatRequest, LeafHash,
-  ListNodesRequest, ListNodesResponse, MerkleRootRequest, NodeInfo as ProtoNodeInfo, ProbeRequest,
-  ProbeResponse, PushNodeRequest, PushRegistersRequest, RegisterRequest, SetPrimaryEndpointRequest,
+  FetchRegistersRequest, HeartbeatRequest, LeafHash, ListNodesRequest, ListNodesResponse,
+  MerkleRootRequest, NodeInfo as ProtoNodeInfo, ProbeRequest, ProbeResponse, PushNodeRequest,
+  PushRegistersRequest, RegisterRequest, SetPrimaryEndpointRequest, StateMessage, StateResponse,
   SyncNodesRequest, SyncNodesResponse, cluster_client::ClusterClient,
   membership_client::MembershipClient, sync_client::SyncClient,
 };
@@ -220,9 +220,9 @@ impl MembershipRpcClient {
     Ok(response.into_inner().registers)
   }
 
-  pub async fn gossip(&self, message: GossipMessage) -> Result<GossipResponse, ClusterClientError> {
+  pub async fn state(&self, message: StateMessage) -> Result<StateResponse, ClusterClientError> {
     let request = Request::new(message);
-    let response = self.inner.lock().await.gossip(request).await?;
+    let response = self.inner.lock().await.state(request).await?;
     Ok(response.into_inner())
   }
 }

@@ -10,8 +10,8 @@ use std::{
 use lycoris_api::{
   ClusterClientError, PeerClient,
   proto::{
-    GossipMessage, LeaveMessage as ProtoLeave, NodeInfo as ProtoNodeInfo, ProbeRequest,
-    ProbeResponse, PushNodeRequest, PushNodeResponse, SuspectMessage as ProtoSuspect,
+    LeaveMessage as ProtoLeave, NodeInfo as ProtoNodeInfo, ProbeRequest, ProbeResponse,
+    PushNodeRequest, PushNodeResponse, StateMessage, SuspectMessage as ProtoSuspect,
     SyncNodesRequest, SyncNodesResponse,
     membership_server::{Membership, MembershipServer},
     sync_server::{Sync, SyncServer},
@@ -131,8 +131,8 @@ impl ClusterSync {
           incarnation,
         }) => {
           self
-            .broadcast_gossip(GossipMessage {
-              payload: Some(lycoris_api::proto::gossip_message::Payload::Suspect(
+            .broadcast_state_message(StateMessage {
+              payload: Some(lycoris_api::proto::state_message::Payload::Suspect(
                 ProtoSuspect {
                   node_id,
                   incarnation,
@@ -146,8 +146,8 @@ impl ClusterSync {
           incarnation,
         }) => {
           self
-            .broadcast_gossip(GossipMessage {
-              payload: Some(lycoris_api::proto::gossip_message::Payload::Leave(
+            .broadcast_state_message(StateMessage {
+              payload: Some(lycoris_api::proto::state_message::Payload::Leave(
                 ProtoLeave {
                   node_id,
                   incarnation,
@@ -397,21 +397,21 @@ impl ClusterSync {
     Ok(())
   }
 
-  async fn broadcast_gossip(&self, message: GossipMessage) {
+  async fn broadcast_state_message(&self, message: StateMessage) {
     let targets = self.current_targets().await;
     for peer in targets {
       let message = message.clone();
-      match timeout(RPC_TIMEOUT, self.gossip_to_peer(&peer, message)).await {
+      match timeout(RPC_TIMEOUT, self.send_state_message_to_peer(&peer, message)).await {
         Ok(Ok(())) => {
           let _ = self.storage.peers.mark_seen(&peer, now_ms());
         }
         Ok(Err(error)) => {
-          tracing::warn!(%peer, %error, "gossip to peer failed");
+          tracing::warn!(%peer, %error, "state message to peer failed");
           let _ = self.storage.peers.mark_attempt(&peer, false);
           self.remove_client(&peer).await;
         }
         Err(_) => {
-          tracing::warn!(%peer, "gossip to peer timed out");
+          tracing::warn!(%peer, "state message to peer timed out");
           let _ = self.storage.peers.mark_attempt(&peer, false);
           self.remove_client(&peer).await;
         }
@@ -419,11 +419,11 @@ impl ClusterSync {
     }
   }
 
-  async fn gossip_to_peer(
-    &self, peer: &str, message: GossipMessage,
+  async fn send_state_message_to_peer(
+    &self, peer: &str, message: StateMessage,
   ) -> Result<(), ClusterClientError> {
     let client = self.connect_peer(peer).await?;
-    client.membership.gossip(message).await?;
+    client.membership.state(message).await?;
     Ok(())
   }
 
@@ -545,18 +545,18 @@ impl ClusterSync {
     }))
   }
 
-  /// Handle an incoming gossip message.
+  /// Handle an incoming state message.
   #[allow(clippy::result_large_err)]
-  pub async fn handle_gossip(
-    &self, request: Request<GossipMessage>,
-  ) -> Result<Response<lycoris_api::proto::GossipResponse>, Status> {
+  pub async fn handle_state_message(
+    &self, request: Request<StateMessage>,
+  ) -> Result<Response<lycoris_api::proto::StateResponse>, Status> {
     let from = self.local_node_id.clone();
     let message = request.into_inner();
     let actions = match message.payload {
-      Some(lycoris_api::proto::gossip_message::Payload::Alive(info)) => {
+      Some(lycoris_api::proto::state_message::Payload::Alive(info)) => {
         self.service.register(&info).await
       }
-      Some(lycoris_api::proto::gossip_message::Payload::Suspect(suspect)) => {
+      Some(lycoris_api::proto::state_message::Payload::Suspect(suspect)) => {
         self
           .service
           .on_probe(
@@ -568,7 +568,7 @@ impl ClusterSync {
           )
           .await
       }
-      Some(lycoris_api::proto::gossip_message::Payload::Leave(leave)) => {
+      Some(lycoris_api::proto::state_message::Payload::Leave(leave)) => {
         self
           .service
           .on_probe(
@@ -583,7 +583,7 @@ impl ClusterSync {
       None => Vec::new(),
     };
     self.dispatch(actions).await;
-    Ok(Response::new(lycoris_api::proto::GossipResponse {
+    Ok(Response::new(lycoris_api::proto::StateResponse {
       accepted: true,
     }))
   }
@@ -672,10 +672,10 @@ impl Membership for ClusterSync {
     self.handle_probe(request).await
   }
 
-  async fn gossip(
-    &self, request: Request<GossipMessage>,
-  ) -> Result<Response<lycoris_api::proto::GossipResponse>, Status> {
-    self.handle_gossip(request).await
+  async fn state(
+    &self, request: Request<StateMessage>,
+  ) -> Result<Response<lycoris_api::proto::StateResponse>, Status> {
+    self.handle_state_message(request).await
   }
 }
 

@@ -46,11 +46,11 @@ pub enum SwimMessage {
   Ack { seq: u64 },
   /// Negative response: the target could not be reached.
   Nack { seq: u64 },
-  /// Gossip that a node is suspected.
+  /// Disseminate that a node is suspected.
   Suspect { node_id: String, incarnation: u64 },
-  /// Gossip that a node is alive.
+  /// Disseminate that a node is alive.
   Alive { register: MemberRegister },
-  /// Gossip that a node is leaving or has left.
+  /// Disseminate that a node is leaving or has left.
   Leave { node_id: String, incarnation: u64 },
 }
 
@@ -67,7 +67,7 @@ pub enum SwimAction {
   },
   /// Send an ack back to `to`.
   SendAck { to: String, seq: u64 },
-  /// Broadcast a gossip message to all active members except ourselves.
+  /// Broadcast a state message to all active members except ourselves.
   Broadcast(SwimMessage),
 }
 
@@ -179,18 +179,18 @@ impl Swim {
         node_id,
         incarnation,
       } => {
-        self.handle_suspect_gossip(&node_id, incarnation, now_ms);
+        self.handle_suspect_state(&node_id, incarnation, now_ms);
         Vec::new()
       }
       SwimMessage::Alive { register } => {
-        self.handle_alive_gossip(&register, now_ms);
+        self.handle_alive_state(&register, now_ms);
         Vec::new()
       }
       SwimMessage::Leave {
         node_id,
         incarnation,
       } => {
-        self.handle_leave_gossip(&node_id, incarnation, now_ms);
+        self.handle_leave_state(&node_id, incarnation, now_ms);
         Vec::new()
       }
     }
@@ -271,7 +271,7 @@ impl Swim {
     Vec::new()
   }
 
-  fn handle_suspect_gossip(&mut self, node_id: &str, incarnation: u64, now_ms: i64) {
+  fn handle_suspect_state(&mut self, node_id: &str, incarnation: u64, now_ms: i64) {
     if node_id == self.local_node_id {
       return;
     }
@@ -288,7 +288,7 @@ impl Swim {
     }
   }
 
-  fn handle_alive_gossip(&mut self, register: &MemberRegister, now_ms: i64) {
+  fn handle_alive_state(&mut self, register: &MemberRegister, now_ms: i64) {
     if register.node_id == self.local_node_id {
       return;
     }
@@ -301,7 +301,7 @@ impl Swim {
       .heartbeat(now_u64);
   }
 
-  fn handle_leave_gossip(&mut self, node_id: &str, incarnation: u64, now_ms: i64) {
+  fn handle_leave_state(&mut self, node_id: &str, incarnation: u64, now_ms: i64) {
     if node_id == self.local_node_id {
       return;
     }
@@ -543,7 +543,7 @@ mod tests {
   }
 
   #[test]
-  fn suspect_gossip_merges_state() {
+  fn suspect_state_merges_state() {
     let mut swim = Swim::new("local", SwimConfig::default(), local_register("local"));
     swim.membership.merge_register(&peer_register("peer"));
 
@@ -563,7 +563,7 @@ mod tests {
   }
 
   #[test]
-  fn alive_gossip_merges_register() {
+  fn alive_state_merges_register() {
     let mut swim = Swim::new("local", SwimConfig::default(), local_register("local"));
     let mut register = peer_register("peer");
     register.heartbeat(2_000);
