@@ -43,7 +43,7 @@ All Rust code changes **MUST pass the following checks before any commit**. No c
 
 - **Mandatory Clippy Check**: Run the full Clippy suite with the following command:
   ```bash
-  cargo +nightly clippy --workspace --all-targets --all-features -- -D warnings
+  cargo clippy --workspace --all-targets --all-features -- -D warnings
   ```
 - **Zero-Warning Enforcement**: All Clippy warnings are treated as errors (`-D warnings`). You **MUST fix every Clippy lint** before committing code. This includes pedantic and nursery lints where enabled in the workspace configuration.
 - **Unsafe Code Restrictions**: `unsafe` Rust is strictly forbidden unless explicitly requested by the user. Any approved `unsafe` code must include comprehensive safety comments documenting all invariants.
@@ -106,7 +106,7 @@ Every commit must lead with a valid [gitmoji](https://gitmoji.dev/) that accurat
 Before marking any task as complete, you **MUST verify and confirm all of the following**:
 
 1. All code is formatted with `cargo +nightly fmt --all` and passes the `--check` validation.
-2. `cargo +nightly clippy` runs with zero warnings or errors (using the mandatory command above).
+2. `cargo clippy` runs with zero warnings or errors (using the mandatory command above).
 3. All `cargo test` suite passes with no failures.
 4. All workflow changes have been tested locally with `act` and pass successfully.
 5. The working directory is clean: no untracked files, uncommitted changes, or temporary assets remain.

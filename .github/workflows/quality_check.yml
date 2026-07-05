@@ -32,7 +32,12 @@ jobs:
       - name: install nightly rust toolchain
         uses: dtolnay/rust-toolchain@nightly
         with:
-          components: rustfmt, clippy
+          components: rustfmt
+
+      - name: install stable rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       - name: install protoc
         uses: arduino/setup-protoc@v3
@@ -50,7 +55,7 @@ jobs:
         run: cargo +nightly fmt --all -- --check
 
       - name: cargo clippy
-        run: cargo +nightly clippy --workspace --all-targets --all-features --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: cargo test
         run: cargo test --workspace --all-features --locked

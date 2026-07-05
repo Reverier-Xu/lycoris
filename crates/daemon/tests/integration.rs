@@ -1,4 +1,9 @@
-use std::{collections::HashMap, path::PathBuf, time::Duration};
+use std::{
+  collections::HashMap,
+  path::PathBuf,
+  sync::atomic::{AtomicU16, Ordering},
+  time::Duration,
+};
 
 use lycoris_api::{ClusterRpcClient, PeerClient};
 use lycoris_config::{ClusterConfig, DaemonConfig, NodeConfig, TlsConfig};
@@ -6,6 +11,14 @@ use lycoris_storage::{LocalNode, Storage};
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
 use tempfile::TempDir;
 use tokio::time;
+
+static NEXT_BASE_PORT: AtomicU16 = AtomicU16::new(56000);
+
+fn alloc_base_port() -> u16 {
+  // each test reserves a 100-port block so internal and external addresses cannot
+  // collide
+  NEXT_BASE_PORT.fetch_add(100, Ordering::SeqCst)
+}
 
 fn generate_test_certs(
   node_count: usize,
@@ -77,7 +90,7 @@ fn build_config(
 async fn registry_converges_across_three_node_chain() {
   let _ = lycoris_daemon::install_crypto_provider();
 
-  let (node_count, base_port) = (3, 56001);
+  let (node_count, base_port) = (3, alloc_base_port());
   let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
 
   let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
@@ -131,7 +144,7 @@ async fn registry_converges_across_three_node_chain() {
   let external = LocalNode::from_config(
     &NodeConfig {
       id: "external-node".to_string(),
-      address: "127.0.0.1:56099".to_string(),
+      address: format!("127.0.0.1:{}", base_port + 99),
     },
     external_storage.node().local,
   );
@@ -164,7 +177,7 @@ async fn registry_converges_across_three_node_chain() {
 async fn primary_failure_falls_back_and_promotes() {
   let _ = lycoris_daemon::install_crypto_provider();
 
-  let (node_count, base_port) = (2, 56101);
+  let (node_count, base_port) = (2, alloc_base_port());
   let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
   let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
 
@@ -226,7 +239,7 @@ async fn primary_failure_falls_back_and_promotes() {
   let external = LocalNode::from_config(
     &NodeConfig {
       id: "fallback-external-node".to_string(),
-      address: "127.0.0.1:56199".to_string(),
+      address: format!("127.0.0.1:{}", base_port + 99),
     },
     external_storage.node().local,
   );
@@ -272,7 +285,7 @@ async fn primary_failure_falls_back_and_promotes() {
 async fn partition_merge_reconciles_bidirectional_membership() {
   let _ = lycoris_daemon::install_crypto_provider();
 
-  let (node_count, base_port) = (2, 56201);
+  let (node_count, base_port) = (2, alloc_base_port());
   let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
   let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
 
@@ -316,7 +329,7 @@ async fn partition_merge_reconciles_bidirectional_membership() {
   let alpha = LocalNode::from_config(
     &NodeConfig {
       id: "alpha".to_string(),
-      address: "127.0.0.1:56299".to_string(),
+      address: format!("127.0.0.1:{}", base_port + 98),
     },
     alpha_storage.node().local,
   );
@@ -334,7 +347,7 @@ async fn partition_merge_reconciles_bidirectional_membership() {
   let beta = LocalNode::from_config(
     &NodeConfig {
       id: "beta".to_string(),
-      address: "127.0.0.1:56298".to_string(),
+      address: format!("127.0.0.1:{}", base_port + 97),
     },
     beta_storage.node().local,
   );
@@ -365,7 +378,7 @@ async fn partition_merge_reconciles_bidirectional_membership() {
 async fn failure_detector_marks_unresponsive_peer() {
   let _ = lycoris_daemon::install_crypto_provider();
 
-  let (node_count, base_port) = (2, 56301);
+  let (node_count, base_port) = (2, alloc_base_port());
   let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
   let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
 
