@@ -49,7 +49,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: cargo check
-        run: cargo +nightly check --workspace --all-targets --all-features --locked
+        run: cargo check --workspace --all-targets --all-features --locked
 
       - name: cargo fmt
         run: cargo +nightly fmt --all -- --check
