@@ -44,7 +44,7 @@ redb          = "3.0"
 rustls        = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2.2"
 serde         = { version = "1.0", features = ["derive"] }
-tempfile      = "3.27"
+tempfile      = "3"
 thiserror     = "2.0"
 tokio         = { version = "1.52", features = ["full"] }
 tokio-rustls  = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
