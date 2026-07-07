@@ -22,7 +22,7 @@ pub mod vcs;
 pub use rule::{RedbRuleStorage, RuleContentStore, RuleRecord, RuleStorage};
 pub use skill::{RedbSkillStorage, SkillContentStore, SkillRecord, SkillStorage};
 pub use store::{RedbWorkspaceStorage, WorkspaceMetadataStorage, WorkspaceRecord};
-pub use vcs::{PijulContentStore, VersionInfo, VersionedContentStore, WorkspaceStorageError};
+pub use vcs::{SnapshotContentStore, VersionInfo, VersionedContentStore, WorkspaceStorageError};
 
 /// Visibility scope for a reusable resource.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -75,8 +75,8 @@ impl WorkspaceDomain {
       workspaces: Arc::new(RedbWorkspaceStorage::new(db.clone())),
       skills: Arc::new(RedbSkillStorage::new(db.clone())),
       rules: Arc::new(RedbRuleStorage::new(db)),
-      skill_content: SkillContentStore::new(data_dir.join("skills.pijul")),
-      rule_content: RuleContentStore::new(data_dir.join("rules.pijul")),
+      skill_content: SkillContentStore::new(data_dir.join("skills")),
+      rule_content: RuleContentStore::new(data_dir.join("rules")),
     })
   }
 

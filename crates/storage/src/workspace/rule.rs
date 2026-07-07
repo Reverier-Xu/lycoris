@@ -27,8 +27,9 @@ pub struct RuleRecord {
 
 /// Storage for rule metadata.
 ///
-/// Rule *content* is versioned by Pijul; this store only persists the metadata
-/// and content hash needed for synchronization and lookup.
+/// Rule *content* is versioned as immutable snapshots; this store only
+/// persists the metadata and content hash needed for synchronization and
+/// lookup.
 pub trait RuleStorage: std::fmt::Debug + Send + Sync {
   /// Insert or update a rule record.
   fn upsert(&self, rule: &RuleRecord) -> Result<(), WorkspaceStorageError>;
@@ -49,23 +50,23 @@ pub trait RuleStorage: std::fmt::Debug + Send + Sync {
   fn delete(&self, id: &str) -> Result<(), WorkspaceStorageError>;
 }
 
-/// Pijul-backed content store for rule bodies.
+/// Filesystem-backed content store for rule bodies.
 ///
-/// Rule content is versioned using Pijul. This store only exposes the small
-/// surface needed by the rest of the storage layer.
+/// Rule content is versioned as immutable snapshots. This store only exposes
+/// the small surface needed by the rest of the storage layer.
 #[derive(Debug, Clone)]
 pub struct RuleContentStore {
-  inner: super::vcs::PijulContentStore,
+  inner: super::vcs::SnapshotContentStore,
 }
 
 impl RuleContentStore {
   pub fn new(repo_path: std::path::PathBuf) -> Self {
     Self {
-      inner: super::vcs::PijulContentStore::new(repo_path),
+      inner: super::vcs::SnapshotContentStore::new(repo_path),
     }
   }
 
-  /// Return the directory of the underlying Pijul repository.
+  /// Return the directory of the underlying snapshot repository.
   pub fn repo_path(&self) -> &Path {
     &self.inner.repo_path
   }
@@ -75,9 +76,9 @@ impl RuleContentStore {
     self.inner.read(id)
   }
 
-  /// Write a new version of a rule, recording it in Pijul.
+  /// Write a new version of a rule, recording it as a snapshot.
   ///
-  /// Returns the content hash of the recorded change.
+  /// Returns the content hash of the recorded snapshot.
   pub fn write(
     &self, id: &str, content: &str, message: &str,
   ) -> Result<String, WorkspaceStorageError> {

@@ -1,25 +1,12 @@
-//! Version-controlled content storage for skills and rules.
+//! Simple filesystem-backed versioned content storage.
 //!
-//! Skill and rule bodies are more than static prompts: they can contain
-//! scripts, tool definitions, and other executable artifacts that evolve over
-//! time. We therefore keep them in a real version-control system rather than a
-//! simple file store.
-//!
-//! The current backend is **Pijul** via `pijul-core`. The abstraction is
-//! intentionally small so that the storage layer does not depend directly on
-//! Pijul's internal concepts outside this module.
+//! Skill and rule bodies are stored as plain files. Each write creates a new
+//! immutable snapshot; the latest snapshot is mirrored to a stable path for
+//! easy reading. This is intentionally lightweight compared to a full DVCS.
 
 use std::path::PathBuf;
 
-use pijul_core::{
-  Hash, MutTxnTExt, TxnTExt, apply,
-  change::{Change, ChangeHeader},
-  changestore::ChangeStore,
-  pristine::{Base32, ChannelRef, Position, sanakirja::SanakirjaError},
-  record::{Algorithm, Builder},
-  small_string::SmallString,
-  working_copy::WorkingCopy,
-};
+use serde::{Deserialize, Serialize};
 
 /// Errors that can occur in workspace storage backends.
 #[derive(Debug, thiserror::Error)]
@@ -28,12 +15,8 @@ pub enum WorkspaceStorageError {
   Storage(#[from] crate::StorageError),
   #[error("workspace not found: {0}")]
   NotFound(String),
-  #[error("pijul error: {0}")]
-  Pijul(String),
-  #[error("pijul change error: {0}")]
-  Change(#[from] pijul_core::change::ChangeError),
-  #[error("corrupt state in database: {0}")]
-  CorruptState(String),
+  #[error("corrupt version log: {0}")]
+  CorruptVersionLog(String),
 }
 
 impl From<std::io::Error> for WorkspaceStorageError {
@@ -42,15 +25,15 @@ impl From<std::io::Error> for WorkspaceStorageError {
   }
 }
 
-impl From<pijul_core::changestore::filesystem::Error> for WorkspaceStorageError {
-  fn from(error: pijul_core::changestore::filesystem::Error) -> Self {
-    Self::Pijul(error.to_string())
+impl From<toml::de::Error> for WorkspaceStorageError {
+  fn from(error: toml::de::Error) -> Self {
+    Self::CorruptVersionLog(error.to_string())
   }
 }
 
-impl From<SanakirjaError> for WorkspaceStorageError {
-  fn from(error: SanakirjaError) -> Self {
-    Self::Pijul(error.to_string())
+impl From<toml::ser::Error> for WorkspaceStorageError {
+  fn from(error: toml::ser::Error) -> Self {
+    Self::CorruptVersionLog(error.to_string())
   }
 }
 
@@ -69,7 +52,7 @@ pub trait VersionedContentStore: std::fmt::Debug + Send + Sync {
 
   /// Write a new version of `id` with the given content and commit message.
   ///
-  /// Returns the hash of the recorded change.
+  /// Returns the hash of the recorded snapshot.
   fn write(&self, id: &str, content: &str, message: &str) -> Result<String, WorkspaceStorageError>;
 
   /// Read the latest version of `id`.
@@ -82,98 +65,90 @@ pub trait VersionedContentStore: std::fmt::Debug + Send + Sync {
   fn history(&self, id: &str) -> Result<Vec<VersionInfo>, WorkspaceStorageError>;
 }
 
-/// A `pijul-core`-backed content store.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VersionEntry {
+  hash: String,
+  message: String,
+  timestamp_ms: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct VersionLog {
+  versions: Vec<VersionEntry>,
+}
+
+/// A filesystem-backed content store.
 ///
-/// Each store uses its own Pijul repository located at `repo_path`. Resources
-/// are stored as files at the repository root, one file per resource id.
+/// Each store uses its own directory. Resources are stored as files under a
+/// per-resource subdirectory; a TOML log keeps the ordered version metadata.
 #[derive(Debug, Clone)]
-pub struct PijulContentStore {
+pub struct SnapshotContentStore {
   pub(crate) repo_path: PathBuf,
 }
 
-impl PijulContentStore {
+impl SnapshotContentStore {
   pub fn new(repo_path: PathBuf) -> Self {
     Self { repo_path }
   }
 
-  fn resource_path(&self, id: &str) -> PathBuf {
-    self.repo_path.join(format!("{id}.toml"))
+  fn resource_dir(&self, id: &str) -> PathBuf {
+    self.repo_path.join(id)
   }
 
-  fn pristine_path(&self) -> PathBuf {
-    self.repo_path.join(".pijul").join("pristine")
+  fn content_path(&self, id: &str, hash: &str) -> PathBuf {
+    self.resource_dir(id).join(format!("{hash}.toml"))
   }
 
-  fn changes_dir(&self) -> PathBuf {
-    self.repo_path.join(".pijul").join("changes")
+  fn latest_path(&self, id: &str) -> PathBuf {
+    self.resource_dir(id).join("latest.toml")
   }
 
-  fn working_copy(&self) -> pijul_core::working_copy::filesystem::FileSystem {
-    pijul_core::working_copy::filesystem::FileSystem::from_root(&self.repo_path)
+  fn log_path(&self, id: &str) -> PathBuf {
+    self.resource_dir(id).join("versions.toml")
   }
 
-  fn file_position<T: pijul_core::pristine::TreeTxnT>(
-    &self, txn: &T, id: &str,
-  ) -> Result<Option<Position<pijul_core::pristine::ChangeId>>, WorkspaceStorageError> {
-    let vertex = pijul_core::fs::get_vertex(txn, &format!("{id}.toml")).map_err(pijul_err)?;
-    if !vertex.remaining {
-      return Ok(None);
+  fn load_log(&self, id: &str) -> Result<VersionLog, WorkspaceStorageError> {
+    let path = self.log_path(id);
+    if !path.exists() {
+      return Ok(VersionLog::default());
     }
-    Ok(vertex.result)
+    Ok(toml::from_str(&std::fs::read_to_string(path)?)?)
   }
 
-  fn change_store(&self) -> pijul_core::changestore::filesystem::FileSystem {
-    pijul_core::changestore::filesystem::FileSystem::from_changes(self.changes_dir(), 100)
-  }
-
-  fn pristine(&self) -> Result<pijul_core::pristine::sanakirja::Pristine, WorkspaceStorageError> {
-    let path = self.pristine_path();
-    if let Some(parent) = path.parent() {
-      std::fs::create_dir_all(parent)?;
-    }
-    Ok(pijul_core::pristine::sanakirja::Pristine::new(path)?)
+  fn save_log(&self, id: &str, log: &VersionLog) -> Result<(), WorkspaceStorageError> {
+    std::fs::write(self.log_path(id), toml::to_string(log)?)?;
+    Ok(())
   }
 }
 
-impl VersionedContentStore for PijulContentStore {
+impl VersionedContentStore for SnapshotContentStore {
   fn initialize(&self) -> Result<(), WorkspaceStorageError> {
     std::fs::create_dir_all(&self.repo_path)?;
-    let pristine = self.pristine()?;
-    let _ = pristine.mut_txn_begin()?;
     Ok(())
   }
 
   fn write(&self, id: &str, content: &str, message: &str) -> Result<String, WorkspaceStorageError> {
     self.initialize()?;
-    let path = self.resource_path(id);
-    std::fs::write(&path, content)?;
+    let dir = self.resource_dir(id);
+    std::fs::create_dir_all(&dir)?;
 
-    let pristine = self.pristine()?;
-    let txn = pristine.arc_txn_begin()?;
-    let path_str = format!("{id}.toml");
+    let timestamp_ms = jiff::Timestamp::now().as_millisecond();
+    let hash = blake3::hash(content.as_bytes()).to_hex().to_string();
+    std::fs::write(self.content_path(id, &hash), content)?;
+    std::fs::write(self.latest_path(id), content)?;
 
-    {
-      let txn_read = txn.read();
-      if !txn_read.is_tracked(&path_str).map_err(pijul_err)? {
-        drop(txn_read);
-        let mut txn_write = txn.write();
-        txn_write.add_file(&path_str, 0).map_err(pijul_err)?;
-      }
-    }
-
-    let channel = open_channel(&txn).map_err(pijul_err)?;
-    let working_copy = self.working_copy();
-    let change_store = self.change_store();
-
-    let hash = record_change(&working_copy, &change_store, &txn, &channel, "", message)
-      .map_err(pijul_err)?;
-
-    txn.commit().map_err(pijul_err)?;
-    Ok(format!("{:?}", hash))
+    let mut log = self.load_log(id)?;
+    log.versions.push(VersionEntry {
+      hash: hash.clone(),
+      message: message.to_string(),
+      timestamp_ms,
+    });
+    self.save_log(id, &log)?;
+    Ok(hash)
   }
 
   fn read(&self, id: &str) -> Result<Option<String>, WorkspaceStorageError> {
-    let path = self.resource_path(id);
+    let path = self.latest_path(id);
     if !path.exists() {
       return Ok(None);
     }
@@ -181,122 +156,25 @@ impl VersionedContentStore for PijulContentStore {
   }
 
   fn latest_hash(&self, id: &str) -> Result<Option<String>, WorkspaceStorageError> {
-    let pristine = self.pristine()?;
-    let txn = pristine.arc_txn_begin()?;
-    let channel = open_channel(&txn).map_err(pijul_err)?;
-    let txn_guard = txn.read();
-    let channel_guard = channel.read();
-    let Some(position) = self.file_position(&*txn_guard, id)? else {
-      return Ok(None);
-    };
-    let log = txn_guard
-      .log_for_path(&*channel_guard, position, 0)
-      .map_err(pijul_err)?;
-    let entries: Vec<_> = log.collect::<Result<Vec<_>, _>>().map_err(pijul_err)?;
-    Ok(
-      entries
-        .last()
-        .map(|hash: &pijul_core::pristine::Hash| hash.to_base32()),
-    )
+    let log = self.load_log(id)?;
+    Ok(log.versions.last().map(|entry| entry.hash.clone()))
   }
 
   fn history(&self, id: &str) -> Result<Vec<VersionInfo>, WorkspaceStorageError> {
-    let change_store = self.change_store();
-    let pristine = self.pristine()?;
-    let txn = pristine.arc_txn_begin()?;
-    let channel = open_channel(&txn).map_err(pijul_err)?;
-    let txn_guard = txn.read();
-    let channel_guard = channel.read();
-    let Some(position) = self.file_position(&*txn_guard, id)? else {
-      return Ok(Vec::new());
-    };
-    let log = txn_guard
-      .log_for_path(&*channel_guard, position, 0)
-      .map_err(pijul_err)?;
-    let entries: Vec<_> = log.collect::<Result<Vec<_>, _>>().map_err(pijul_err)?;
-    let mut history = Vec::with_capacity(entries.len());
-    for hash in entries.into_iter().rev() {
-      let header = change_store
-        .get_header(&hash)
-        .map_err(|error| WorkspaceStorageError::Pijul(error.to_string()))?;
-      history.push(VersionInfo {
-        hash: hash.to_base32(),
-        message: header.message,
-        timestamp_ms: header.timestamp.as_millisecond(),
-      });
-    }
-    Ok(history)
-  }
-}
-
-fn pijul_err(error: impl std::fmt::Display) -> WorkspaceStorageError {
-  WorkspaceStorageError::Pijul(error.to_string())
-}
-
-fn open_channel<T: pijul_core::pristine::MutTxnT>(
-  txn: &pijul_core::pristine::ArcTxn<T>,
-) -> Result<ChannelRef<T>, T::GraphError> {
-  let name = SmallString::from_str("main");
-  txn.write().open_or_create_channel(&name)
-}
-
-fn record_change<
-  T: pijul_core::pristine::MutTxnT + Send + Sync + 'static,
-  W: WorkingCopy + Clone + Send + Sync + 'static,
-  C: ChangeStore + Clone + Send + 'static,
->(
-  working_copy: &W, change_store: &C, txn: &pijul_core::pristine::ArcTxn<T>,
-  channel: &ChannelRef<T>, prefix: &str, message: &str,
-) -> Result<Hash, WorkspaceStorageError>
-where
-  W::Error: Send + Sync + 'static,
-  C::Error: std::error::Error + Send + Sync + 'static,
-  WorkspaceStorageError: From<C::Error>, {
-  let mut state = Builder::new();
-  state
-    .record(
-      txn.clone(),
-      Algorithm::default(),
-      false,
-      &pijul_core::DEFAULT_SEPARATOR,
-      channel.clone(),
-      working_copy,
-      change_store,
-      prefix,
-      1,
+    let log = self.load_log(id)?;
+    Ok(
+      log
+        .versions
+        .into_iter()
+        .rev()
+        .map(|entry| VersionInfo {
+          hash: entry.hash,
+          message: entry.message,
+          timestamp_ms: entry.timestamp_ms,
+        })
+        .collect(),
     )
-    .map_err(pijul_err)?;
-
-  let rec = state.finish();
-  let actions: Vec<_> = rec
-    .actions
-    .into_iter()
-    .map(|rec| rec.globalize(&*txn.read()).map_err(pijul_err))
-    .collect::<Result<Vec<_>, _>>()?;
-
-  let mut change = Change::make_change(
-    &*txn.read(),
-    channel,
-    actions,
-    std::mem::take(&mut *rec.contents.lock()),
-    ChangeHeader {
-      message: message.to_string(),
-      authors: vec![],
-      description: None,
-      timestamp: jiff::Timestamp::now(),
-    },
-    Vec::new(),
-  )
-  .map_err(pijul_err)?;
-
-  let hash = change_store
-    .save_change(&mut change, |_, _| Ok::<(), WorkspaceStorageError>(()))
-    .map_err(pijul_err)?;
-
-  apply::apply_local_change(&mut *txn.write(), channel, &change, &hash, &rec.updatables)
-    .map_err(pijul_err)?;
-
-  Ok(hash)
+  }
 }
 
 #[cfg(test)]
@@ -305,17 +183,17 @@ mod tests {
 
   use super::*;
 
-  fn test_store() -> (TempDir, PijulContentStore) {
+  fn test_store() -> (TempDir, SnapshotContentStore) {
     let dir = TempDir::new().unwrap();
-    let store = PijulContentStore::new(dir.path().to_path_buf());
+    let store = SnapshotContentStore::new(dir.path().to_path_buf());
     (dir, store)
   }
 
   #[test]
-  fn initialize_creates_pijul_repository() {
+  fn initialize_creates_repository() {
     let (dir, store) = test_store();
     store.initialize().unwrap();
-    assert!(dir.path().join(".pijul").join("pristine").exists());
+    assert!(dir.path().exists());
   }
 
   #[test]

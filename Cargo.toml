@@ -35,8 +35,8 @@ lancedb       = "0.31"
 lycoris-api     = { path = "crates/api" }
 lycoris-config  = { path = "crates/config" }
 lycoris-storage = { path = "crates/storage" }
+blake3        = "1.8"
 owo-colors    = "4.3"
-pijul-core    = "1.0.0-beta"
 postcard      = { version = "1.0", features = ["use-std"] }
 prost         = "0.13"
 rcgen         = "0.13"
