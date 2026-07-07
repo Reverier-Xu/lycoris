@@ -58,6 +58,4 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: cargo test
-        env:
-          CARGO_BUILD_JOBS: 2
         run: cargo test --workspace --locked
