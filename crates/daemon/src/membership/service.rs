@@ -59,15 +59,7 @@ impl MembershipService {
 
   /// Record a heartbeat from an RPC request.
   pub async fn heartbeat(&self, info: &ProtoNodeInfo) -> Vec<SwimAction> {
-    let now = now_ms();
-    let mut state = self.state.lock().await;
-    state.swim.on_message(
-      &self.local_node_id,
-      SwimMessage::Alive {
-        register: proto_to_register(info, now),
-      },
-      now,
-    )
+    self.register(info).await
   }
 
   /// Return alive nodes that match the optional label selector.
@@ -156,9 +148,11 @@ impl MembershipService {
 
   /// Compute the symmetric Merkle diff against a remote leaf set.
   ///
-  /// Returns the node ids that differ or are missing locally. The caller can
-  /// use these to request missing registers from the remote peer.
-  pub async fn merkle_diff_against(&self, remote_leaves: &[(String, MerkleHash)]) -> Vec<String> {
+  /// Returns the node ids missing or differing on each side:
+  /// `(need_from_remote, need_from_local)`.
+  pub async fn merkle_diff(
+    &self, remote_leaves: &[(String, MerkleHash)],
+  ) -> (Vec<String>, Vec<String>) {
     let mut local_leaves: Vec<(String, MerkleHash)> = {
       let state = self.state.lock().await;
       state
@@ -194,24 +188,28 @@ fn matches_selector(labels: &HashMap<String, String>, selector: &HashMap<String,
     .all(|(key, value)| labels.get(key) == Some(value))
 }
 
-fn diff_leaf_sets(left: &[(String, MerkleHash)], right: &[(String, MerkleHash)]) -> Vec<String> {
-  let mut ids = Vec::new();
+fn diff_leaf_sets(
+  local: &[(String, MerkleHash)], remote: &[(String, MerkleHash)],
+) -> (Vec<String>, Vec<String>) {
+  let mut need_from_remote = Vec::new();
+  let mut need_from_local = Vec::new();
   let mut i = 0usize;
   let mut j = 0usize;
 
-  while i < left.len() && j < right.len() {
-    match left[i].0.cmp(&right[j].0) {
+  while i < local.len() && j < remote.len() {
+    match local[i].0.cmp(&remote[j].0) {
       std::cmp::Ordering::Less => {
-        ids.push(left[i].0.clone());
+        need_from_local.push(local[i].0.clone());
         i += 1;
       }
       std::cmp::Ordering::Greater => {
-        ids.push(right[j].0.clone());
+        need_from_remote.push(remote[j].0.clone());
         j += 1;
       }
       std::cmp::Ordering::Equal => {
-        if left[i].1 != right[j].1 {
-          ids.push(left[i].0.clone());
+        if local[i].1 != remote[j].1 {
+          need_from_remote.push(local[i].0.clone());
+          need_from_local.push(local[i].0.clone());
         }
         i += 1;
         j += 1;
@@ -219,18 +217,16 @@ fn diff_leaf_sets(left: &[(String, MerkleHash)], right: &[(String, MerkleHash)])
     }
   }
 
-  while i < left.len() {
-    ids.push(left[i].0.clone());
+  while i < local.len() {
+    need_from_local.push(local[i].0.clone());
     i += 1;
   }
-  while j < right.len() {
-    ids.push(right[j].0.clone());
+  while j < remote.len() {
+    need_from_remote.push(remote[j].0.clone());
     j += 1;
   }
 
-  ids.sort();
-  ids.dedup();
-  ids
+  (need_from_remote, need_from_local)
 }
 
 fn proto_to_register(info: &ProtoNodeInfo, now_ms: i64) -> MemberRegister {
@@ -247,7 +243,7 @@ fn proto_to_register(info: &ProtoNodeInfo, now_ms: i64) -> MemberRegister {
   register
 }
 
-fn register_to_proto(register: &MemberRegister) -> ProtoNodeInfo {
+pub fn register_to_proto(register: &MemberRegister) -> ProtoNodeInfo {
   ProtoNodeInfo {
     id: register.node_id.clone(),
     address: register.address.clone(),
@@ -340,5 +336,60 @@ mod tests {
     let snapshot = service.sync_nodes(vec![proto("b")]).await;
     assert!(snapshot.iter().any(|n| n.id == "a"));
     assert!(snapshot.iter().any(|n| n.id == "b"));
+  }
+
+  #[tokio::test]
+  async fn heartbeat_behaves_like_register() {
+    let service = MembershipService::new("local", SwimConfig::default(), register("local"));
+    let _ = service.heartbeat(&proto("peer")).await;
+    let nodes = service.list_nodes(&HashMap::new()).await;
+    assert!(nodes.iter().any(|n| n.id == "peer"));
+  }
+
+  #[tokio::test]
+  async fn merkle_diff_detects_missing_and_differing_nodes() {
+    let local = register("local");
+    let service = MembershipService::new("local", SwimConfig::default(), local.clone());
+    let _ = service.register(&proto("a")).await;
+    let _ = service.register(&proto("b")).await;
+
+    let mut remote_only = proto("c");
+    remote_only.address = "127.0.0.1:3".to_string();
+
+    let mut remote_b = proto("b");
+    remote_b.address = "127.0.0.1:9".to_string();
+
+    let remote_leaves = vec![
+      (
+        "b".to_string(),
+        hash_register(&proto_to_register(&remote_b, 0)),
+      ),
+      (
+        "c".to_string(),
+        hash_register(&proto_to_register(&remote_only, 0)),
+      ),
+    ];
+
+    let (need_from_remote, need_from_local) = service.merkle_diff(&remote_leaves).await;
+    assert!(need_from_remote.contains(&"b".to_string()));
+    assert!(need_from_remote.contains(&"c".to_string()));
+    assert!(need_from_local.contains(&"a".to_string()));
+    assert!(need_from_local.contains(&"b".to_string()));
+  }
+
+  #[test]
+  fn register_to_proto_preserves_all_states() {
+    for (state, expected) in [
+      (MemberState::Active, "active"),
+      (MemberState::Suspected, "suspected"),
+      (MemberState::Leaving, "leaving"),
+      (MemberState::Offline, "offline"),
+    ] {
+      let mut register = register("node");
+      register.state = state;
+      let proto = register_to_proto(&register);
+      assert_eq!(proto.state, expected);
+      assert_eq!(proto.id, "node");
+    }
   }
 }

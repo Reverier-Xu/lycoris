@@ -1,29 +1,28 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
-use anyhow::Context;
 use clap::Parser;
 
 mod cli;
 mod commands;
 mod config;
+mod error;
 
 use cli::{Cli, ClusterCommand, Command};
 use config::load_client_config;
+use error::ShellError;
 
-fn main() -> anyhow::Result<()> {
-  lycoris_api::install_crypto_provider()
-    .map_err(|error| anyhow::anyhow!("failed to install rustls crypto provider: {error:?}"))?;
+fn main() -> Result<(), ShellError> {
+  lycoris_api::install_crypto_provider().map_err(ShellError::CryptoProvider)?;
   tracing_subscriber::fmt::init();
 
   let cli = Cli::parse();
 
   match cli.command {
     Command::Cluster(cluster) => {
-      let runtime = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
-      let client_config = load_client_config().with_context(
-        || "failed to load client configuration; run a local daemon or create a client config",
-      )?;
+      let runtime = tokio::runtime::Runtime::new().map_err(ShellError::RuntimeCreation)?;
+      let client_config =
+        load_client_config().map_err(|error| ShellError::ConfigLoad(error.to_string()))?;
       runtime.block_on(async move {
         match cluster {
           ClusterCommand::Nodes { selectors } => {

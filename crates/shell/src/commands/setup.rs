@@ -1,6 +1,6 @@
 use std::env;
 
-use anyhow::Context;
+use crate::error::ShellError;
 
 const SERVICE_NAME: &str = "lycoris";
 const DEFAULT_CONFIG_NAME: &str = "lycoris.toml";
@@ -10,11 +10,15 @@ const DEFAULT_CONFIG_NAME: &str = "lycoris.toml";
 /// The server binary is expected to live in the same directory as the running
 /// `lycoris` executable. This matches the production layout where both binaries
 /// are shipped side-by-side.
-pub fn run(binary_name: &str) -> anyhow::Result<()> {
-  let current_exe = env::current_exe().context("failed to determine current executable path")?;
+pub fn run(binary_name: &str) -> Result<(), ShellError> {
+  let current_exe = env::current_exe().map_err(|error| {
+    ShellError::setup(format!(
+      "failed to determine current executable path: {error}"
+    ))
+  })?;
   let bin_dir = current_exe
     .parent()
-    .context("current executable has no parent directory")?;
+    .ok_or_else(|| ShellError::setup("current executable has no parent directory"))?;
 
   platform::install(bin_dir, binary_name)
 }
@@ -23,11 +27,10 @@ pub fn run(binary_name: &str) -> anyhow::Result<()> {
 mod platform {
   use std::{env, fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
 
-  use anyhow::{Context, bail};
-
   use super::{DEFAULT_CONFIG_NAME, SERVICE_NAME};
+  use crate::error::ShellError;
 
-  pub fn install(bin_dir: &Path, binary_name: &str) -> anyhow::Result<()> {
+  pub fn install(bin_dir: &Path, binary_name: &str) -> Result<(), ShellError> {
     let home = home_dir()?;
     let systemd_dir = home.join(".config/systemd/user");
     let config_dir =
@@ -59,39 +62,55 @@ mod platform {
 
   fn install_common(
     bin_dir: &Path, binary_name: &str, systemd_dir: &Path, config_dir: &Path, data_dir: &Path,
-  ) -> anyhow::Result<()> {
+  ) -> Result<(), ShellError> {
     let server_binary = bin_dir.join(binary_name);
 
     if !server_binary.is_file() {
-      bail!(
+      return Err(ShellError::setup(format!(
         "server binary not found at {}; ensure '{}' is in the same directory as the lycoris binary",
         server_binary.display(),
         binary_name
-      );
+      )));
     }
 
-    let metadata = server_binary
-      .metadata()
-      .with_context(|| format!("failed to read metadata for {}", server_binary.display()))?;
+    let metadata = server_binary.metadata().map_err(|error| {
+      ShellError::setup(format!(
+        "failed to read metadata for {}: {error}",
+        server_binary.display()
+      ))
+    })?;
     let mode = metadata.permissions().mode();
     if mode & 0o111 == 0 {
-      bail!(
+      return Err(ShellError::setup(format!(
         "server binary at {} is not executable",
         server_binary.display()
-      );
+      )));
     }
 
-    fs::create_dir_all(systemd_dir)
-      .with_context(|| format!("failed to create {}", systemd_dir.display()))?;
-    fs::create_dir_all(config_dir)
-      .with_context(|| format!("failed to create {}", config_dir.display()))?;
-    fs::create_dir_all(data_dir)
-      .with_context(|| format!("failed to create {}", data_dir.display()))?;
+    fs::create_dir_all(systemd_dir).map_err(|error| {
+      ShellError::setup(format!(
+        "failed to create {}: {error}",
+        systemd_dir.display()
+      ))
+    })?;
+    fs::create_dir_all(config_dir).map_err(|error| {
+      ShellError::setup(format!(
+        "failed to create {}: {error}",
+        config_dir.display()
+      ))
+    })?;
+    fs::create_dir_all(data_dir).map_err(|error| {
+      ShellError::setup(format!("failed to create {}: {error}", data_dir.display()))
+    })?;
 
     let service_path = systemd_dir.join(format!("{SERVICE_NAME}.service"));
     let unit_content = render_user_unit(&server_binary, config_dir, data_dir);
-    fs::write(&service_path, unit_content)
-      .with_context(|| format!("failed to write {}", service_path.display()))?;
+    fs::write(&service_path, unit_content).map_err(|error| {
+      ShellError::setup(format!(
+        "failed to write {}: {error}",
+        service_path.display()
+      ))
+    })?;
 
     Ok(())
   }
@@ -126,31 +145,37 @@ mod platform {
     )
   }
 
-  fn reload_and_enable_user_systemd() -> anyhow::Result<()> {
-    run_systemctl(&["--user", "daemon-reload"]).context("failed to reload user systemd daemon")?;
+  fn reload_and_enable_user_systemd() -> Result<(), ShellError> {
+    run_systemctl(&["--user", "daemon-reload"]).map_err(|error| {
+      ShellError::setup(format!("failed to reload user systemd daemon: {error}"))
+    })?;
     run_systemctl(&["--user", "enable", &format!("{SERVICE_NAME}.service")])
-      .context("failed to enable user service")?;
+      .map_err(|error| ShellError::setup(format!("failed to enable user service: {error}")))?;
     Ok(())
   }
 
-  fn run_systemctl(args: &[&str]) -> anyhow::Result<()> {
+  fn run_systemctl(args: &[&str]) -> Result<(), ShellError> {
     let output = Command::new("systemctl")
       .args(args)
       .output()
-      .context("failed to execute systemctl")?;
+      .map_err(|error| ShellError::setup(format!("failed to execute systemctl: {error}")))?;
 
     if !output.status.success() {
       let stderr = String::from_utf8_lossy(&output.stderr);
-      bail!("systemctl {} failed: {}", args.join(" "), stderr);
+      return Err(ShellError::setup(format!(
+        "systemctl {} failed: {}",
+        args.join(" "),
+        stderr
+      )));
     }
 
     Ok(())
   }
 
-  fn home_dir() -> anyhow::Result<std::path::PathBuf> {
+  fn home_dir() -> Result<std::path::PathBuf, ShellError> {
     env::var("HOME")
-      .context("HOME environment variable is not set")
       .map(std::path::PathBuf::from)
+      .map_err(|_| ShellError::setup("HOME environment variable is not set"))
   }
 
   #[cfg(test)]
@@ -241,11 +266,10 @@ mod platform {
 mod platform {
   use std::{env, fs, path::Path, process::Command};
 
-  use anyhow::{Context, bail};
-
   use super::{DEFAULT_CONFIG_NAME, SERVICE_NAME};
+  use crate::error::ShellError;
 
-  pub fn install(bin_dir: &Path, binary_name: &str) -> anyhow::Result<()> {
+  pub fn install(bin_dir: &Path, binary_name: &str) -> Result<(), ShellError> {
     let home = home_dir()?;
     let launchd_dir = home.join("Library/LaunchAgents");
     let config_dir = lycoris_config::paths::user_config_dir()
@@ -275,28 +299,38 @@ mod platform {
 
   fn install_common(
     bin_dir: &Path, binary_name: &str, launchd_dir: &Path, config_dir: &Path, data_dir: &Path,
-  ) -> anyhow::Result<()> {
+  ) -> Result<(), ShellError> {
     let server_binary = bin_dir.join(binary_name);
 
     if !server_binary.is_file() {
-      bail!(
+      return Err(ShellError::setup(format!(
         "server binary not found at {}; ensure '{}' is in the same directory as the lycoris binary",
         server_binary.display(),
         binary_name
-      );
+      )));
     }
 
-    fs::create_dir_all(launchd_dir)
-      .with_context(|| format!("failed to create {}", launchd_dir.display()))?;
-    fs::create_dir_all(config_dir)
-      .with_context(|| format!("failed to create {}", config_dir.display()))?;
-    fs::create_dir_all(data_dir)
-      .with_context(|| format!("failed to create {}", data_dir.display()))?;
+    fs::create_dir_all(launchd_dir).map_err(|error| {
+      ShellError::setup(format!(
+        "failed to create {}: {error}",
+        launchd_dir.display()
+      ))
+    })?;
+    fs::create_dir_all(config_dir).map_err(|error| {
+      ShellError::setup(format!(
+        "failed to create {}: {error}",
+        config_dir.display()
+      ))
+    })?;
+    fs::create_dir_all(data_dir).map_err(|error| {
+      ShellError::setup(format!("failed to create {}: {error}", data_dir.display()))
+    })?;
 
     let plist_path = launchd_dir.join(format!("{SERVICE_NAME}.plist"));
     let plist_content = render_plist(&server_binary, config_dir, data_dir);
-    fs::write(&plist_path, plist_content)
-      .with_context(|| format!("failed to write {}", plist_path.display()))?;
+    fs::write(&plist_path, plist_content).map_err(|error| {
+      ShellError::setup(format!("failed to write {}: {error}", plist_path.display()))
+    })?;
 
     Ok(())
   }
@@ -337,25 +371,28 @@ mod platform {
     )
   }
 
-  fn load_launchd_agent(launchd_dir: &Path) -> anyhow::Result<()> {
+  fn load_launchd_agent(launchd_dir: &Path) -> Result<(), ShellError> {
     let plist_path = launchd_dir.join(format!("{SERVICE_NAME}.plist"));
     let output = Command::new("launchctl")
       .args(["load", "-w", plist_path.to_string_lossy().as_ref()])
       .output()
-      .context("failed to execute launchctl")?;
+      .map_err(|error| ShellError::setup(format!("failed to execute launchctl: {error}")))?;
 
     if !output.status.success() {
       let stderr = String::from_utf8_lossy(&output.stderr);
-      bail!("launchctl load failed: {}", stderr);
+      return Err(ShellError::setup(format!(
+        "launchctl load failed: {}",
+        stderr
+      )));
     }
 
     Ok(())
   }
 
-  fn home_dir() -> anyhow::Result<std::path::PathBuf> {
+  fn home_dir() -> Result<std::path::PathBuf, ShellError> {
     env::var("HOME")
-      .context("HOME environment variable is not set")
       .map(std::path::PathBuf::from)
+      .map_err(|_| ShellError::setup("HOME environment variable is not set"))
   }
 }
 
@@ -363,30 +400,34 @@ mod platform {
 mod platform {
   use std::{fs, path::Path};
 
-  use anyhow::{Context, bail};
-
   use super::{DEFAULT_CONFIG_NAME, SERVICE_NAME};
+  use crate::error::ShellError;
 
-  pub fn install(bin_dir: &Path, binary_name: &str) -> anyhow::Result<()> {
+  pub fn install(bin_dir: &Path, binary_name: &str) -> Result<(), ShellError> {
     let server_binary = bin_dir.join(binary_name);
 
     if !server_binary.is_file() {
-      bail!(
+      return Err(ShellError::setup(format!(
         "server binary not found at {}; ensure '{}' is in the same directory as the lycoris binary",
         server_binary.display(),
         binary_name
-      );
+      )));
     }
 
     let config_dir = lycoris_config::paths::user_config_dir()
-      .context("failed to determine user config directory")?;
-    let data_dir =
-      lycoris_config::paths::user_data_dir().context("failed to determine user data directory")?;
+      .ok_or_else(|| ShellError::setup("failed to determine user config directory"))?;
+    let data_dir = lycoris_config::paths::user_data_dir()
+      .ok_or_else(|| ShellError::setup("failed to determine user data directory"))?;
 
-    fs::create_dir_all(&config_dir)
-      .with_context(|| format!("failed to create {}", config_dir.display()))?;
-    fs::create_dir_all(&data_dir)
-      .with_context(|| format!("failed to create {}", data_dir.display()))?;
+    fs::create_dir_all(&config_dir).map_err(|error| {
+      ShellError::setup(format!(
+        "failed to create {}: {error}",
+        config_dir.display()
+      ))
+    })?;
+    fs::create_dir_all(&data_dir).map_err(|error| {
+      ShellError::setup(format!("failed to create {}: {error}", data_dir.display()))
+    })?;
 
     println!("windows service setup is not yet automated.");
     println!();
@@ -415,9 +456,11 @@ mod platform {
 mod platform {
   use std::path::Path;
 
-  use anyhow::bail;
+  use crate::error::ShellError;
 
-  pub fn install(_bin_dir: &Path, _binary_name: &str) -> anyhow::Result<()> {
-    bail!("setup is only supported on linux, macos and windows")
+  pub fn install(_bin_dir: &Path, _binary_name: &str) -> Result<(), ShellError> {
+    Err(ShellError::setup(
+      "setup is only supported on linux, macos and windows",
+    ))
   }
 }

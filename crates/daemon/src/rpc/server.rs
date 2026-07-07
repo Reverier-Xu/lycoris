@@ -1,12 +1,11 @@
 use std::sync::Arc;
 
 use lycoris_api::proto::{
-  HeartbeatRequest, HeartbeatResponse, ListNodesRequest, ListNodesResponse,
-  NodeInfo as ProtoNodeInfo, RegisterRequest, RegisterResponse, SetPrimaryEndpointRequest,
-  SetPrimaryEndpointResponse,
+  HeartbeatRequest, HeartbeatResponse, ListNodesRequest, ListNodesResponse, RegisterRequest,
+  RegisterResponse, SetPrimaryEndpointRequest, SetPrimaryEndpointResponse,
   cluster_server::{Cluster, ClusterServer},
 };
-use lycoris_storage::{ClusterNodeRecord, NodeDomain, NodeState};
+use lycoris_storage::NodeDomain;
 use tonic::{Request, Response, Status};
 
 use crate::{cluster_sync::ClusterSync, membership::MembershipService};
@@ -39,27 +38,6 @@ impl ClusterService {
   }
 }
 
-fn persist_node_info(storage: &NodeDomain, info: &ProtoNodeInfo) {
-  let record = ClusterNodeRecord {
-    id: info.id.clone(),
-    address: info.address.clone(),
-    last_heartbeat_ms: info.last_heartbeat_unix_ms,
-    state: proto_state_to_storage(&info.state),
-    labels: info.labels.clone(),
-    annotations: info.annotations.clone(),
-  };
-  if let Err(error) = storage.cluster.upsert(&record) {
-    tracing::warn!(%error, node_id = %info.id, "failed to persist node info");
-  }
-}
-
-fn proto_state_to_storage(state: &str) -> NodeState {
-  match state {
-    "offline" | "leaving" => NodeState::Offline,
-    _ => NodeState::Alive,
-  }
-}
-
 #[tonic::async_trait]
 impl Cluster for ClusterService {
   async fn register(
@@ -77,7 +55,6 @@ impl Cluster for ClusterService {
       }));
     }
 
-    persist_node_info(&self.storage, &info);
     let actions = self.service.register(&info).await;
     if let Some(cluster_sync) = &self.cluster_sync {
       cluster_sync.dispatch(actions).await;
@@ -105,7 +82,6 @@ impl Cluster for ClusterService {
       }));
     }
 
-    persist_node_info(&self.storage, &info);
     let actions = self.service.heartbeat(&info).await;
     if let Some(cluster_sync) = &self.cluster_sync {
       cluster_sync.dispatch(actions).await;

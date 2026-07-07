@@ -3,11 +3,25 @@ use std::{collections::HashMap, time::Duration};
 use lycoris_api::{ClusterRpcClient, tls::load_client_tls};
 use lycoris_config::NodeConfig;
 use lycoris_storage::{LocalNode, Storage};
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+enum ExampleError {
+  #[error("failed to install rustls crypto provider: {0:?}")]
+  CryptoProvider(std::sync::Arc<rustls::crypto::CryptoProvider>),
+  #[error("io error: {0}")]
+  Io(#[from] std::io::Error),
+  #[error("cluster client error: {0}")]
+  Cluster(#[from] lycoris_api::ClusterClientError),
+  #[error("storage error: {0}")]
+  Storage(#[from] lycoris_storage::StorageError),
+  #[error("{0} not visible on {1}")]
+  NotVisible(String, String),
+}
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-  lycoris_daemon::install_crypto_provider()
-    .map_err(|e| anyhow::anyhow!("failed to install crypto provider: {e:?}"))?;
+async fn main() -> Result<(), ExampleError> {
+  lycoris_api::install_crypto_provider().map_err(ExampleError::CryptoProvider)?;
 
   let args: Vec<String> = std::env::args().collect();
   if args.len() != 7 {
@@ -52,6 +66,9 @@ async fn main() -> anyhow::Result<()> {
     println!("ok: {expected_id} visible on {query_addr}");
     Ok(())
   } else {
-    anyhow::bail!("{expected_id} not visible on {query_addr}");
+    Err(ExampleError::NotVisible(
+      expected_id.clone(),
+      query_addr.clone(),
+    ))
   }
 }

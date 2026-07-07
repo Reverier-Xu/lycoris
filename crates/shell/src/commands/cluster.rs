@@ -1,26 +1,32 @@
 use std::collections::HashMap;
 
-use anyhow::Context;
 use lycoris_api::{ClusterRpcClient, tls::load_client_tls};
 use lycoris_config::{ClientConfig, NodeInfo};
 use owo_colors::OwoColorize;
 
-pub async fn list_nodes(client_config: &ClientConfig, selectors: &[String]) -> anyhow::Result<()> {
+use crate::error::ShellError;
+
+pub async fn list_nodes(
+  client_config: &ClientConfig, selectors: &[String],
+) -> Result<(), ShellError> {
   let tls = load_client_tls(
     &client_config.cert,
     &client_config.key,
     &client_config.ca_cert,
   )
-  .with_context(|| "failed to load client TLS material")?;
+  .map_err(ShellError::TlsLoad)?;
   let client = ClusterRpcClient::connect(&client_config.api_address, tls)
     .await
-    .with_context(|| format!("failed to connect to {}", client_config.api_address))?;
+    .map_err(|source| ShellError::Connect {
+      address: client_config.api_address.clone(),
+      source,
+    })?;
 
   let selector = parse_selectors(selectors)?;
   let response = client
     .list_nodes(selector)
     .await
-    .context("failed to list cluster nodes")?;
+    .map_err(ShellError::ListNodes)?;
 
   println!("{}", "NODE ID".bold().underline());
   for node in &response.nodes {
@@ -39,25 +45,25 @@ pub async fn list_nodes(client_config: &ClientConfig, selectors: &[String]) -> a
 
 pub async fn register(
   client_config: &ClientConfig, id: String, address: String,
-) -> anyhow::Result<()> {
+) -> Result<(), ShellError> {
   let tls = load_client_tls(
     &client_config.cert,
     &client_config.key,
     &client_config.ca_cert,
   )
-  .with_context(|| "failed to load client TLS material")?;
+  .map_err(ShellError::TlsLoad)?;
   let client = ClusterRpcClient::connect(&client_config.api_address, tls)
     .await
-    .with_context(|| format!("failed to connect to {}", client_config.api_address))?;
+    .map_err(|source| ShellError::Connect {
+      address: client_config.api_address.clone(),
+      source,
+    })?;
 
   let node = SimpleNode {
     id: id.clone(),
     address,
   };
-  client
-    .register(&node)
-    .await
-    .context("failed to register node")?;
+  client.register(&node).await.map_err(ShellError::Register)?;
   println!("registered node {}", id.cyan());
   Ok(())
 }
@@ -86,12 +92,12 @@ impl NodeInfo for SimpleNode {
   }
 }
 
-fn parse_selectors(raw: &[String]) -> anyhow::Result<HashMap<String, String>> {
+fn parse_selectors(raw: &[String]) -> Result<HashMap<String, String>, ShellError> {
   let mut selector = HashMap::new();
   for item in raw {
     let (key, value) = item
       .split_once('=')
-      .with_context(|| format!("invalid selector '{item}', expected key=value"))?;
+      .ok_or_else(|| ShellError::InvalidSelector(item.clone()))?;
     selector.insert(key.to_string(), value.to_string());
   }
   Ok(selector)

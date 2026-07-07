@@ -20,6 +20,27 @@ fn alloc_base_port() -> u16 {
   NEXT_BASE_PORT.fetch_add(100, Ordering::SeqCst)
 }
 
+async fn wait_for_node(client: &ClusterRpcClient, node_id: &str, timeout: Duration) {
+  let start = std::time::Instant::now();
+  loop {
+    let ids: Vec<String> = client
+      .list_nodes(HashMap::new())
+      .await
+      .expect("list_nodes failed")
+      .nodes
+      .into_iter()
+      .map(|n| n.id)
+      .collect();
+    if ids.iter().any(|id| id == node_id) {
+      return;
+    }
+    if start.elapsed() >= timeout {
+      panic!("timed out waiting for {node_id} to appear in membership");
+    }
+    time::sleep(Duration::from_millis(100)).await;
+  }
+}
+
 fn generate_test_certs(
   node_count: usize,
 ) -> (TempDir, PathBuf, PathBuf, Vec<PathBuf>, Vec<PathBuf>) {
@@ -88,7 +109,7 @@ fn build_config(
 
 #[tokio::test]
 async fn registry_converges_across_three_node_chain() {
-  let _ = lycoris_daemon::install_crypto_provider();
+  let _ = lycoris_api::install_crypto_provider();
 
   let (node_count, base_port) = (3, alloc_base_port());
   let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
@@ -175,7 +196,7 @@ async fn registry_converges_across_three_node_chain() {
 
 #[tokio::test]
 async fn primary_failure_falls_back_and_promotes() {
-  let _ = lycoris_daemon::install_crypto_provider();
+  let _ = lycoris_api::install_crypto_provider();
 
   let (node_count, base_port) = (2, alloc_base_port());
   let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
@@ -283,7 +304,7 @@ async fn primary_failure_falls_back_and_promotes() {
 
 #[tokio::test]
 async fn partition_merge_reconciles_bidirectional_membership() {
-  let _ = lycoris_daemon::install_crypto_provider();
+  let _ = lycoris_api::install_crypto_provider();
 
   let (node_count, base_port) = (2, alloc_base_port());
   let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
@@ -376,7 +397,7 @@ async fn partition_merge_reconciles_bidirectional_membership() {
 
 #[tokio::test]
 async fn failure_detector_marks_unresponsive_peer() {
-  let _ = lycoris_daemon::install_crypto_provider();
+  let _ = lycoris_api::install_crypto_provider();
 
   let (node_count, base_port) = (2, alloc_base_port());
   let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
@@ -417,12 +438,7 @@ async fn failure_detector_marks_unresponsive_peer() {
     .await
     .expect("failed to connect to node-0");
 
-  let peers = client
-    .list_nodes(HashMap::new())
-    .await
-    .expect("list_nodes failed")
-    .nodes;
-  assert!(peers.iter().any(|n| n.id == "node-1"));
+  wait_for_node(&client, "node-1", Duration::from_millis(2000)).await;
 
   // Stop node-1 so that node-0's SWIM probes begin to fail.
   handles[1].abort();

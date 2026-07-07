@@ -23,7 +23,9 @@ use tokio::{sync::Mutex, time::timeout};
 use tonic::{Request, Response, Status, transport::ClientTlsConfig};
 
 use crate::{
-  membership::{MembershipService, SwimAction, SwimMessage, merkle::Hash as MerkleHash},
+  membership::{
+    MembershipService, SwimAction, SwimMessage, merkle::Hash as MerkleHash, register_to_proto,
+  },
   tls::TlsBundle,
 };
 
@@ -183,10 +185,7 @@ impl ClusterSync {
           false
         }
       },
-      Err(error) => {
-        tracing::warn!(%target_id, %error, "failed to connect for probe");
-        false
-      }
+      Err(_) => false,
     }
   }
 
@@ -196,15 +195,10 @@ impl ClusterSync {
       None => return,
     };
 
-    match self.connect_peer(&address).await {
-      Ok(client) => {
-        if let Err(error) = client.membership.probe(seq, target).await {
-          tracing::warn!(%proxy, %target, %error, "indirect probe failed");
-        }
-      }
-      Err(error) => {
-        tracing::warn!(%proxy, %target, %error, "failed to connect for indirect probe");
-      }
+    if let Ok(client) = self.connect_peer(&address).await
+      && let Err(error) = client.membership.probe(seq, target).await
+    {
+      tracing::warn!(%proxy, %target, %error, "indirect probe failed");
     }
   }
 
@@ -295,17 +289,7 @@ impl ClusterSync {
       })
       .collect();
 
-    let local_leaves_parsed: Vec<(String, MerkleHash)> = local_root
-      .leaf_hashes
-      .into_iter()
-      .filter_map(|(id, hash)| {
-        let hash = hash.try_into().ok()?;
-        Some((id, hash))
-      })
-      .collect();
-
-    let (need_from_remote, need_from_local) =
-      merkle_diff(&local_leaves_parsed, &remote_leaves_parsed);
+    let (need_from_remote, need_from_local) = self.service.merkle_diff(&remote_leaves_parsed).await;
 
     let fetched = if need_from_remote.is_empty() {
       Vec::new()
@@ -337,10 +321,7 @@ impl ClusterSync {
       let _ = self.storage.peers.seed(&info.address);
     }
 
-    let now = now_ms();
-    if let Err(error) = self.storage.peers.mark_seen(peer, now) {
-      tracing::warn!(%peer, %error, "failed to record peer seen state");
-    }
+    let _ = self.storage.peers.mark_seen(peer, now_ms());
     Ok(())
   }
 
@@ -354,10 +335,7 @@ impl ClusterSync {
       let _ = self.storage.peers.seed(&info.address);
     }
 
-    let now = now_ms();
-    if let Err(error) = self.storage.peers.mark_seen(peer, now) {
-      tracing::warn!(%peer, %error, "failed to record peer seen state");
-    }
+    let _ = self.storage.peers.mark_seen(peer, now_ms());
     Ok(())
   }
 
@@ -455,14 +433,8 @@ impl ClusterSync {
     let connect = PeerClient::connect(address, self.tls.clone());
     let client = match timeout(Duration::from_secs(3), connect).await {
       Ok(Ok(client)) => client,
-      Ok(Err(error)) => {
-        tracing::warn!(%address, %error, "peer connect failed");
-        return Err(error);
-      }
-      Err(_) => {
-        tracing::warn!(%address, "peer connect timed out");
-        return Err(ClusterClientError::Timeout);
-      }
+      Ok(Err(error)) => return Err(error),
+      Err(_) => return Err(ClusterClientError::Timeout),
     };
 
     let mut clients = self.clients.lock().await;
@@ -676,64 +648,5 @@ impl Membership for ClusterSync {
     &self, request: Request<StateMessage>,
   ) -> Result<Response<lycoris_api::proto::StateResponse>, Status> {
     self.handle_state_message(request).await
-  }
-}
-
-fn merkle_diff(
-  local: &[(String, MerkleHash)], remote: &[(String, MerkleHash)],
-) -> (Vec<String>, Vec<String>) {
-  let mut need_from_remote = Vec::new();
-  let mut need_from_local = Vec::new();
-  let mut i = 0usize;
-  let mut j = 0usize;
-
-  while i < local.len() && j < remote.len() {
-    match local[i].0.cmp(&remote[j].0) {
-      std::cmp::Ordering::Less => {
-        need_from_local.push(local[i].0.clone());
-        i += 1;
-      }
-      std::cmp::Ordering::Greater => {
-        need_from_remote.push(remote[j].0.clone());
-        j += 1;
-      }
-      std::cmp::Ordering::Equal => {
-        if local[i].1 != remote[j].1 {
-          need_from_remote.push(local[i].0.clone());
-          need_from_local.push(local[i].0.clone());
-        }
-        i += 1;
-        j += 1;
-      }
-    }
-  }
-
-  while i < local.len() {
-    need_from_local.push(local[i].0.clone());
-    i += 1;
-  }
-  while j < remote.len() {
-    need_from_remote.push(remote[j].0.clone());
-    j += 1;
-  }
-
-  (need_from_remote, need_from_local)
-}
-
-fn register_to_proto(register: &crate::membership::MemberRegister) -> ProtoNodeInfo {
-  ProtoNodeInfo {
-    id: register.node_id.clone(),
-    address: register.address.clone(),
-    labels: register.labels.clone(),
-    annotations: register.annotations.clone(),
-    last_heartbeat_unix_ms: register.updated_at_ms,
-    state: match register.state {
-      crate::membership::MemberState::Active => "active".to_string(),
-      crate::membership::MemberState::Suspected => "suspected".to_string(),
-      crate::membership::MemberState::Leaving => "leaving".to_string(),
-      crate::membership::MemberState::Offline => "offline".to_string(),
-    },
-    incarnation: register.incarnation,
-    heartbeat: register.heartbeat,
   }
 }

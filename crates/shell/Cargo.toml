@@ -16,7 +16,6 @@ name = "lycoris"
 path = "src/main.rs"
 
 [dependencies]
-anyhow.workspace         = true
 clap = { workspace = true, features = ["derive"] }
 lycoris-api.workspace = true
 lycoris-config.workspace = true

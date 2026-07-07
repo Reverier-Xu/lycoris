@@ -16,10 +16,8 @@ name = "lycoris-daemon"
 path = "src/main.rs"
 
 [dependencies]
-anyhow.workspace         = true
 blake3                   = "1.5"
 clap = { workspace = true, features = ["derive"] }
-dashmap.workspace        = true
 lycoris-api.workspace    = true
 lycoris-config.workspace = true
 lycoris-storage.workspace = true

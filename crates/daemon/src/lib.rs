@@ -1,7 +1,6 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
-pub mod api;
 pub mod cluster_sync;
 pub mod membership;
 pub mod rpc;
@@ -20,10 +19,4 @@ pub enum Error {
   Tls(#[from] tls::TlsError),
   #[error("runtime error: {0}")]
   Runtime(#[from] runtime::RuntimeError),
-}
-
-/// Install the rustls ring crypto provider as the process default.
-/// This must be called before any TLS connection is established.
-pub fn install_crypto_provider() -> Result<(), std::sync::Arc<rustls::crypto::CryptoProvider>> {
-  rustls::crypto::ring::default_provider().install_default()
 }

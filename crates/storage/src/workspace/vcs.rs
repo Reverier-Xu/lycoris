@@ -30,6 +30,8 @@ pub enum WorkspaceStorageError {
   NotFound(String),
   #[error("pijul error: {0}")]
   Pijul(String),
+  #[error("pijul change error: {0}")]
+  Change(#[from] pijul_core::change::ChangeError),
   #[error("corrupt state in database: {0}")]
   CorruptState(String),
 }
@@ -37,6 +39,12 @@ pub enum WorkspaceStorageError {
 impl From<std::io::Error> for WorkspaceStorageError {
   fn from(error: std::io::Error) -> Self {
     Self::Storage(crate::StorageError::Io(error))
+  }
+}
+
+impl From<pijul_core::changestore::filesystem::Error> for WorkspaceStorageError {
+  fn from(error: pijul_core::changestore::filesystem::Error) -> Self {
+    Self::Pijul(error.to_string())
   }
 }
 
@@ -239,32 +247,31 @@ fn record_change<
 >(
   working_copy: &W, change_store: &C, txn: &pijul_core::pristine::ArcTxn<T>,
   channel: &ChannelRef<T>, prefix: &str, message: &str,
-) -> Result<Hash, anyhow::Error>
+) -> Result<Hash, WorkspaceStorageError>
 where
   W::Error: Send + Sync + 'static,
-  C::Error: std::error::Error + Send + Sync + 'static, {
+  C::Error: std::error::Error + Send + Sync + 'static,
+  WorkspaceStorageError: From<C::Error>, {
   let mut state = Builder::new();
-  state.record(
-    txn.clone(),
-    Algorithm::default(),
-    false,
-    &pijul_core::DEFAULT_SEPARATOR,
-    channel.clone(),
-    working_copy,
-    change_store,
-    prefix,
-    1,
-  )?;
+  state
+    .record(
+      txn.clone(),
+      Algorithm::default(),
+      false,
+      &pijul_core::DEFAULT_SEPARATOR,
+      channel.clone(),
+      working_copy,
+      change_store,
+      prefix,
+      1,
+    )
+    .map_err(pijul_err)?;
 
   let rec = state.finish();
   let actions: Vec<_> = rec
     .actions
     .into_iter()
-    .map(|rec| {
-      rec
-        .globalize(&*txn.read())
-        .map_err(|e| anyhow::anyhow!("{e}"))
-    })
+    .map(|rec| rec.globalize(&*txn.read()).map_err(pijul_err))
     .collect::<Result<Vec<_>, _>>()?;
 
   let mut change = Change::make_change(
@@ -279,11 +286,15 @@ where
       timestamp: jiff::Timestamp::now(),
     },
     Vec::new(),
-  )?;
+  )
+  .map_err(pijul_err)?;
 
-  let hash = change_store.save_change(&mut change, |_, _| Ok::<(), anyhow::Error>(()))?;
+  let hash = change_store
+    .save_change(&mut change, |_, _| Ok::<(), WorkspaceStorageError>(()))
+    .map_err(pijul_err)?;
 
-  apply::apply_local_change(&mut *txn.write(), channel, &change, &hash, &rec.updatables)?;
+  apply::apply_local_change(&mut *txn.write(), channel, &change, &hash, &rec.updatables)
+    .map_err(pijul_err)?;
 
   Ok(hash)
 }

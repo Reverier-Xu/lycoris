@@ -3,9 +3,9 @@
 
 use std::path::PathBuf;
 
-use anyhow::Context;
 use clap::Parser;
 use lycoris_config::{DaemonConfig, paths::default_daemon_config_path};
+use thiserror::Error;
 
 #[derive(Parser, Debug)]
 #[command(name = "lycoris-daemon", version, about = "lycoris daemon")]
@@ -16,20 +16,30 @@ struct Args {
   config: Option<PathBuf>,
 }
 
+#[derive(Debug, Error)]
+enum MainError {
+  #[error("failed to install rustls crypto provider: {0:?}")]
+  CryptoProvider(std::sync::Arc<rustls::crypto::CryptoProvider>),
+  #[error("could not determine configuration file path")]
+  MissingConfigPath,
+  #[error("failed to load config: {0}")]
+  Config(#[from] lycoris_config::ConfigError),
+  #[error("runtime error: {0}")]
+  Runtime(#[from] lycoris_daemon::runtime::RuntimeError),
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-  lycoris_daemon::install_crypto_provider()
-    .map_err(|error| anyhow::anyhow!("failed to install rustls crypto provider: {error:?}"))?;
+async fn main() -> Result<(), MainError> {
+  lycoris_api::install_crypto_provider().map_err(MainError::CryptoProvider)?;
   tracing_subscriber::fmt::init();
 
   let args = Args::parse();
   let config_path = args
     .config
     .or_else(default_daemon_config_path)
-    .context("could not determine configuration file path")?;
+    .ok_or(MainError::MissingConfigPath)?;
 
-  let config = DaemonConfig::from_file(&config_path)
-    .with_context(|| format!("failed to load config from {:?}", config_path))?;
+  let config = DaemonConfig::from_file(&config_path)?;
 
   tracing::info!(
     node_id = %config.node.id,
