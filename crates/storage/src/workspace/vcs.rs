@@ -1,12 +1,10 @@
-//! Simple filesystem-backed versioned content storage.
+//! Version-controlled content storage for skills and rules.
 //!
-//! Skill and rule bodies are stored as plain files. Each write creates a new
-//! immutable snapshot; the latest snapshot is mirrored to a stable path for
-//! easy reading. This is intentionally lightweight compared to a full DVCS.
+//! Skill and rule bodies are kept in a real Git repository. The backend is
+//! intentionally thin: it shells out to the system `git` binary instead of
+//! linking a Git library, avoiding C dependencies such as `libgit2`.
 
 use std::path::PathBuf;
-
-use serde::{Deserialize, Serialize};
 
 /// Errors that can occur in workspace storage backends.
 #[derive(Debug, thiserror::Error)]
@@ -15,8 +13,8 @@ pub enum WorkspaceStorageError {
   Storage(#[from] crate::StorageError),
   #[error("workspace not found: {0}")]
   NotFound(String),
-  #[error("corrupt version log: {0}")]
-  CorruptVersionLog(String),
+  #[error("git command failed: {0}")]
+  GitCommandFailed(String),
 }
 
 impl From<std::io::Error> for WorkspaceStorageError {
@@ -25,15 +23,9 @@ impl From<std::io::Error> for WorkspaceStorageError {
   }
 }
 
-impl From<toml::de::Error> for WorkspaceStorageError {
-  fn from(error: toml::de::Error) -> Self {
-    Self::CorruptVersionLog(error.to_string())
-  }
-}
-
-impl From<toml::ser::Error> for WorkspaceStorageError {
-  fn from(error: toml::ser::Error) -> Self {
-    Self::CorruptVersionLog(error.to_string())
+impl From<std::string::FromUtf8Error> for WorkspaceStorageError {
+  fn from(error: std::string::FromUtf8Error) -> Self {
+    Self::GitCommandFailed(format!("invalid utf-8 in git output: {error}"))
   }
 }
 
@@ -47,135 +39,149 @@ pub struct VersionInfo {
 
 /// A content store backed by a version-control system.
 pub trait VersionedContentStore: std::fmt::Debug + Send + Sync {
-  /// Ensure the underlying repository exists and is initialized.
   fn initialize(&self) -> Result<(), WorkspaceStorageError>;
-
-  /// Write a new version of `id` with the given content and commit message.
-  ///
-  /// Returns the hash of the recorded snapshot.
   fn write(&self, id: &str, content: &str, message: &str) -> Result<String, WorkspaceStorageError>;
-
-  /// Read the latest version of `id`.
   fn read(&self, id: &str) -> Result<Option<String>, WorkspaceStorageError>;
-
-  /// Return the hash of the latest recorded change for `id`, if any.
   fn latest_hash(&self, id: &str) -> Result<Option<String>, WorkspaceStorageError>;
-
-  /// Return the version history of `id`, most recent first.
   fn history(&self, id: &str) -> Result<Vec<VersionInfo>, WorkspaceStorageError>;
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct VersionEntry {
-  hash: String,
-  message: String,
-  timestamp_ms: i64,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct VersionLog {
-  versions: Vec<VersionEntry>,
-}
-
-/// A filesystem-backed content store.
-///
-/// Each store uses its own directory. Resources are stored as files under a
-/// per-resource subdirectory; a TOML log keeps the ordered version metadata.
+/// A thin Git-backed content store using the system `git` binary.
 #[derive(Debug, Clone)]
-pub struct SnapshotContentStore {
+pub struct GitContentStore {
   pub(crate) repo_path: PathBuf,
 }
 
-impl SnapshotContentStore {
+impl GitContentStore {
   pub fn new(repo_path: PathBuf) -> Self {
     Self { repo_path }
   }
 
-  fn resource_dir(&self, id: &str) -> PathBuf {
-    self.repo_path.join(id)
+  fn git(&self) -> std::process::Command {
+    let mut cmd = std::process::Command::new("git");
+    cmd
+      .current_dir(&self.repo_path)
+      .env("GIT_AUTHOR_NAME", "lycoris")
+      .env("GIT_AUTHOR_EMAIL", "lycoris@localhost")
+      .env("GIT_COMMITTER_NAME", "lycoris")
+      .env("GIT_COMMITTER_EMAIL", "lycoris@localhost");
+    cmd
   }
 
-  fn content_path(&self, id: &str, hash: &str) -> PathBuf {
-    self.resource_dir(id).join(format!("{hash}.toml"))
-  }
-
-  fn latest_path(&self, id: &str) -> PathBuf {
-    self.resource_dir(id).join("latest.toml")
-  }
-
-  fn log_path(&self, id: &str) -> PathBuf {
-    self.resource_dir(id).join("versions.toml")
-  }
-
-  fn load_log(&self, id: &str) -> Result<VersionLog, WorkspaceStorageError> {
-    let path = self.log_path(id);
-    if !path.exists() {
-      return Ok(VersionLog::default());
+  fn ok(
+    &self, output: std::process::Output,
+  ) -> Result<std::process::Output, WorkspaceStorageError> {
+    if output.status.success() {
+      Ok(output)
+    } else {
+      Err(WorkspaceStorageError::GitCommandFailed(
+        String::from_utf8_lossy(&output.stderr).to_string(),
+      ))
     }
-    Ok(toml::from_str(&std::fs::read_to_string(path)?)?)
-  }
-
-  fn save_log(&self, id: &str, log: &VersionLog) -> Result<(), WorkspaceStorageError> {
-    std::fs::write(self.log_path(id), toml::to_string(log)?)?;
-    Ok(())
   }
 }
 
-impl VersionedContentStore for SnapshotContentStore {
+impl VersionedContentStore for GitContentStore {
   fn initialize(&self) -> Result<(), WorkspaceStorageError> {
     std::fs::create_dir_all(&self.repo_path)?;
+    if self.repo_path.join(".git").exists() {
+      return Ok(());
+    }
+    self.ok(self.git().arg("init").arg("--quiet").output()?)?;
     Ok(())
   }
 
   fn write(&self, id: &str, content: &str, message: &str) -> Result<String, WorkspaceStorageError> {
     self.initialize()?;
-    let dir = self.resource_dir(id);
-    std::fs::create_dir_all(&dir)?;
+    let relative_path = format!("{id}.toml");
+    std::fs::write(self.repo_path.join(&relative_path), content)?;
 
-    let timestamp_ms = jiff::Timestamp::now().as_millisecond();
-    let hash = blake3::hash(content.as_bytes()).to_hex().to_string();
-    std::fs::write(self.content_path(id, &hash), content)?;
-    std::fs::write(self.latest_path(id), content)?;
+    self.ok(self.git().arg("add").arg(&relative_path).output()?)?;
+    let output = self
+      .git()
+      .arg("commit")
+      .arg("--quiet")
+      .arg("--no-gpg-sign")
+      .arg("-m")
+      .arg(message)
+      .arg("--")
+      .arg(&relative_path)
+      .output()?;
+    if !output.status.success() && output.status.code() != Some(1) {
+      return Err(WorkspaceStorageError::GitCommandFailed(
+        String::from_utf8_lossy(&output.stderr).to_string(),
+      ));
+    }
 
-    let mut log = self.load_log(id)?;
-    log.versions.push(VersionEntry {
-      hash: hash.clone(),
-      message: message.to_string(),
-      timestamp_ms,
-    });
-    self.save_log(id, &log)?;
-    Ok(hash)
+    let output = self.ok(
+      self
+        .git()
+        .arg("log")
+        .arg("-1")
+        .arg("--format=%H")
+        .arg("--")
+        .arg(&relative_path)
+        .output()?,
+    )?;
+    Ok(String::from_utf8(output.stdout)?.trim().to_string())
   }
 
   fn read(&self, id: &str) -> Result<Option<String>, WorkspaceStorageError> {
-    let path = self.latest_path(id);
-    if !path.exists() {
-      return Ok(None);
+    match std::fs::read_to_string(self.repo_path.join(format!("{id}.toml"))) {
+      Ok(content) => Ok(Some(content)),
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+      Err(error) => Err(error.into()),
     }
-    Ok(Some(std::fs::read_to_string(path)?))
   }
 
   fn latest_hash(&self, id: &str) -> Result<Option<String>, WorkspaceStorageError> {
-    let log = self.load_log(id)?;
-    Ok(log.versions.last().map(|entry| entry.hash.clone()))
+    let relative_path = format!("{id}.toml");
+    let output = self
+      .git()
+      .arg("log")
+      .arg("-1")
+      .arg("--format=%H")
+      .arg("--")
+      .arg(&relative_path)
+      .output()?;
+    if !output.status.success() {
+      return Ok(None);
+    }
+    let hash = String::from_utf8(output.stdout)?.trim().to_string();
+    Ok(if hash.is_empty() { None } else { Some(hash) })
   }
 
   fn history(&self, id: &str) -> Result<Vec<VersionInfo>, WorkspaceStorageError> {
-    let log = self.load_log(id)?;
-    Ok(
-      log
-        .versions
-        .into_iter()
-        .rev()
-        .map(|entry| VersionInfo {
-          hash: entry.hash,
-          message: entry.message,
-          timestamp_ms: entry.timestamp_ms,
-        })
-        .collect(),
-    )
+    let relative_path = format!("{id}.toml");
+    let output = self
+      .git()
+      .arg("log")
+      .arg("--format=%H%x00%s%x00%at")
+      .arg("--")
+      .arg(&relative_path)
+      .output()?;
+    if !output.status.success() {
+      return Ok(Vec::new());
+    }
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let mut history = Vec::new();
+    for record in stdout.split('\n').filter(|line| !line.is_empty()) {
+      let mut fields = record.split('\0');
+      let hash = fields.next().unwrap_or("").to_string();
+      let message = fields.next().unwrap_or("").to_string();
+      let timestamp_s: i64 = fields.next().unwrap_or("0").parse().unwrap_or(0);
+      history.push(VersionInfo {
+        hash,
+        message,
+        timestamp_ms: timestamp_s * 1000,
+      });
+    }
+    Ok(history)
   }
 }
+
+pub type ContentStore = GitContentStore;
 
 #[cfg(test)]
 mod tests {
@@ -183,17 +189,17 @@ mod tests {
 
   use super::*;
 
-  fn test_store() -> (TempDir, SnapshotContentStore) {
+  fn test_store() -> (TempDir, GitContentStore) {
     let dir = TempDir::new().unwrap();
-    let store = SnapshotContentStore::new(dir.path().to_path_buf());
+    let store = GitContentStore::new(dir.path().to_path_buf());
     (dir, store)
   }
 
   #[test]
-  fn initialize_creates_repository() {
+  fn initialize_creates_git_repository() {
     let (dir, store) = test_store();
     store.initialize().unwrap();
-    assert!(dir.path().exists());
+    assert!(dir.path().join(".git").exists());
   }
 
   #[test]
@@ -201,9 +207,7 @@ mod tests {
     let (_dir, store) = test_store();
     store.write("skill-1", "v1", "initial").unwrap();
     store.write("skill-1", "v2", "update").unwrap();
-
-    let latest = store.read("skill-1").unwrap().unwrap();
-    assert_eq!(latest, "v2");
+    assert_eq!(store.read("skill-1").unwrap().unwrap(), "v2");
   }
 
   #[test]

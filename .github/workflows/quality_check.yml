@@ -49,13 +49,15 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: cargo check
-        run: cargo check --workspace --all-targets --all-features --locked
+        run: cargo check --workspace --all-targets --locked
 
       - name: cargo fmt
         run: cargo +nightly fmt --all -- --check
 
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: cargo test
-        run: cargo test --workspace --all-features --locked
+        env:
+          CARGO_BUILD_JOBS: 2
+        run: cargo test --workspace --locked

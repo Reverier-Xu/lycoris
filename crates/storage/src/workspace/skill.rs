@@ -50,23 +50,20 @@ pub trait SkillStorage: std::fmt::Debug + Send + Sync {
   fn delete(&self, id: &str) -> Result<(), WorkspaceStorageError>;
 }
 
-/// Filesystem-backed content store for skill bodies.
-///
-/// Skill content is versioned as immutable snapshots. This store only exposes
-/// the small surface needed by the rest of the storage layer.
+/// Git-backed content store for skill bodies.
 #[derive(Debug, Clone)]
 pub struct SkillContentStore {
-  inner: super::vcs::SnapshotContentStore,
+  inner: super::vcs::ContentStore,
 }
 
 impl SkillContentStore {
   pub fn new(repo_path: std::path::PathBuf) -> Self {
     Self {
-      inner: super::vcs::SnapshotContentStore::new(repo_path),
+      inner: super::vcs::ContentStore::new(repo_path),
     }
   }
 
-  /// Return the directory of the underlying snapshot repository.
+  /// Return the directory of the underlying git repository.
   pub fn repo_path(&self) -> &Path {
     &self.inner.repo_path
   }
@@ -76,9 +73,7 @@ impl SkillContentStore {
     self.inner.read(id)
   }
 
-  /// Write a new version of a skill, recording it as a snapshot.
-  ///
-  /// Returns the content hash of the recorded snapshot.
+  /// Write a new version of a skill, recording it in git.
   pub fn write(
     &self, id: &str, content: &str, message: &str,
   ) -> Result<String, WorkspaceStorageError> {

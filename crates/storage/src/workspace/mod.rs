@@ -22,7 +22,9 @@ pub mod vcs;
 pub use rule::{RedbRuleStorage, RuleContentStore, RuleRecord, RuleStorage};
 pub use skill::{RedbSkillStorage, SkillContentStore, SkillRecord, SkillStorage};
 pub use store::{RedbWorkspaceStorage, WorkspaceMetadataStorage, WorkspaceRecord};
-pub use vcs::{SnapshotContentStore, VersionInfo, VersionedContentStore, WorkspaceStorageError};
+pub use vcs::{
+  ContentStore, GitContentStore, VersionInfo, VersionedContentStore, WorkspaceStorageError,
+};
 
 /// Visibility scope for a reusable resource.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
