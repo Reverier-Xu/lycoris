@@ -17,23 +17,41 @@ pub enum Command {
   #[command(subcommand)]
   Cluster(ClusterCommand),
 
-  /// Install lycoris-server as a user-mode background service.
-  Setup {
-    /// Name of the server binary to look for next to the lycoris binary.
-    #[arg(long, default_value = "lycoris-server")]
-    binary_name: String,
+  /// Run the lycoris daemon in the foreground.
+  Daemon {
+    /// Path to the daemon configuration file.
+    #[arg(short, long)]
+    config: Option<std::path::PathBuf>,
   },
+
+  /// Install lycoris as a user-mode background service.
+  Setup,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum ClusterCommand {
-  /// List cluster nodes.
-  Nodes {
-    /// Label selector in the form `key=value`. Can be specified multiple
-    /// times.
-    #[arg(long = "selector", value_name = "KEY=VALUE")]
+  /// List or get cluster resources.
+  Get {
+    /// Resource kind, e.g. `nodes`, `skills`, `sessions`.
+    resource: String,
+    /// Optional resource id. If omitted, all matching resources are listed.
+    name: Option<String>,
+    /// Label selector in the form `key=value`. Can be specified multiple times.
+    #[arg(short, long = "selector", value_name = "KEY=VALUE")]
     selectors: Vec<String>,
+    /// Scope filter for skills and rules (`shared` or `local`).
+    #[arg(long, value_name = "SCOPE")]
+    scope: Option<String>,
   },
+
+  /// Show detailed information about a single resource.
+  Describe {
+    /// Resource kind, e.g. `node`, `skill`, `session`.
+    resource: String,
+    /// Unique resource id.
+    name: String,
+  },
+
   /// Register a new node with the cluster.
   Register {
     /// Unique node id.
@@ -43,4 +61,29 @@ pub enum ClusterCommand {
     #[arg(long)]
     address: String,
   },
+
+  /// Initialize this machine as a new cluster, generating or storing a
+  /// cluster key.
+  Init {
+    /// Optional 32-byte cluster key in hex. If omitted, a random key is
+    /// generated.
+    #[arg(long)]
+    key: Option<String>,
+  },
+
+  /// Join an existing cluster by contacting one of its members.
+  Join {
+    /// Address of an existing cluster member.
+    #[arg(long)]
+    peer: String,
+    /// Cluster shared key in hex.
+    #[arg(long)]
+    key: String,
+  },
+
+  /// Leave the cluster.
+  Leave,
+
+  /// Print the current cluster key.
+  Key,
 }

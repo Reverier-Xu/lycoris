@@ -5,12 +5,12 @@ use crate::error::ShellError;
 const SERVICE_NAME: &str = "lycoris";
 const DEFAULT_CONFIG_NAME: &str = "lycoris.toml";
 
-/// Install `lycoris-server` as a user service.
+/// Install `lycoris` as a user service.
 ///
-/// The server binary is expected to live in the same directory as the running
-/// `lycoris` executable. This matches the production layout where both binaries
-/// are shipped side-by-side.
-pub fn run(binary_name: &str) -> Result<(), ShellError> {
+/// The binary is expected to live in the same directory as the running
+/// `lycoris` executable. This matches the production layout where both the
+/// CLI and daemon code ship as a single binary.
+pub fn run() -> Result<(), ShellError> {
   let current_exe = env::current_exe().map_err(|error| {
     ShellError::setup(format!(
       "failed to determine current executable path: {error}"
@@ -20,7 +20,7 @@ pub fn run(binary_name: &str) -> Result<(), ShellError> {
     .parent()
     .ok_or_else(|| ShellError::setup("current executable has no parent directory"))?;
 
-  platform::install(bin_dir, binary_name)
+  platform::install(bin_dir)
 }
 
 #[cfg(target_os = "linux")]
@@ -30,7 +30,7 @@ mod platform {
   use super::{DEFAULT_CONFIG_NAME, SERVICE_NAME};
   use crate::error::ShellError;
 
-  pub fn install(bin_dir: &Path, binary_name: &str) -> Result<(), ShellError> {
+  pub fn install(bin_dir: &Path) -> Result<(), ShellError> {
     let home = home_dir()?;
     let systemd_dir = home.join(".config/systemd/user");
     let config_dir =
@@ -38,7 +38,7 @@ mod platform {
     let data_dir =
       lycoris_config::paths::user_data_dir().unwrap_or_else(|| home.join(".local/share/lycoris"));
 
-    install_common(bin_dir, binary_name, &systemd_dir, &config_dir, &data_dir)?;
+    install_common(bin_dir, &systemd_dir, &config_dir, &data_dir)?;
     reload_and_enable_user_systemd()?;
 
     println!(
@@ -61,15 +61,14 @@ mod platform {
   }
 
   fn install_common(
-    bin_dir: &Path, binary_name: &str, systemd_dir: &Path, config_dir: &Path, data_dir: &Path,
+    bin_dir: &Path, systemd_dir: &Path, config_dir: &Path, data_dir: &Path,
   ) -> Result<(), ShellError> {
-    let server_binary = bin_dir.join(binary_name);
+    let server_binary = bin_dir.join("lycoris");
 
     if !server_binary.is_file() {
       return Err(ShellError::setup(format!(
-        "server binary not found at {}; ensure '{}' is in the same directory as the lycoris binary",
-        server_binary.display(),
-        binary_name
+        "server binary not found at {}; ensure 'lycoris' is in the same directory as the lycoris binary",
+        server_binary.display()
       )));
     }
 
@@ -117,14 +116,14 @@ mod platform {
 
   fn render_user_unit(server_binary: &Path, config_dir: &Path, data_dir: &Path) -> String {
     let exec_start = format!(
-      "\"{}\" --config \"{}\"",
+      "\"{}\" daemon --config \"{}\"",
       server_binary.to_string_lossy(),
       config_dir.join(DEFAULT_CONFIG_NAME).display()
     );
 
     format!(
       "[Unit]\n\
-       Description=Lycoris server daemon (user)\n\
+       Description=Lycoris daemon (user)\n\
        Documentation=https://lycoris.woooo.tech\n\
        After=network-online.target\n\
        Wants=network-online.target\n\n\
@@ -202,24 +201,17 @@ mod platform {
       let data_dir = tmp.path().join("data");
 
       fs::create_dir_all(&bin_dir).unwrap();
-      let server_binary = bin_dir.join("lycoris-server");
+      let server_binary = bin_dir.join("lycoris");
       make_executable(&server_binary);
 
-      install_common(
-        &bin_dir,
-        "lycoris-server",
-        &systemd_dir,
-        &config_dir,
-        &data_dir,
-      )
-      .unwrap();
+      install_common(&bin_dir, &systemd_dir, &config_dir, &data_dir).unwrap();
 
       assert!(systemd_dir.join("lycoris.service").is_file());
       assert!(config_dir.is_dir());
       assert!(data_dir.is_dir());
 
       let content = fs::read_to_string(systemd_dir.join("lycoris.service")).unwrap();
-      assert!(content.contains(&format!("ExecStart=\"{}\"", server_binary.display())));
+      assert!(content.contains(&format!("ExecStart=\"{}\" daemon", server_binary.display())));
       assert!(content.contains(&format!("WorkingDirectory={}", data_dir.display())));
     }
 
@@ -231,7 +223,6 @@ mod platform {
 
       let result = install_common(
         &bin_dir,
-        "lycoris-server",
         &tmp.path().join("systemd"),
         &tmp.path().join("config"),
         &tmp.path().join("data"),
@@ -246,12 +237,11 @@ mod platform {
       let bin_dir = tmp.path().join("bin");
       fs::create_dir_all(&bin_dir).unwrap();
 
-      let server_binary = bin_dir.join("lycoris-server");
+      let server_binary = bin_dir.join("lycoris");
       fs::write(&server_binary, "not executable").unwrap();
 
       let result = install_common(
         &bin_dir,
-        "lycoris-server",
         &tmp.path().join("systemd"),
         &tmp.path().join("config"),
         &tmp.path().join("data"),
@@ -269,7 +259,7 @@ mod platform {
   use super::{DEFAULT_CONFIG_NAME, SERVICE_NAME};
   use crate::error::ShellError;
 
-  pub fn install(bin_dir: &Path, binary_name: &str) -> Result<(), ShellError> {
+  pub fn install(bin_dir: &Path) -> Result<(), ShellError> {
     let home = home_dir()?;
     let launchd_dir = home.join("Library/LaunchAgents");
     let config_dir = lycoris_config::paths::user_config_dir()
@@ -277,7 +267,7 @@ mod platform {
     let data_dir = lycoris_config::paths::user_data_dir()
       .unwrap_or_else(|| home.join("Library/Application Support/lycoris"));
 
-    install_common(bin_dir, binary_name, &launchd_dir, &config_dir, &data_dir)?;
+    install_common(bin_dir, &launchd_dir, &config_dir, &data_dir)?;
     load_launchd_agent(&launchd_dir)?;
 
     println!(
@@ -298,15 +288,14 @@ mod platform {
   }
 
   fn install_common(
-    bin_dir: &Path, binary_name: &str, launchd_dir: &Path, config_dir: &Path, data_dir: &Path,
+    bin_dir: &Path, launchd_dir: &Path, config_dir: &Path, data_dir: &Path,
   ) -> Result<(), ShellError> {
-    let server_binary = bin_dir.join(binary_name);
+    let server_binary = bin_dir.join("lycoris");
 
     if !server_binary.is_file() {
       return Err(ShellError::setup(format!(
-        "server binary not found at {}; ensure '{}' is in the same directory as the lycoris binary",
-        server_binary.display(),
-        binary_name
+        "server binary not found at {}; ensure 'lycoris' is in the same directory as the lycoris binary",
+        server_binary.display()
       )));
     }
 
@@ -348,6 +337,7 @@ mod platform {
          <key>ProgramArguments</key>\n\
          <array>\n\
            <string>{}</string>\n\
+           <string>daemon</string>\n\
            <string>--config</string>\n\
            <string>{}</string>\n\
          </array>\n\
@@ -403,14 +393,13 @@ mod platform {
   use super::{DEFAULT_CONFIG_NAME, SERVICE_NAME};
   use crate::error::ShellError;
 
-  pub fn install(bin_dir: &Path, binary_name: &str) -> Result<(), ShellError> {
-    let server_binary = bin_dir.join(binary_name);
+  pub fn install(bin_dir: &Path) -> Result<(), ShellError> {
+    let server_binary = bin_dir.join("lycoris");
 
     if !server_binary.is_file() {
       return Err(ShellError::setup(format!(
-        "server binary not found at {}; ensure '{}' is in the same directory as the lycoris binary",
-        server_binary.display(),
-        binary_name
+        "server binary not found at {}; ensure 'lycoris' is in the same directory as the lycoris binary",
+        server_binary.display()
       )));
     }
 
@@ -442,7 +431,7 @@ mod platform {
     );
     println!("  2. register {} as a windows service, e.g.:", SERVICE_NAME);
     println!(
-      "     sc create {SERVICE_NAME} binPath= \"{} --config \\\"{}\\\"\" start= auto",
+      "     sc create {SERVICE_NAME} binPath= \"{} daemon --config \\\"{}\\\"\" start= auto",
       server_binary.display(),
       config_dir.join(DEFAULT_CONFIG_NAME).display()
     );
@@ -458,7 +447,7 @@ mod platform {
 
   use crate::error::ShellError;
 
-  pub fn install(_bin_dir: &Path, _binary_name: &str) -> Result<(), ShellError> {
+  pub fn install(_bin_dir: &Path) -> Result<(), ShellError> {
     Err(ShellError::setup(
       "setup is only supported on linux, macos and windows",
     ))
