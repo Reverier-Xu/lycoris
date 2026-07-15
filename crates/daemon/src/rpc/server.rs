@@ -14,9 +14,10 @@ use lycoris_api::{
     resource::Body,
   },
 };
-use lycoris_core::ClusterKey;
+use lycoris_core::{ClusterKey, DEFAULT_EMBEDDING_DIM};
 use lycoris_storage::{
   MemoryEntry, ResourceScope, RuleRecord, Session, SkillRecord, Storage, WorkspaceRecord,
+  workspace::VersionedContentStore,
 };
 use tokio::sync::watch;
 use tonic::{Request, Response, Status, transport::ClientTlsConfig};
@@ -525,7 +526,7 @@ impl ClusterService {
   async fn recall_memories(
     &self, limit: usize,
   ) -> Result<Vec<MemoryEntry>, lycoris_storage::AgentStorageError> {
-    let query = vec![0.0f32; lycoris_storage::DEFAULT_EMBEDDING_DIM];
+    let query = vec![0.0f32; DEFAULT_EMBEDDING_DIM];
     self.storage.agent().memory().recall(query, limit).await
   }
 }

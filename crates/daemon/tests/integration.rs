@@ -7,7 +7,8 @@ use std::{
 
 use lycoris_api::{ClusterRpcClient, PeerClient, proto::ResourceKind};
 use lycoris_config::{ClusterConfig, DaemonConfig, NodeConfig, TlsConfig};
-use lycoris_storage::{LocalNode, Storage};
+use lycoris_core::SimpleNode;
+use lycoris_storage::Storage;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
 use tempfile::TempDir;
 use tokio::time;
@@ -168,16 +169,14 @@ async fn registry_converges_across_three_node_chain() {
     .expect("failed to connect to node-0");
 
   let external_dir = TempDir::new().unwrap();
-  let external_storage =
+  let _external_storage =
     Storage::open(external_dir.path().join("external.redb")).expect("open external storage");
-  let external = LocalNode::from_config(
-    &NodeConfig {
-      id: "external-node".to_string(),
-      address: format!("127.0.0.1:{}", base_port + 99),
-    },
-    external_storage.node().local,
-  )
-  .unwrap();
+  let external = SimpleNode::new(
+    "external-node".to_string(),
+    format!("127.0.0.1:{}", base_port + 99),
+    HashMap::new(),
+    HashMap::new(),
+  );
   client.register(&external).await.expect("register failed");
 
   // Wait for push + anti-entropy to propagate through the chain.
@@ -262,16 +261,14 @@ async fn primary_failure_falls_back_and_promotes() {
   // Register an external node through node-0. The push/sync must use the
   // fallback (node-1) because the primary is unreachable.
   let external_dir = TempDir::new().unwrap();
-  let external_storage =
+  let _external_storage =
     Storage::open(external_dir.path().join("external.redb")).expect("open external storage");
-  let external = LocalNode::from_config(
-    &NodeConfig {
-      id: "fallback-external-node".to_string(),
-      address: format!("127.0.0.1:{}", base_port + 99),
-    },
-    external_storage.node().local,
-  )
-  .unwrap();
+  let external = SimpleNode::new(
+    "fallback-external-node".to_string(),
+    format!("127.0.0.1:{}", base_port + 99),
+    HashMap::new(),
+    HashMap::new(),
+  );
   client.register(&external).await.expect("register failed");
 
   time::sleep(Duration::from_millis(5500)).await;
@@ -346,16 +343,14 @@ async fn partition_merge_reconciles_bidirectional_membership() {
     .expect("failed to connect to node-0");
 
   let alpha_dir = TempDir::new().unwrap();
-  let alpha_storage =
+  let _alpha_storage =
     Storage::open(alpha_dir.path().join("alpha.redb")).expect("open alpha storage");
-  let alpha = LocalNode::from_config(
-    &NodeConfig {
-      id: "alpha".to_string(),
-      address: format!("127.0.0.1:{}", base_port + 98),
-    },
-    alpha_storage.node().local,
-  )
-  .unwrap();
+  let alpha = SimpleNode::new(
+    "alpha".to_string(),
+    format!("127.0.0.1:{}", base_port + 98),
+    HashMap::new(),
+    HashMap::new(),
+  );
   client
     .register(&alpha)
     .await
@@ -366,15 +361,13 @@ async fn partition_merge_reconciles_bidirectional_membership() {
     .expect("failed to connect to node-1");
 
   let beta_dir = TempDir::new().unwrap();
-  let beta_storage = Storage::open(beta_dir.path().join("beta.redb")).expect("open beta storage");
-  let beta = LocalNode::from_config(
-    &NodeConfig {
-      id: "beta".to_string(),
-      address: format!("127.0.0.1:{}", base_port + 97),
-    },
-    beta_storage.node().local,
-  )
-  .unwrap();
+  let _beta_storage = Storage::open(beta_dir.path().join("beta.redb")).expect("open beta storage");
+  let beta = SimpleNode::new(
+    "beta".to_string(),
+    format!("127.0.0.1:{}", base_port + 97),
+    HashMap::new(),
+    HashMap::new(),
+  );
   client.register(&beta).await.expect("register beta failed");
 
   time::sleep(Duration::from_millis(1500)).await;

@@ -57,6 +57,11 @@ impl GitContentStore {
     Self { repo_path }
   }
 
+  /// Return the directory of the underlying git repository.
+  pub fn repo_path(&self) -> &std::path::Path {
+    &self.repo_path
+  }
+
   fn git(&self) -> std::process::Command {
     let mut cmd = std::process::Command::new("git");
     cmd

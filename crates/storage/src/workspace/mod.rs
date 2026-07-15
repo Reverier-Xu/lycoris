@@ -18,6 +18,7 @@ pub mod rule;
 pub mod skill;
 pub mod store;
 pub mod vcs;
+pub mod versioned;
 
 pub use rule::{RedbRuleStorage, RuleContentStore, RuleRecord, RuleStorage};
 pub use skill::{RedbSkillStorage, SkillContentStore, SkillRecord, SkillStorage};
@@ -75,8 +76,8 @@ impl WorkspaceDomain {
 
     Ok(Self {
       workspaces: Arc::new(RedbWorkspaceStorage::new(db.clone())),
-      skills: Arc::new(RedbSkillStorage::new(db.clone())),
-      rules: Arc::new(RedbRuleStorage::new(db)),
+      skills: Arc::new(skill::new_skill_storage(db.clone())),
+      rules: Arc::new(rule::new_rule_storage(db)),
       skill_content: SkillContentStore::new(data_dir.join("skills")),
       rule_content: RuleContentStore::new(data_dir.join("rules")),
     })

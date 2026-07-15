@@ -17,6 +17,7 @@ use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use futures_util::stream::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase};
+use lycoris_core::DEFAULT_EMBEDDING_DIM;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
@@ -27,7 +28,6 @@ use crate::{
 };
 
 const SESSIONS: TableDefinition<&str, Bytes> = TableDefinition::new("agent_sessions");
-pub const DEFAULT_EMBEDDING_DIM: usize = 384;
 const MEMORY_TABLE: &str = "memories";
 
 /// A stored agent session.
@@ -82,40 +82,6 @@ impl From<StorageError> for AgentStorageError {
 impl From<std::io::Error> for AgentStorageError {
   fn from(error: std::io::Error) -> Self {
     Self::Backend(error.to_string())
-  }
-}
-
-/// No-op placeholder implementation.
-#[derive(Debug, Clone, Default)]
-pub struct NoopAgentStorage;
-
-impl SessionStorage for NoopAgentStorage {
-  fn create(&self, _session: &Session) -> Result<(), AgentStorageError> {
-    Ok(())
-  }
-  fn get(&self, _id: &str) -> Result<Option<Session>, AgentStorageError> {
-    Ok(None)
-  }
-  fn list(&self) -> Result<Vec<Session>, AgentStorageError> {
-    Ok(Vec::new())
-  }
-  fn delete(&self, _id: &str) -> Result<(), AgentStorageError> {
-    Ok(())
-  }
-  fn upsert(&self, _session: &Session) -> Result<(), AgentStorageError> {
-    Ok(())
-  }
-}
-
-#[async_trait]
-impl MemoryStorage for NoopAgentStorage {
-  async fn store(&self, _entry: &MemoryEntry) -> Result<(), AgentStorageError> {
-    Ok(())
-  }
-  async fn recall(
-    &self, _query: Vec<f32>, _limit: usize,
-  ) -> Result<Vec<MemoryEntry>, AgentStorageError> {
-    Ok(Vec::new())
   }
 }
 

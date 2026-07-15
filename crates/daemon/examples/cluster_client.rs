@@ -1,8 +1,7 @@
 use std::{collections::HashMap, time::Duration};
 
 use lycoris_api::ClusterRpcClient;
-use lycoris_config::NodeConfig;
-use lycoris_storage::{LocalNode, Storage};
+use lycoris_core::SimpleNode;
 use lycoris_tls::load_client_tls;
 use thiserror::Error;
 
@@ -14,8 +13,6 @@ enum ExampleError {
   Io(#[from] std::io::Error),
   #[error("cluster client error: {0}")]
   Cluster(#[from] lycoris_api::ClusterClientError),
-  #[error("storage error: {0}")]
-  Storage(#[from] lycoris_storage::StorageError),
   #[error("{0} not visible on {1}")]
   NotVisible(String, String),
 }
@@ -43,16 +40,12 @@ async fn main() -> Result<(), ExampleError> {
   let tls = load_client_tls(cert_path, key_path, ca_path)?;
 
   let mut client = ClusterRpcClient::connect_with_tls(register_addr, tls.clone()).await?;
-  let storage_dir = std::env::temp_dir().join(format!("lycoris-client-{expected_id}"));
-  std::fs::create_dir_all(&storage_dir)?;
-  let storage = Storage::open(storage_dir.join("client.redb"))?;
-  let node = LocalNode::from_config(
-    &NodeConfig {
-      id: expected_id.clone(),
-      address: "127.0.0.1:59999".to_string(),
-    },
-    storage.node().local,
-  )?;
+  let node = SimpleNode::new(
+    expected_id.clone(),
+    "127.0.0.1:59999".to_string(),
+    HashMap::new(),
+    HashMap::new(),
+  );
   client.register(&node).await?;
   println!("registered {expected_id} via {register_addr}");
 
