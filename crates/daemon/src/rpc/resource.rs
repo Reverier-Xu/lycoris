@@ -397,10 +397,11 @@ impl ResourceMapper {
 
     match (kind, resource.body.as_ref()) {
       (ResourceKind::Skill, Some(Body::Skill(body))) => {
-        let record = resource_to_skill(metadata, body)?;
-        if !body.content.is_empty() {
-          verify_content_hash(&body.content, &body.content_hash)?;
+        if body.content.is_empty() {
+          return Ok(());
         }
+        let record = resource_to_skill(metadata, body)?;
+        verify_content_hash(&body.content, &body.content_hash)?;
         let local = self
           .storage
           .workspace()
@@ -426,10 +427,11 @@ impl ResourceMapper {
         }
       }
       (ResourceKind::Rule, Some(Body::Rule(body))) => {
-        let record = resource_to_rule(metadata, body)?;
-        if !body.content.is_empty() {
-          verify_content_hash(&body.content, &body.content_hash)?;
+        if body.content.is_empty() {
+          return Ok(());
         }
+        let record = resource_to_rule(metadata, body)?;
+        verify_content_hash(&body.content, &body.content_hash)?;
         let local = self
           .storage
           .workspace()
