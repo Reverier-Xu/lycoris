@@ -19,7 +19,10 @@ use lycoris_api::{
 };
 use lycoris_config::time::now_ms;
 use lycoris_storage::NodeDomain;
-use tokio::{sync::Mutex, time::timeout};
+use tokio::{
+  sync::Mutex,
+  time::{self, MissedTickBehavior, timeout},
+};
 use tonic::{Request, Response, Status, transport::ClientTlsConfig};
 
 use crate::{
@@ -45,7 +48,7 @@ pub struct ClusterSync {
   sequence: Arc<AtomicU64>,
 }
 
-const RPC_TIMEOUT: Duration = Duration::from_secs(5);
+const RPC_TIMEOUT: Duration = Duration::from_secs(3);
 
 impl ClusterSync {
   pub fn new(
@@ -69,7 +72,8 @@ impl ClusterSync {
 
   /// Start background anti-entropy sync and SWIM failure detection.
   pub async fn run(&self, interval: Duration) {
-    let mut ticker = tokio::time::interval(interval);
+    let mut ticker = time::interval(interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let notify = self.storage.change_notify();
     loop {
       tokio::select! {
@@ -81,11 +85,15 @@ impl ClusterSync {
   }
 
   pub async fn run_swim(&self, interval: Duration) {
-    let mut ticker = tokio::time::interval(interval);
+    let mut ticker = time::interval(interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
       ticker.tick().await;
       let actions = self.service.tick().await;
-      self.dispatch(actions).await;
+      let sync = self.clone();
+      tokio::spawn(async move {
+        sync.dispatch(actions).await;
+      });
     }
   }
 
@@ -169,23 +177,34 @@ impl ClusterSync {
       None => return false,
     };
 
-    match self.connect_peer(&address).await {
-      Ok(client) => match client.membership.probe(seq, "").await {
-        Ok(response) => {
-          if response.ack {
-            self
-              .service
-              .on_probe(target_id, SwimMessage::Ack { seq })
-              .await;
-          }
-          response.ack
+    let client = match self.connect_peer(&address).await {
+      Ok(client) => client,
+      Err(_) => {
+        self.remove_client(&address).await;
+        return false;
+      }
+    };
+
+    match timeout(RPC_TIMEOUT, client.membership.probe(seq, "")).await {
+      Ok(Ok(response)) => {
+        if response.ack {
+          self
+            .service
+            .on_probe(target_id, SwimMessage::Ack { seq })
+            .await;
         }
-        Err(error) => {
-          tracing::warn!(%target_id, %error, "probe failed");
-          false
-        }
-      },
-      Err(_) => false,
+        response.ack
+      }
+      Ok(Err(error)) => {
+        tracing::warn!(%target_id, %error, "probe failed");
+        self.remove_client(&address).await;
+        false
+      }
+      Err(_) => {
+        tracing::warn!(%target_id, "probe timed out");
+        self.remove_client(&address).await;
+        false
+      }
     }
   }
 
@@ -195,10 +214,33 @@ impl ClusterSync {
       None => return,
     };
 
-    if let Ok(client) = self.connect_peer(&address).await
-      && let Err(error) = client.membership.probe(seq, target).await
-    {
-      tracing::warn!(%proxy, %target, %error, "indirect probe failed");
+    let client = match self.connect_peer(&address).await {
+      Ok(client) => client,
+      Err(_) => {
+        self.remove_client(&address).await;
+        return;
+      }
+    };
+
+    let result = timeout(RPC_TIMEOUT, client.membership.probe(seq, target)).await;
+
+    match result {
+      Ok(Err(error)) => {
+        tracing::warn!(%proxy, %target, %error, "indirect probe failed");
+        self.remove_client(&address).await;
+      }
+      Err(_) => {
+        tracing::warn!(%proxy, %target, "indirect probe timed out");
+        self.remove_client(&address).await;
+      }
+      Ok(Ok(response)) => {
+        if response.ack {
+          self
+            .service
+            .on_probe(target, SwimMessage::Ack { seq })
+            .await;
+        }
+      }
     }
   }
 
@@ -208,13 +250,11 @@ impl ClusterSync {
 
   async fn sync_with_peers(&self) {
     let snapshot = self.service.list_nodes(&HashMap::new()).await;
-    let mut primary_set = false;
+    let local_address = self.local_address().await;
 
     if let Some(primary) = self.storage.peers.get_primary().unwrap_or(None) {
       match timeout(RPC_TIMEOUT, self.sync_with_peer(&primary, snapshot.clone())).await {
-        Ok(Ok(())) => {
-          primary_set = true;
-        }
+        Ok(Ok(())) => return,
         Ok(Err(error)) => {
           tracing::warn!(%primary, %error, "primary endpoint unreachable, trying fallbacks");
           self.remove_client(&primary).await;
@@ -227,24 +267,37 @@ impl ClusterSync {
     }
 
     let fallbacks = self.storage.peers.fallback_addresses().unwrap_or_default();
+    let mut join_set = tokio::task::JoinSet::new();
     for peer in fallbacks {
-      let result = timeout(RPC_TIMEOUT, self.sync_with_peer(&peer, snapshot.clone())).await;
+      let sync = self.clone();
+      let snapshot = snapshot.clone();
+      join_set.spawn(async move {
+        let result = timeout(RPC_TIMEOUT, sync.sync_with_peer(&peer, snapshot)).await;
+        (peer, result)
+      });
+    }
+
+    let mut promoted = false;
+    while let Some(result) = join_set.join_next().await {
       match result {
-        Ok(Ok(())) => {
-          if !primary_set {
+        Ok((peer, Ok(Ok(())))) => {
+          if !promoted && local_address.as_deref() != Some(peer.as_str()) {
             if let Err(error) = self.storage.peers.set_primary(&peer) {
               tracing::warn!(%peer, %error, "failed to promote fallback to primary");
             }
-            primary_set = true;
+            promoted = true;
           }
         }
-        Ok(Err(error)) => {
+        Ok((peer, Ok(Err(error)))) => {
           tracing::warn!(%peer, %error, "fallback peer sync failed");
           self.remove_client(&peer).await;
         }
-        Err(_) => {
+        Ok((peer, Err(_))) => {
           tracing::warn!(%peer, "fallback peer sync timed out");
           self.remove_client(&peer).await;
+        }
+        Err(error) => {
+          tracing::warn!(%error, "sync task panicked");
         }
       }
     }
@@ -254,6 +307,7 @@ impl ClusterSync {
     &self, peer: &str, _snapshot: Vec<ProtoNodeInfo>,
   ) -> Result<(), ClusterClientError> {
     let client = self.connect_peer(peer).await?;
+    let local_address = self.local_address().await.unwrap_or_default();
 
     let (remote_root, remote_leaves) =
       match timeout(RPC_TIMEOUT, client.membership.merkle_root()).await {
@@ -318,7 +372,9 @@ impl ClusterSync {
     }
 
     for info in self.service.list_nodes(&HashMap::new()).await {
-      let _ = self.storage.peers.seed(&info.address);
+      if info.address != local_address {
+        let _ = self.storage.peers.seed(&info.address);
+      }
     }
 
     let _ = self.storage.peers.mark_seen(peer, now_ms());
@@ -330,9 +386,12 @@ impl ClusterSync {
     let snapshot = self.service.list_nodes(&HashMap::new()).await;
     let response = client.sync.sync_nodes(snapshot).await?;
     let _ = self.service.sync_nodes(response.nodes).await;
+    let local_address = self.local_address().await.unwrap_or_default();
 
     for info in self.service.list_nodes(&HashMap::new()).await {
-      let _ = self.storage.peers.seed(&info.address);
+      if info.address != local_address {
+        let _ = self.storage.peers.seed(&info.address);
+      }
     }
 
     let _ = self.storage.peers.mark_seen(peer, now_ms());
@@ -406,20 +465,27 @@ impl ClusterSync {
   }
 
   async fn current_targets(&self) -> Vec<String> {
+    let local_address = self.local_address().await.unwrap_or_default();
     let mut seen = HashSet::new();
     let mut targets = Vec::new();
-    if let Ok(Some(primary)) = self.storage.peers.get_primary() {
+    if let Ok(Some(primary)) = self.storage.peers.get_primary()
+      && primary != local_address
+    {
       seen.insert(primary.clone());
       targets.push(primary);
     }
     if let Ok(fallbacks) = self.storage.peers.fallback_addresses() {
       for peer in fallbacks {
-        if seen.insert(peer.clone()) {
+        if peer != local_address && seen.insert(peer.clone()) {
           targets.push(peer);
         }
       }
     }
     targets
+  }
+
+  async fn local_address(&self) -> Option<String> {
+    self.service.member_address(&self.local_node_id).await
   }
 
   async fn connect_peer(&self, address: &str) -> Result<PeerClient, ClusterClientError> {
@@ -454,8 +520,11 @@ impl ClusterSync {
     &self, request: Request<SyncNodesRequest>,
   ) -> Result<Response<SyncNodesResponse>, Status> {
     let nodes = request.into_inner().nodes;
+    let local_address = self.local_address().await.unwrap_or_default();
     for info in &nodes {
-      let _ = self.storage.peers.seed(&info.address);
+      if info.address != local_address {
+        let _ = self.storage.peers.seed(&info.address);
+      }
     }
     let snapshot = self.service.sync_nodes(nodes).await;
     Ok(Response::new(SyncNodesResponse { nodes: snapshot }))
@@ -477,13 +546,19 @@ impl ClusterSync {
       return Ok(Response::new(PushNodeResponse { accepted: true }));
     }
 
-    let _ = self.storage.peers.seed(&info.address);
+    let local_address = self.local_address().await.unwrap_or_default();
+    if info.address != local_address {
+      let _ = self.storage.peers.seed(&info.address);
+    }
     let actions = self.service.register(&info).await;
-    self.dispatch(actions).await;
 
-    self
-      .broadcast_push(info, push.origin_node_id, push.sequence)
-      .await;
+    let origin = push.origin_node_id;
+    let sequence = push.sequence;
+    let sync = self.clone();
+    tokio::spawn(async move {
+      sync.dispatch(actions).await;
+      sync.broadcast_push(info, origin, sequence).await;
+    });
 
     Ok(Response::new(PushNodeResponse { accepted: true }))
   }
@@ -501,10 +576,14 @@ impl ClusterSync {
         .service
         .on_probe(&from, SwimMessage::Ping { seq: probe.seq })
         .await;
-      self.dispatch_non_acks(actions.clone()).await;
-      actions
+      let ack = actions
         .iter()
-        .any(|action| matches!(action, SwimAction::SendAck { .. }))
+        .any(|action| matches!(action, SwimAction::SendAck { .. }));
+      let sync = self.clone();
+      tokio::spawn(async move {
+        sync.dispatch_non_acks(actions).await;
+      });
+      ack
     } else if probe.target == self.local_node_id {
       true
     } else {
@@ -554,7 +633,10 @@ impl ClusterSync {
       }
       None => Vec::new(),
     };
-    self.dispatch(actions).await;
+    let sync = self.clone();
+    tokio::spawn(async move {
+      sync.dispatch(actions).await;
+    });
     Ok(Response::new(lycoris_api::proto::StateResponse {
       accepted: true,
     }))

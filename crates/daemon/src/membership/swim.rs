@@ -20,17 +20,20 @@ pub struct SwimConfig {
   pub phi_threshold: f64,
   /// Window size for the per-peer Phi detector.
   pub phi_window_size: usize,
+  /// Consecutive probe failures required before marking a peer suspected.
+  pub failure_threshold: u32,
 }
 
 impl Default for SwimConfig {
   fn default() -> Self {
     Self {
       ping_interval_ms: 1_000,
-      ping_timeout_ms: 5_000,
-      indirect_probe_count: 3,
-      suspicion_timeout_ms: 10_000,
+      ping_timeout_ms: 3_000,
+      indirect_probe_count: 0,
+      suspicion_timeout_ms: 5_000,
       phi_threshold: 8.0,
       phi_window_size: 100,
+      failure_threshold: 3,
     }
   }
 }
@@ -98,11 +101,11 @@ pub struct Swim {
   config: SwimConfig,
   membership: Membership,
   detectors: HashMap<String, PhiAccrualDetector>,
+  consecutive_failures: HashMap<String, u32>,
   sequence: u64,
   pending_pings: HashMap<u64, PendingPing>,
   pending_indirect: HashMap<u64, PendingIndirect>,
   last_probe_ms: HashMap<String, u64>,
-  next_probe_at_ms: u64,
 }
 
 impl Swim {
@@ -123,17 +126,22 @@ impl Swim {
       config,
       membership,
       detectors,
+      consecutive_failures: HashMap::new(),
       sequence: 0,
       pending_pings: HashMap::new(),
       pending_indirect: HashMap::new(),
       last_probe_ms: HashMap::new(),
-      next_probe_at_ms: 0,
     }
   }
 
   /// Read-only access to the underlying membership CRDT.
   pub fn membership(&self) -> &Membership {
     &self.membership
+  }
+
+  /// Mutable access to the underlying membership CRDT.
+  pub fn membership_mut(&mut self) -> &mut Membership {
+    &mut self.membership
   }
 
   /// Return the current phi value for `node_id` at `now_ms`.
@@ -196,14 +204,49 @@ impl Swim {
     }
   }
 
-  /// Advance timers and possibly issue a new probe.
+  /// Advance timers and possibly issue new probes.
   ///
   /// Callers should drive this method from a periodic tick loop.
   pub fn tick(&mut self, now_ms: i64) -> Vec<SwimAction> {
     let now_u64 = u64::try_from(now_ms).unwrap_or(0);
     let mut actions = self.check_timeouts(now_u64, now_ms);
-    actions.extend(self.maybe_send_probe(now_u64));
+    actions.extend(self.generate_probes(now_u64, now_ms));
     actions
+  }
+
+  fn generate_probes(&mut self, now_u64: u64, now_ms: i64) -> Vec<SwimAction> {
+    let interval = self.config.ping_interval_ms;
+    let active: Vec<String> = self
+      .membership
+      .active()
+      .into_iter()
+      .filter(|r| r.node_id != self.local_node_id)
+      .map(|r| r.node_id.clone())
+      .collect();
+
+    let mut candidate: Option<String> = None;
+    let mut oldest_gap: u64 = 0;
+    for target in active {
+      if self
+        .pending_pings
+        .values()
+        .any(|pending| pending.target == target)
+      {
+        continue;
+      }
+      let last = self.last_probe_ms.get(&target).copied().unwrap_or(0);
+      let gap = now_u64.saturating_sub(last);
+      if gap >= interval && gap > oldest_gap {
+        oldest_gap = gap;
+        candidate = Some(target);
+      }
+    }
+
+    if let Some(target) = candidate {
+      self.send_ping_to(&target, now_ms).into_iter().collect()
+    } else {
+      Vec::new()
+    }
   }
 
   fn handle_ping_req(
@@ -242,6 +285,7 @@ impl Swim {
       return Vec::new();
     };
 
+    self.consecutive_failures.remove(&target);
     self.heartbeat(&target, now_ms);
 
     let mut actions = Vec::new();
@@ -391,6 +435,18 @@ impl Swim {
 
   fn mark_suspected(&mut self, target: &str, now_ms: i64) -> Vec<SwimAction> {
     let mut actions = Vec::new();
+    let failures = self
+      .consecutive_failures
+      .entry(target.to_string())
+      .and_modify(|count| *count += 1)
+      .or_insert(1);
+
+    if *failures < self.config.failure_threshold {
+      return actions;
+    }
+
+    self.consecutive_failures.remove(target);
+
     if let Some(register) = self.membership.get_mut(target)
       && register.state == MemberState::Active
     {
@@ -401,20 +457,6 @@ impl Swim {
       }));
     }
     actions
-  }
-
-  fn maybe_send_probe(&mut self, now_u64: u64) -> Option<SwimAction> {
-    if now_u64 < self.next_probe_at_ms {
-      return None;
-    }
-
-    if !self.pending_pings.is_empty() {
-      return None;
-    }
-
-    let target = self.pick_probe_target()?;
-    self.next_probe_at_ms = now_u64 + self.config.ping_interval_ms;
-    self.send_ping_to(&target, i64::try_from(now_u64).unwrap_or(0))
   }
 
   fn send_ping_to(&mut self, target: &str, now_ms: i64) -> Option<SwimAction> {
@@ -434,24 +476,6 @@ impl Swim {
       target: target.to_string(),
       seq,
     })
-  }
-
-  fn pick_probe_target(&self) -> Option<String> {
-    let active: Vec<&MemberRegister> = self
-      .membership
-      .active()
-      .into_iter()
-      .filter(|r| r.node_id != self.local_node_id)
-      .collect();
-
-    if active.is_empty() {
-      return None;
-    }
-
-    active
-      .iter()
-      .min_by_key(|r| self.last_probe_ms.get(&r.node_id).copied().unwrap_or(0))
-      .map(|r| r.node_id.clone())
   }
 
   fn pick_indirect_proxies(&self, target: &str, count: usize) -> Vec<String> {
@@ -520,14 +544,15 @@ mod tests {
   fn timeout_marks_suspected_and_broadcasts() {
     let config = SwimConfig {
       ping_interval_ms: 1_000,
-      ping_timeout_ms: 5_000,
+      ping_timeout_ms: 2_000,
+      failure_threshold: 1,
       ..SwimConfig::default()
     };
     let mut swim = Swim::new("local", config, local_register("local"));
     swim.membership.merge_register(&peer_register("peer"));
 
     let _ = swim.tick(1_000);
-    let actions = swim.tick(6_100);
+    let actions = swim.tick(3_100);
 
     let has_suspect = actions.iter().any(|a| {
       matches!(
@@ -536,6 +561,48 @@ mod tests {
       )
     });
     assert!(has_suspect);
+    assert_eq!(
+      swim.membership.get("peer").unwrap().state,
+      MemberState::Suspected
+    );
+  }
+
+  #[test]
+  fn consecutive_failures_required_by_default() {
+    let config = SwimConfig {
+      ping_interval_ms: 1_000,
+      ping_timeout_ms: 2_000,
+      failure_threshold: 3,
+      ..SwimConfig::default()
+    };
+    let mut swim = Swim::new("local", config, local_register("local"));
+    swim.membership.merge_register(&peer_register("peer"));
+
+    let _ = swim.tick(1_000);
+    let actions = swim.tick(3_100);
+    assert!(
+      !actions
+        .iter()
+        .any(|a| matches!(a, SwimAction::Broadcast(SwimMessage::Suspect { .. })))
+    );
+    assert_eq!(
+      swim.membership.get("peer").unwrap().state,
+      MemberState::Active
+    );
+
+    let actions = swim.tick(5_200);
+    assert!(
+      !actions
+        .iter()
+        .any(|a| matches!(a, SwimAction::Broadcast(SwimMessage::Suspect { .. })))
+    );
+
+    let actions = swim.tick(7_300);
+    assert!(
+      actions
+        .iter()
+        .any(|a| matches!(a, SwimAction::Broadcast(SwimMessage::Suspect { .. })))
+    );
     assert_eq!(
       swim.membership.get("peer").unwrap().state,
       MemberState::Suspected

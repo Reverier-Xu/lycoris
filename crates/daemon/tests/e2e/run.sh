@@ -19,7 +19,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "building static musl binary..."
-cargo +stable build --release --target x86_64-unknown-linux-musl -p lycoris-daemon
+cargo +stable build --release --target x86_64-unknown-linux-musl -p lycoris
 
 echo "building container image..."
 podman build -t "${IMAGE}" -f "${SCRIPT_DIR}/Containerfile" "${PROJECT_ROOT}"

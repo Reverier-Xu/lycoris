@@ -62,6 +62,37 @@ impl MembershipService {
     self.register(info).await
   }
 
+  /// Mark a node as leaving the cluster.
+  pub async fn leave(&self, node_id: &str, now_ms: i64) -> Vec<SwimAction> {
+    let mut state = self.state.lock().await;
+    let incarnation = state
+      .swim
+      .membership()
+      .get(node_id)
+      .map(|register| register.incarnation)
+      .unwrap_or(1);
+
+    if node_id == self.local_node_id {
+      if let Some(register) = state.swim.membership_mut().get_mut(node_id) {
+        register.leave(now_ms);
+      }
+    } else {
+      state.swim.on_message(
+        &self.local_node_id,
+        SwimMessage::Leave {
+          node_id: node_id.to_string(),
+          incarnation,
+        },
+        now_ms,
+      );
+    }
+
+    vec![SwimAction::Broadcast(SwimMessage::Leave {
+      node_id: node_id.to_string(),
+      incarnation,
+    })]
+  }
+
   /// Return alive nodes that match the optional label selector.
   pub async fn list_nodes(&self, selector: &HashMap<String, String>) -> Vec<ProtoNodeInfo> {
     let state = self.state.lock().await;
@@ -253,6 +284,8 @@ pub fn register_to_proto(register: &MemberRegister) -> ProtoNodeInfo {
     state: state_to_string(register.state).to_string(),
     incarnation: register.incarnation,
     heartbeat: register.heartbeat,
+    in_degree: Vec::new(),
+    out_degree: Vec::new(),
   }
 }
 
@@ -304,6 +337,8 @@ mod tests {
       state: "active".to_string(),
       incarnation: 1,
       heartbeat: 0,
+      in_degree: Vec::new(),
+      out_degree: Vec::new(),
     }
   }
 

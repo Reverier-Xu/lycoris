@@ -1,10 +1,15 @@
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
-use lycoris_config::{ClientConfig, DaemonConfig, paths, time::now_ms};
+use lycoris_config::{
+  ClientConfig, ClusterKey, DaemonConfig, default_cluster_key_path, paths, time::now_ms,
+};
 use lycoris_storage::{Storage, StorageError};
 use thiserror::Error;
-use tokio::sync::watch;
-use tonic::transport::ServerTlsConfig;
+use tokio::{
+  signal::unix::{SignalKind, signal},
+  sync::watch,
+};
+use tonic::transport::{ClientTlsConfig, ServerTlsConfig};
 
 use crate::{
   cluster_sync::ClusterSync,
@@ -32,15 +37,33 @@ pub enum RuntimeError {
 
 /// Run the daemon until the process is interrupted.
 pub async fn run(config: DaemonConfig) -> Result<(), RuntimeError> {
-  // Hold the sender so the receiver never sees the channel close. The
-  // daemon then runs until the surrounding task/runtime is shut down.
-  let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-  run_with_shutdown(config, shutdown_rx).await
+  let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+  let shutdown_tx_signal = shutdown_tx.clone();
+  tokio::spawn(async move {
+    let mut terminate = match signal(SignalKind::terminate()) {
+      Ok(signal) => signal,
+      Err(_) => return,
+    };
+    let mut interrupt = match signal(SignalKind::interrupt()) {
+      Ok(signal) => signal,
+      Err(_) => return,
+    };
+
+    tokio::select! {
+      _ = terminate.recv() => {}
+      _ = interrupt.recv() => {}
+    }
+
+    let _ = shutdown_tx_signal.send(true);
+  });
+
+  run_with_shutdown(config, shutdown_tx, shutdown_rx).await
 }
 
 /// Run the daemon until the supplied shutdown signal becomes `true`.
 pub async fn run_with_shutdown(
-  config: DaemonConfig, shutdown: watch::Receiver<bool>,
+  config: DaemonConfig, shutdown_tx: watch::Sender<bool>, shutdown: watch::Receiver<bool>,
 ) -> Result<(), RuntimeError> {
   write_client_config(&config);
 
@@ -48,6 +71,8 @@ pub async fn run_with_shutdown(
   std::fs::create_dir_all(&data_dir)?;
   let storage = Storage::open(data_dir.join("lycoris.redb"))?;
   let node = storage.node();
+
+  let cluster_key = load_cluster_key();
 
   let tls_bundle = ensure_tls_bundle(
     &config.tls.ca_cert,
@@ -59,6 +84,9 @@ pub async fn run_with_shutdown(
   let server_tls = ServerTlsConfig::new()
     .identity(tls_bundle.identity.clone())
     .client_ca_root(tls_bundle.ca.clone());
+  let client_tls = ClientTlsConfig::new()
+    .identity(tls_bundle.identity.clone())
+    .ca_certificate(tls_bundle.ca.clone());
 
   for peer in &config.cluster.bootstrap_peers {
     node.peers.seed(peer)?;
@@ -88,8 +116,11 @@ pub async fn run_with_shutdown(
     &tls_bundle,
   );
 
-  let cluster_service = ClusterService::new(membership_service.clone(), node.clone())
-    .with_cluster_sync(cluster_sync.clone());
+  let cluster_service =
+    ClusterService::new(membership_service.clone(), storage.clone(), client_tls)
+      .with_cluster_sync(cluster_sync.clone())
+      .with_cluster_key(cluster_key)
+      .with_shutdown(shutdown_tx);
 
   let mut background = tokio::task::JoinSet::new();
 
@@ -152,6 +183,28 @@ fn write_client_config(config: &DaemonConfig) {
       );
     } else {
       tracing::info!(path = %path.display(), "wrote client configuration");
+    }
+  }
+}
+
+fn load_cluster_key() -> Option<ClusterKey> {
+  let path = default_cluster_key_path();
+  if !path.is_file() {
+    return None;
+  }
+
+  match ClusterKey::load(&path) {
+    Ok(key) => {
+      tracing::info!(path = %path.display(), "loaded cluster key");
+      Some(key)
+    }
+    Err(error) => {
+      tracing::warn!(
+        %error,
+        path = %path.display(),
+        "failed to load cluster key; join requests will be rejected"
+      );
+      None
     }
   }
 }

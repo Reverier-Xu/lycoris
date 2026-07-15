@@ -1,3 +1,3 @@
 FROM scratch
-COPY target/x86_64-unknown-linux-musl/release/lycoris-daemon /lycoris-daemon
-ENTRYPOINT ["/lycoris-daemon", "--config", "/config.toml"]
+COPY target/x86_64-unknown-linux-musl/release/lycoris /lycoris
+ENTRYPOINT ["/lycoris", "daemon", "--config", "/config.toml"]

@@ -5,7 +5,7 @@ use std::{
   time::Duration,
 };
 
-use lycoris_api::{ClusterRpcClient, PeerClient};
+use lycoris_api::{ClusterRpcClient, PeerClient, proto::ResourceKind};
 use lycoris_config::{ClusterConfig, DaemonConfig, NodeConfig, TlsConfig};
 use lycoris_storage::{LocalNode, Storage};
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
@@ -23,14 +23,7 @@ fn alloc_base_port() -> u16 {
 async fn wait_for_node(client: &ClusterRpcClient, node_id: &str, timeout: Duration) {
   let start = std::time::Instant::now();
   loop {
-    let ids: Vec<String> = client
-      .list_nodes(HashMap::new())
-      .await
-      .expect("list_nodes failed")
-      .nodes
-      .into_iter()
-      .map(|n| n.id)
-      .collect();
+    let ids = list_node_ids(client).await;
     if ids.iter().any(|id| id == node_id) {
       return;
     }
@@ -39,6 +32,21 @@ async fn wait_for_node(client: &ClusterRpcClient, node_id: &str, timeout: Durati
     }
     time::sleep(Duration::from_millis(100)).await;
   }
+}
+
+async fn list_node_ids(client: &ClusterRpcClient) -> Vec<String> {
+  client
+    .list_resources(ResourceKind::Node, HashMap::new(), String::new())
+    .await
+    .expect("list resources failed")
+    .into_iter()
+    .filter_map(|resource| match resource.body {
+      Some(lycoris_api::proto::resource::Body::Node(lycoris_api::proto::NodeBody {
+        node: Some(node),
+      })) => Some(node.id),
+      _ => None,
+    })
+    .collect()
 }
 
 fn generate_test_certs(
@@ -172,7 +180,7 @@ async fn registry_converges_across_three_node_chain() {
   client.register(&external).await.expect("register failed");
 
   // Wait for push + anti-entropy to propagate through the chain.
-  time::sleep(Duration::from_millis(1500)).await;
+  time::sleep(Duration::from_millis(10000)).await;
 
   // Query node-2 (the far end of the chain) and verify it knows external-node.
   let client_tls = client_tls_config(&cert_paths[2], &key_paths[2], &ca_cert_path);
@@ -181,13 +189,8 @@ async fn registry_converges_across_three_node_chain() {
     .await
     .expect("failed to connect to node-2");
 
-  let nodes = client
-    .list_nodes(HashMap::new())
-    .await
-    .expect("list_nodes failed")
-    .nodes;
+  let ids = list_node_ids(&client).await;
 
-  let ids: Vec<String> = nodes.into_iter().map(|n| n.id).collect();
   assert!(ids.contains(&"external-node".to_string()));
   assert!(ids.contains(&"node-0".to_string()));
   assert!(ids.contains(&"node-1".to_string()));
@@ -225,8 +228,11 @@ async fn primary_failure_falls_back_and_promotes() {
   for (i, config) in configs.clone().into_iter().enumerate() {
     if i == 0 {
       let shutdown_rx = node0_shutdown_rx.clone();
+      let shutdown_tx = node0_shutdown_tx.clone();
       handles.push(tokio::spawn(async move {
-        if let Err(e) = lycoris_daemon::runtime::run_with_shutdown(config, shutdown_rx).await {
+        if let Err(e) =
+          lycoris_daemon::runtime::run_with_shutdown(config, shutdown_tx, shutdown_rx).await
+        {
           eprintln!("runtime error: {e:?}");
         }
       }));
@@ -273,14 +279,7 @@ async fn primary_failure_falls_back_and_promotes() {
   let client = ClusterRpcClient::connect(&node1_url, client_tls)
     .await
     .expect("failed to connect to node-1");
-  let ids: Vec<String> = client
-    .list_nodes(HashMap::new())
-    .await
-    .expect("list_nodes failed")
-    .nodes
-    .into_iter()
-    .map(|n| n.id)
-    .collect();
+  let ids = list_node_ids(&client).await;
   assert!(ids.contains(&"fallback-external-node".to_string()));
 
   // Stop node-0 so that its redb database is closed and can be reopened.
@@ -380,14 +379,7 @@ async fn partition_merge_reconciles_bidirectional_membership() {
     let client = ClusterRpcClient::connect(url, client_tls.clone())
       .await
       .expect("failed to connect");
-    let ids: Vec<String> = client
-      .list_nodes(HashMap::new())
-      .await
-      .expect("list_nodes failed")
-      .nodes
-      .into_iter()
-      .map(|n| n.id)
-      .collect();
+    let ids = list_node_ids(&client).await;
     assert!(ids.contains(&"alpha".to_string()));
     assert!(ids.contains(&"beta".to_string()));
     assert!(ids.contains(&"node-0".to_string()));
@@ -443,8 +435,9 @@ async fn failure_detector_marks_unresponsive_peer() {
   // Stop node-1 so that node-0's SWIM probes begin to fail.
   handles[1].abort();
 
-  // Wait long enough for the SWIM tick (1s) plus the ping timeout (5s).
-  time::sleep(Duration::from_secs(7)).await;
+  // Wait long enough for three consecutive SWIM probe timeouts
+  // (1s interval + 2s timeout per failure = ~7-9s).
+  time::sleep(Duration::from_secs(10)).await;
 
   let peer = PeerClient::connect(&node0_url, client_tls.clone())
     .await

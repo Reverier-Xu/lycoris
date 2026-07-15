@@ -58,8 +58,22 @@ async fn main() -> Result<(), ExampleError> {
   tokio::time::sleep(Duration::from_secs(2)).await;
 
   let client = ClusterRpcClient::connect(query_addr, tls).await?;
-  let nodes = client.list_nodes(HashMap::new()).await?.nodes;
-  let ids: Vec<String> = nodes.into_iter().map(|n| n.id).collect();
+  let resources = client
+    .list_resources(
+      lycoris_api::proto::ResourceKind::Node,
+      HashMap::new(),
+      String::new(),
+    )
+    .await?;
+  let ids: Vec<String> = resources
+    .into_iter()
+    .filter_map(|resource| match resource.body {
+      Some(lycoris_api::proto::resource::Body::Node(lycoris_api::proto::NodeBody {
+        node: Some(node),
+      })) => Some(node.id),
+      _ => None,
+    })
+    .collect();
   println!("nodes on {query_addr}: {ids:?}");
 
   if ids.contains(expected_id) {
