@@ -611,8 +611,8 @@ impl ClusterSync {
       .ok_or_else(|| Status::invalid_argument("missing node info"))?;
     let key = (push.origin_node_id.clone(), push.sequence);
 
-    let already_seen = self.seen_pushes.lock().await.insert(key);
-    if !already_seen {
+    let is_new = self.seen_pushes.lock().await.insert(key);
+    if !is_new {
       return Ok(Response::new(PushNodeResponse { accepted: true }));
     }
 
