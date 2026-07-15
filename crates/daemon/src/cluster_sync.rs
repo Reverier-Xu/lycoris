@@ -116,9 +116,6 @@ impl ClusterSync {
         SwimAction::SendPing { target, seq } => {
           let _ = self.send_probe_to(&target, seq).await;
         }
-        SwimAction::SendPingReq { proxy, target, seq } => {
-          self.send_ping_req(&proxy, &target, seq).await;
-        }
         SwimAction::SendAck { .. } => {
           // Acks are returned inline in response to a Probe RPC.
         }
@@ -202,42 +199,6 @@ impl ClusterSync {
         tracing::warn!(%target_id, "probe timed out");
         self.remove_client(&address).await;
         false
-      }
-    }
-  }
-
-  async fn send_ping_req(&self, proxy: &str, target: &str, seq: u64) {
-    let address = match self.resolve_address(proxy).await {
-      Some(addr) => addr,
-      None => return,
-    };
-
-    let mut client = match self.connect_peer(&address).await {
-      Ok(client) => client,
-      Err(_) => {
-        self.remove_client(&address).await;
-        return;
-      }
-    };
-
-    let result = timeout(RPC_TIMEOUT, client.membership.probe(seq, target)).await;
-
-    match result {
-      Ok(Err(error)) => {
-        tracing::warn!(%proxy, %target, %error, "indirect probe failed");
-        self.remove_client(&address).await;
-      }
-      Err(_) => {
-        tracing::warn!(%proxy, %target, "indirect probe timed out");
-        self.remove_client(&address).await;
-      }
-      Ok(Ok(response)) => {
-        if response.ack {
-          self
-            .service
-            .on_probe(target, SwimMessage::Ack { seq })
-            .await;
-        }
       }
     }
   }

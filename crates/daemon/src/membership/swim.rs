@@ -1,25 +1,14 @@
 use std::collections::HashMap;
 
-use crate::membership::{
-  crdt::{MemberRegister, MemberState, Membership},
-  detector::PhiAccrualDetector,
-};
+use lycoris_core::{MemberRegister, MemberState, Membership};
 
 /// Configuration for the SWIM failure detector.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SwimConfig {
   /// Milliseconds between periodic probe rounds.
   pub ping_interval_ms: u64,
-  /// Milliseconds to wait for a direct ack before escalating.
+  /// Milliseconds to wait for a direct ack before declaring the probe failed.
   pub ping_timeout_ms: u64,
-  /// Number of random members to ask for an indirect probe.
-  pub indirect_probe_count: usize,
-  /// Milliseconds to keep a node suspected before declaring it failed.
-  pub suspicion_timeout_ms: u64,
-  /// Phi value at which a peer is considered suspected.
-  pub phi_threshold: f64,
-  /// Window size for the per-peer Phi detector.
-  pub phi_window_size: usize,
   /// Consecutive probe failures required before marking a peer suspected.
   pub failure_threshold: u32,
 }
@@ -29,10 +18,6 @@ impl Default for SwimConfig {
     Self {
       ping_interval_ms: 1_000,
       ping_timeout_ms: 3_000,
-      indirect_probe_count: 0,
-      suspicion_timeout_ms: 5_000,
-      phi_threshold: 8.0,
-      phi_window_size: 100,
       failure_threshold: 3,
     }
   }
@@ -43,12 +28,8 @@ impl Default for SwimConfig {
 pub enum SwimMessage {
   /// Direct liveness probe.
   Ping { seq: u64 },
-  /// Request that `target` be probed indirectly.
-  PingReq { target: String, seq: u64 },
-  /// Positive response to a `Ping` or `PingReq`.
+  /// Positive response to a `Ping`.
   Ack { seq: u64 },
-  /// Negative response: the target could not be reached.
-  Nack { seq: u64 },
   /// Disseminate that a node is suspected.
   Suspect { node_id: String, incarnation: u64 },
   /// Disseminate that a node is alive.
@@ -62,12 +43,6 @@ pub enum SwimMessage {
 pub enum SwimAction {
   /// Send a direct ping to `target`.
   SendPing { target: String, seq: u64 },
-  /// Ask `proxy` to probe `target` on our behalf.
-  SendPingReq {
-    proxy: String,
-    target: String,
-    seq: u64,
-  },
   /// Send an ack back to `to`.
   SendAck { to: String, seq: u64 },
   /// Broadcast a state message to all active members except ourselves.
@@ -79,32 +54,25 @@ pub enum SwimAction {
 struct PendingPing {
   target: String,
   sent_at: u64,
-  indirect_sent: bool,
 }
 
-/// State for an indirect probe that is waiting for proxy responses.
-#[derive(Debug, Clone)]
-struct PendingIndirect {
-  target: String,
-  proxies: Vec<String>,
-  sent_at: u64,
-}
-
-/// A SWIM membership layer backed by the CRDT membership set and Phi accrual
-/// failure detectors.
+/// A minimal SWIM membership layer backed by the CRDT membership set.
 ///
-/// `Swim` is intentionally transport agnostic. It consumes events and emits
-/// `SwimAction`s that the caller must dispatch over the network.
+/// Indirect probes and Phi accrual are intentionally omitted: the current
+/// topology is a sparse graph where each node maintains direct connections to
+/// one or more peers, so simple direct probes with a consecutive-failure
+/// threshold are sufficient and easier to reason about.
+///
+/// `Swim` is transport agnostic. It consumes events and emits `SwimAction`s
+/// that the caller must dispatch over the network.
 #[derive(Debug, Clone)]
 pub struct Swim {
   local_node_id: String,
   config: SwimConfig,
   membership: Membership,
-  detectors: HashMap<String, PhiAccrualDetector>,
   consecutive_failures: HashMap<String, u32>,
   sequence: u64,
   pending_pings: HashMap<u64, PendingPing>,
-  pending_indirect: HashMap<u64, PendingIndirect>,
   last_probe_ms: HashMap<String, u64>,
 }
 
@@ -115,21 +83,13 @@ impl Swim {
     let mut membership = Membership::new();
     membership.merge_register(&local);
 
-    let mut detectors = HashMap::new();
-    detectors.insert(
-      local_node_id.clone(),
-      PhiAccrualDetector::with_window(config.phi_window_size),
-    );
-
     Self {
       local_node_id,
       config,
       membership,
-      detectors,
       consecutive_failures: HashMap::new(),
       sequence: 0,
       pending_pings: HashMap::new(),
-      pending_indirect: HashMap::new(),
       last_probe_ms: HashMap::new(),
     }
   }
@@ -144,27 +104,10 @@ impl Swim {
     &mut self.membership
   }
 
-  /// Return the current phi value for `node_id` at `now_ms`.
-  pub fn phi(&self, node_id: &str, now_ms: u64) -> f64 {
-    self
-      .detectors
-      .get(node_id)
-      .map(|d| d.phi(now_ms))
-      .unwrap_or(0.0)
-  }
-
   /// Record a heartbeat for `node_id` at `now_ms`.
   ///
-  /// This updates both the failure detector and the CRDT register (if the node
-  /// is already known).
+  /// This updates the CRDT register (if the node is already known).
   pub fn heartbeat(&mut self, node_id: &str, now_ms: i64) {
-    let now_u64 = u64::try_from(now_ms).unwrap_or(0);
-    self
-      .detectors
-      .entry(node_id.to_string())
-      .or_insert_with(|| PhiAccrualDetector::with_window(self.config.phi_window_size))
-      .heartbeat(now_u64);
-
     if let Some(register) = self.membership.get_mut(node_id) {
       register.heartbeat(now_ms);
     }
@@ -172,7 +115,6 @@ impl Swim {
 
   /// Process an incoming SWIM message from `from`.
   pub fn on_message(&mut self, from: &str, message: SwimMessage, now_ms: i64) -> Vec<SwimAction> {
-    let now_u64 = u64::try_from(now_ms).unwrap_or(0);
     match message {
       SwimMessage::Ping { seq } => {
         vec![SwimAction::SendAck {
@@ -180,9 +122,7 @@ impl Swim {
           seq,
         }]
       }
-      SwimMessage::PingReq { target, seq } => self.handle_ping_req(from, &target, seq, now_ms),
       SwimMessage::Ack { seq } => self.handle_ack(seq, now_ms),
-      SwimMessage::Nack { seq } => self.handle_nack(seq, now_u64),
       SwimMessage::Suspect {
         node_id,
         incarnation,
@@ -249,42 +189,12 @@ impl Swim {
     }
   }
 
-  fn handle_ping_req(
-    &mut self, from: &str, target: &str, seq: u64, now_ms: i64,
-  ) -> Vec<SwimAction> {
-    if target == self.local_node_id {
-      return vec![SwimAction::SendAck {
-        to: from.to_string(),
-        seq,
-      }];
-    }
-
-    if self.membership.get(target).is_some() {
-      self
-        .send_ping_to(target, now_ms)
-        .map(|action| vec![action])
-        .unwrap_or_default()
-    } else {
-      vec![SwimAction::SendAck {
-        to: from.to_string(),
-        seq,
-      }]
-    }
-  }
-
   fn handle_ack(&mut self, seq: u64, now_ms: i64) -> Vec<SwimAction> {
-    let target = if let Some(pending) = self.pending_pings.remove(&seq) {
-      Some(pending.target)
-    } else if let Some(pending) = self.pending_indirect.remove(&seq) {
-      Some(pending.target)
-    } else {
-      None
-    };
-
-    let Some(target) = target else {
+    let Some(pending) = self.pending_pings.remove(&seq) else {
       return Vec::new();
     };
 
+    let target = pending.target;
     self.consecutive_failures.remove(&target);
     self.heartbeat(&target, now_ms);
 
@@ -299,22 +209,6 @@ impl Swim {
     actions
   }
 
-  fn handle_nack(&mut self, seq: u64, now_u64: u64) -> Vec<SwimAction> {
-    let local_id = self.local_node_id().to_string();
-    if let Some(pending) = self.pending_indirect.get_mut(&seq) {
-      pending.proxies.retain(|proxy| proxy != &local_id);
-    }
-
-    if let Some(pending) = self.pending_indirect.get(&seq)
-      && pending.proxies.is_empty()
-    {
-      let target = pending.target.clone();
-      let now_ms = i64::try_from(now_u64).unwrap_or(0);
-      return self.mark_suspected(&target, now_ms);
-    }
-    Vec::new()
-  }
-
   fn handle_suspect_state(&mut self, node_id: &str, incarnation: u64, now_ms: i64) {
     if node_id == self.local_node_id {
       return;
@@ -326,8 +220,7 @@ impl Swim {
       }
       let mut register = existing.clone();
       register.incarnation = incarnation;
-      register.state = MemberState::Suspected;
-      register.updated_at_ms = now_ms;
+      register.suspect(now_ms);
       self.membership.merge_register(&register);
     }
   }
@@ -337,12 +230,7 @@ impl Swim {
       return;
     }
     self.membership.merge_register(register);
-    let now_u64 = u64::try_from(now_ms).unwrap_or(0);
-    self
-      .detectors
-      .entry(register.node_id.clone())
-      .or_insert_with(|| PhiAccrualDetector::with_window(self.config.phi_window_size))
-      .heartbeat(now_u64);
+    let _ = now_ms;
   }
 
   fn handle_leave_state(&mut self, node_id: &str, incarnation: u64, now_ms: i64) {
@@ -355,8 +243,7 @@ impl Swim {
       }
       let mut register = existing.clone();
       register.incarnation = incarnation;
-      register.state = MemberState::Leaving;
-      register.updated_at_ms = now_ms;
+      register.leave(now_ms);
       self.membership.merge_register(&register);
     }
   }
@@ -371,61 +258,7 @@ impl Swim {
       .collect();
 
     for seq in timed_out {
-      let escalate = self
-        .pending_pings
-        .get(&seq)
-        .is_some_and(|pending| !pending.indirect_sent);
-
-      if escalate {
-        let target = self
-          .pending_pings
-          .get(&seq)
-          .map(|pending| pending.target.clone())
-          .unwrap_or_default();
-        let proxies = self.pick_indirect_proxies(&target, self.config.indirect_probe_count);
-
-        if proxies.is_empty() {
-          if let Some(pending) = self.pending_pings.remove(&seq) {
-            actions.extend(self.mark_suspected(&pending.target, now_ms));
-          }
-        } else {
-          if let Some(pending) = self.pending_pings.get_mut(&seq) {
-            pending.indirect_sent = true;
-          }
-          self.pending_indirect.insert(
-            seq,
-            PendingIndirect {
-              target: target.clone(),
-              proxies: proxies.clone(),
-              sent_at: now_u64,
-            },
-          );
-          for proxy in proxies {
-            actions.push(SwimAction::SendPingReq {
-              proxy,
-              target: target.clone(),
-              seq,
-            });
-          }
-        }
-        continue;
-      }
-
       if let Some(pending) = self.pending_pings.remove(&seq) {
-        actions.extend(self.mark_suspected(&pending.target, now_ms));
-      }
-    }
-
-    let indirect_timed_out: Vec<u64> = self
-      .pending_indirect
-      .iter()
-      .filter(|(_, pending)| now_u64 - pending.sent_at >= self.config.ping_timeout_ms)
-      .map(|(seq, _)| *seq)
-      .collect();
-
-    for seq in indirect_timed_out {
-      self.pending_pings.remove(&seq);
-      if let Some(pending) = self.pending_indirect.remove(&seq) {
         actions.extend(self.mark_suspected(&pending.target, now_ms));
       }
     }
@@ -468,7 +301,6 @@ impl Swim {
       PendingPing {
         target: target.to_string(),
         sent_at: now_u64,
-        indirect_sent: false,
       },
     );
     self.last_probe_ms.insert(target.to_string(), now_u64);
@@ -476,20 +308,6 @@ impl Swim {
       target: target.to_string(),
       seq,
     })
-  }
-
-  fn pick_indirect_proxies(&self, target: &str, count: usize) -> Vec<String> {
-    let mut proxies: Vec<String> = self
-      .membership
-      .active()
-      .into_iter()
-      .filter(|r| r.node_id != self.local_node_id && r.node_id != target)
-      .map(|r| r.node_id.clone())
-      .collect();
-
-    proxies.sort();
-    proxies.truncate(count);
-    proxies
   }
 
   pub fn local_node_id(&self) -> &str {
@@ -546,7 +364,6 @@ mod tests {
       ping_interval_ms: 1_000,
       ping_timeout_ms: 2_000,
       failure_threshold: 1,
-      ..SwimConfig::default()
     };
     let mut swim = Swim::new("local", config, local_register("local"));
     swim.membership.merge_register(&peer_register("peer"));
@@ -573,7 +390,6 @@ mod tests {
       ping_interval_ms: 1_000,
       ping_timeout_ms: 2_000,
       failure_threshold: 3,
-      ..SwimConfig::default()
     };
     let mut swim = Swim::new("local", config, local_register("local"));
     swim.membership.merge_register(&peer_register("peer"));

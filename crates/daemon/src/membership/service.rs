@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 
 use lycoris_api::proto::NodeInfo as ProtoNodeInfo;
-use lycoris_core::time::now_ms;
+use lycoris_core::{MemberRegister, MemberState, Membership, matches_selector, time::now_ms};
 use tokio::sync::Mutex;
 
 use crate::membership::{
-  MemberRegister, MemberState, Membership, MerkleTree,
+  MerkleTree,
   merkle::Hash as MerkleHash,
   swim::{Swim, SwimAction, SwimConfig, SwimMessage},
 };
@@ -208,15 +208,6 @@ impl MembershipService {
 pub struct MerkleRoot {
   pub root_hash: Vec<u8>,
   pub leaf_hashes: Vec<(String, Vec<u8>)>,
-}
-
-fn matches_selector(labels: &HashMap<String, String>, selector: &HashMap<String, String>) -> bool {
-  if selector.is_empty() {
-    return true;
-  }
-  selector
-    .iter()
-    .all(|(key, value)| labels.get(key) == Some(value))
 }
 
 fn diff_leaf_sets(

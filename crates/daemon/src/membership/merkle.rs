@@ -1,6 +1,5 @@
 use blake3::Hasher;
-
-use crate::membership::crdt::{MemberRegister, Membership};
+use lycoris_core::{MemberRegister, Membership};
 
 const LEAF_PREFIX: &[u8] = b"L";
 const INNER_PREFIX: &[u8] = b"I";
@@ -201,8 +200,9 @@ fn hash_empty() -> Hash {
 
 #[cfg(test)]
 mod tests {
+  use lycoris_core::{MemberRegister, MemberState, Membership};
+
   use super::*;
-  use crate::membership::crdt::{MemberRegister, MemberState, Membership};
 
   fn register(id: &str, heartbeat: u64) -> MemberRegister {
     let mut r = MemberRegister::new(id, "127.0.0.1:1", 1, heartbeat);

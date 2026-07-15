@@ -1,3 +1,8 @@
+//! Cluster membership CRDT types shared across crates.
+//!
+//! These types intentionally avoid any transport or persistence dependencies
+//! so that `lycoris-core` remains a small leaf crate.
+
 use std::collections::HashMap;
 
 /// Lifecycle state of a cluster member.
@@ -67,16 +72,14 @@ impl MemberRegister {
 
   /// Return true if `self` dominates `other` according to CRDT ordering.
   ///
-  /// Ordering: higher incarnation wins; if equal, higher heartbeat wins;
-  /// if equal, later timestamp wins. This is a total preorder per node.
+  /// Ordering: higher incarnation wins; if equal, higher heartbeat wins. This
+  /// is a total preorder per node. `updated_at_ms` is intentionally not used
+  /// as a tiebreaker because wall clocks are unreliable across partitions.
   pub fn dominates(&self, other: &Self) -> bool {
     if self.incarnation != other.incarnation {
       return self.incarnation > other.incarnation;
     }
-    if self.heartbeat != other.heartbeat {
-      return self.heartbeat > other.heartbeat;
-    }
-    self.updated_at_ms >= other.updated_at_ms
+    self.heartbeat > other.heartbeat
   }
 
   /// Merge another register into this one, keeping the dominant state.
@@ -116,19 +119,15 @@ impl MemberRegister {
     // register (e.g., Offline) via a suspect call.
     if matches!(self.state, MemberState::Active) {
       self.state = MemberState::Suspected;
+      self.heartbeat = self.heartbeat.saturating_add(1);
       self.updated_at_ms = now_ms;
     }
-  }
-
-  /// Mark the node as offline.
-  pub fn fail(&mut self, now_ms: i64) {
-    self.state = MemberState::Offline;
-    self.updated_at_ms = now_ms;
   }
 
   /// Mark the node as leaving.
   pub fn leave(&mut self, now_ms: i64) {
     self.state = MemberState::Leaving;
+    self.heartbeat = self.heartbeat.saturating_add(1);
     self.updated_at_ms = now_ms;
   }
 
