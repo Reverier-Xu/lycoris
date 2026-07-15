@@ -4,7 +4,7 @@ This directory contains systemd unit files and an install helper for running the
 lycoris server daemon as a persistent system service, either system-wide or
 per-user.
 
-> The server binary produced by this repository is named `lycoris-daemon`. The
+> The server binary produced by this repository is named `lycoris` and is run with `lycoris daemon`. The
 > systemd service itself is named `lycoris.service`.
 
 ## Files
@@ -18,7 +18,7 @@ per-user.
 1. Build the release binary:
 
    ```bash
-   cargo build --release -p lycoris-daemon
+   cargo build --release -p lycoris
    ```
 
 2. Run the installer as root:
@@ -47,7 +47,7 @@ root privileges.
 1. Build the release binary:
 
    ```bash
-   cargo build --release -p lycoris-daemon
+   cargo build --release -p lycoris
    ```
 
 2. Run the installer with the `--user` flag:
@@ -82,7 +82,7 @@ systemd directory:
 
 Adjust the following paths as needed:
 
-- `ExecStart` — path to the `lycoris-daemon` binary.
+- `ExecStart` — path to the `lycoris daemon` binary.
 - `--config` — path to the daemon configuration file.
 - `WorkingDirectory` — runtime data directory.
 - `User` / `Group` — the account under which the daemon runs (system mode only).

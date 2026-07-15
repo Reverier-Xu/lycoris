@@ -1,5 +1,5 @@
 [Unit]
-Description=Lycoris server daemon
+Description=Lycoris daemon
 Documentation=https://lycoris.woooo.tech
 After=network-online.target
 Wants=network-online.target
@@ -9,7 +9,7 @@ Type=exec
 User=lycoris
 Group=lycoris
 
-ExecStart=/usr/local/bin/lycoris-daemon --config /etc/lycoris/lycoris.toml
+ExecStart=/usr/local/bin/lycoris daemon --config /etc/lycoris/lycoris.toml
 WorkingDirectory=/var/lib/lycoris
 
 Restart=on-failure

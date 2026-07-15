@@ -1,12 +1,12 @@
 [Unit]
-Description=Lycoris server daemon (user)
+Description=Lycoris daemon (user)
 Documentation=https://lycoris.woooo.tech
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=exec
-ExecStart=%h/.local/bin/lycoris-daemon --config %h/.config/lycoris/lycoris.toml
+ExecStart=%h/.local/bin/lycoris daemon --config %h/.config/lycoris/lycoris.toml
 WorkingDirectory=%h/.local/share/lycoris
 
 Restart=on-failure

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Install lycoris-server as a systemd service.
+# Install lycoris as a systemd service.
 # Supports both system-wide (root) and per-user (--user) installations.
 
 SERVICE_NAME="lycoris"
-BINARY_NAME="lycoris-daemon"
+BINARY_NAME="lycoris"
 
 user_mode=false
 while [[ "$#" -gt 0 ]]; do
@@ -76,7 +76,7 @@ fi
 
 if [[ -z "${binary_path}" ]]; then
   echo "error: could not find '${BINARY_NAME}' binary" >&2
-  echo "       place it next to this script, build it with 'cargo build --release -p lycoris-daemon', or install it in PATH" >&2
+  echo "       place it next to this script, build it with 'cargo build --release -p lycoris', or install it in PATH" >&2
   exit 1
 fi
 
