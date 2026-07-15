@@ -247,15 +247,24 @@ impl Swim {
     if node_id == self.local_node_id {
       return;
     }
-    if let Some(existing) = self.membership.get(node_id) {
-      if existing.incarnation > incarnation {
-        return;
-      }
-      let mut register = existing.clone();
-      register.incarnation = incarnation;
-      register.leave(now_ms);
-      self.membership.merge_register(&register);
+    let Some(existing) = self.membership.get(node_id) else {
+      return;
+    };
+
+    if existing.incarnation > incarnation {
+      return;
     }
+
+    // A Leave rumor for the same incarnation must not revive a node that has
+    // already been confirmed Offline.
+    if existing.incarnation == incarnation && existing.state == MemberState::Offline {
+      return;
+    }
+
+    let mut register = existing.clone();
+    register.incarnation = incarnation;
+    register.leave(now_ms);
+    self.membership.merge_register(&register);
   }
 
   fn check_timeouts(&mut self, now_u64: u64, now_ms: i64) -> Vec<SwimAction> {

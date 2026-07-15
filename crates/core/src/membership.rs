@@ -86,8 +86,9 @@ impl MemberRegister {
 
   /// Merge another register into this one, keeping the dominant state.
   ///
-  /// If the other register dominates, all fields are replaced. If they are
-  /// equivalent in ordering, fields are merged defensively (union of maps).
+  /// If one register clearly dominates, its full state wins so that stale
+  /// duplicates cannot revert newer labels or annotations. Only when the two
+  /// registers are equivalent in ordering are the maps merged defensively.
   pub fn merge(&mut self, other: &Self) {
     if other.dominates(self) {
       *self = other.clone();
@@ -95,10 +96,7 @@ impl MemberRegister {
     }
 
     if self.dominates(other) {
-      // Keep self, but still merge label/annotation sets defensively so a
-      // stale duplicate does not lose metadata.
-      self.labels.extend(other.labels.clone());
-      self.annotations.extend(other.annotations.clone());
+      // The dominant register already wins; do not merge stale metadata.
       return;
     }
 
