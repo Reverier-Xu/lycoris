@@ -21,37 +21,37 @@ pub enum ShellError {
   #[error("failed to connect to {address}: {source}")]
   Connect {
     address: String,
-    source: lycoris_api::ClusterClientError,
+    source: lycoris_client::ClientError,
   },
   #[error("failed to list {kind}: {source}")]
   ListResources {
     kind: String,
-    source: lycoris_api::ClusterClientError,
+    source: lycoris_client::ClientError,
   },
   #[error("failed to get {kind} '{id}': {source}")]
   GetResource {
     kind: String,
     id: String,
-    source: lycoris_api::ClusterClientError,
+    source: lycoris_client::ClientError,
   },
   #[error("failed to describe {kind} '{id}': {source}")]
   DescribeResource {
     kind: String,
     id: String,
-    source: lycoris_api::ClusterClientError,
+    source: lycoris_client::ClientError,
   },
   #[error("{kind} '{id}' not found")]
   ResourceNotFound { kind: String, id: String },
   #[error("unknown resource kind '{0}'")]
   UnknownResourceKind(String),
   #[error("failed to register node: {0}")]
-  Register(lycoris_api::ClusterClientError),
+  Register(lycoris_client::ClientError),
   #[error("failed to join cluster: {0}")]
-  Join(lycoris_api::ClusterClientError),
+  Join(lycoris_client::ClientError),
   #[error("failed to leave cluster: {0}")]
-  Leave(lycoris_api::ClusterClientError),
+  Leave(lycoris_client::ClientError),
   #[error("failed to set primary endpoint: {0}")]
-  SetPrimary(lycoris_api::ClusterClientError),
+  SetPrimary(lycoris_client::ClientError),
   #[error("cluster key error: {0}")]
   ClusterKey(lycoris_core::ClusterKeyError),
   #[error("no cluster key found; run 'lycoris cluster init' first")]

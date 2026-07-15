@@ -1,4 +1,4 @@
-use lycoris_api::ClusterRpcClient;
+use lycoris_client::ClusterClient;
 use lycoris_config::{ClientConfig, DaemonConfig};
 use lycoris_core::{
   ClusterKey, SimpleNode, default_cluster_key_path, paths::default_daemon_config_path,
@@ -117,7 +117,7 @@ pub async fn join_cluster(
     &client_config.ca_cert,
   )
   .map_err(ShellError::TlsLoad)?;
-  let mut client = ClusterRpcClient::connect_with_tls(&peer, tls)
+  let mut client = ClusterClient::connect_with_tls(&peer, tls)
     .await
     .map_err(|source| ShellError::Connect {
       address: peer.clone(),
@@ -172,14 +172,14 @@ pub fn show_key() -> Result<(), ShellError> {
   Ok(())
 }
 
-async fn connect_cluster(client_config: &ClientConfig) -> Result<ClusterRpcClient, ShellError> {
+async fn connect_cluster(client_config: &ClientConfig) -> Result<ClusterClient, ShellError> {
   let tls = load_client_tls(
     &client_config.cert,
     &client_config.key,
     &client_config.ca_cert,
   )
   .map_err(ShellError::TlsLoad)?;
-  ClusterRpcClient::connect_with_tls(&client_config.api_address, tls)
+  ClusterClient::connect_with_tls(&client_config.api_address, tls)
     .await
     .map_err(|source| ShellError::Connect {
       address: client_config.api_address.clone(),

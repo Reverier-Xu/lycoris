@@ -1,4 +1,4 @@
-use lycoris_api::proto::{NodeBody, Resource as ProtoResource, ResourceKind, resource::Body};
+use lycoris_proto::node::{NodeBody, Resource as ProtoResource, ResourceKind, resource::Body};
 use owo_colors::OwoColorize;
 
 use super::parse::resource_name;
@@ -12,11 +12,9 @@ pub fn render_list(kind: ResourceKind, resources: &[ProtoResource], local_id: &s
 
 fn render_node_list(resources: &[ProtoResource], local_id: &str) {
   println!(
-    "{}  {}  {}  {}",
+    "{}  {}",
     "NODE ID".bold().underline(),
     "STATE".bold().underline(),
-    "IN".bold().underline(),
-    "OUT".bold().underline()
   );
 
   for resource in resources {
@@ -33,14 +31,7 @@ fn render_node_list(resources: &[ProtoResource], local_id: &str) {
     } else {
       node.id.clone()
     };
-    println!(
-      "{}{}  {}  {}  {}",
-      marker,
-      id,
-      node.state,
-      format_degree(&node.in_degree),
-      format_degree(&node.out_degree),
-    );
+    println!("{}{}  {}", marker, id, node.state,);
     println!("  address: {}", node.address);
   }
 }
@@ -93,8 +84,6 @@ fn render_node(resource: &ProtoResource, local_id: &str, compact: bool) {
     println!("{}{}", node.id.bold().cyan(), marker);
     println!("  address:        {}", node.address);
     println!("  state:          {}", node.state);
-    println!("  in-degree:      {}", format_degree(&node.in_degree));
-    println!("  out-degree:     {}", format_degree(&node.out_degree));
   } else {
     println!("{}{}", node.id.bold().cyan(), marker);
     println!("  address:        {}", node.address);
@@ -102,8 +91,6 @@ fn render_node(resource: &ProtoResource, local_id: &str, compact: bool) {
     println!("  incarnation:    {}", node.incarnation);
     println!("  heartbeat:      {}", node.heartbeat);
     println!("  last heartbeat: {}", node.last_heartbeat_unix_ms);
-    println!("  in-degree:      {}", format_degree(&node.in_degree));
-    println!("  out-degree:     {}", format_degree(&node.out_degree));
     println!("  labels:         {:?}", node.labels);
     println!("  annotations:    {:?}", node.annotations);
   }
@@ -161,13 +148,5 @@ fn render_generic(resource: &ProtoResource, compact: bool) {
       }
       Some(Body::Node(_)) | None => {}
     }
-  }
-}
-
-fn format_degree(degree: &[String]) -> String {
-  if degree.is_empty() {
-    "-".to_string()
-  } else {
-    degree.join(", ")
   }
 }

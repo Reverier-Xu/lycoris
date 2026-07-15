@@ -13,12 +13,12 @@ version.workspace      = true
 
 [dependencies]
 blake3.workspace         = true
-lycoris-api.workspace    = true
-lycoris-config.workspace = true
-lycoris-core.workspace   = true
-lycoris-proto.workspace  = true
-lycoris-storage.workspace = true
-lycoris-tls.workspace    = true
+lycoris-client.workspace     = true
+lycoris-config.workspace     = true
+lycoris-core.workspace       = true
+lycoris-proto.workspace      = true
+lycoris-storage.workspace    = true
+lycoris-tls.workspace        = true
 prost.workspace          = true
 thiserror.workspace      = true
 tokio.workspace          = true
@@ -26,7 +26,7 @@ tonic.workspace          = true
 tracing.workspace        = true
 
 [dev-dependencies]
-lycoris-api.workspace    = true
+lycoris-client.workspace = true
 lycoris-config.workspace = true
 lycoris-core.workspace   = true
 lycoris-tls.workspace    = true

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use lycoris_api::proto::ResourceKind;
+use lycoris_proto::node::ResourceKind;
 
 use crate::error::ShellError;
 

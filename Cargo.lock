@@ -3778,10 +3778,11 @@ name = "lycoris"
 version = "0.1.0"
 dependencies = [
  "clap",
- "lycoris-api",
+ "lycoris-client",
  "lycoris-config",
  "lycoris-core",
  "lycoris-daemon",
+ "lycoris-proto",
  "lycoris-tls",
  "owo-colors",
  "rustls",
@@ -3793,15 +3794,6 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "lycoris-api"
-version = "0.1.0"
-dependencies = [
- "lycoris-client",
- "lycoris-proto",
- "lycoris-tls",
 ]
 
 [[package]]
@@ -3849,7 +3841,7 @@ name = "lycoris-daemon"
 version = "0.1.0"
 dependencies = [
  "blake3",
- "lycoris-api",
+ "lycoris-client",
  "lycoris-config",
  "lycoris-core",
  "lycoris-proto",

@@ -37,7 +37,6 @@ hex           = "0.4"
 jiff          = "0.2"
 is-root       = "0.1"
 lancedb       = "0.31"
-lycoris-api     = { path = "crates/api" }
 lycoris-client  = { path = "crates/client" }
 lycoris-config  = { path = "crates/config" }
 lycoris-core    = { path = "crates/core" }

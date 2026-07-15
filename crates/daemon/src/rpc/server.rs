@@ -2,14 +2,14 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use lycoris_api::proto::{
+use lycoris_core::ClusterKey;
+use lycoris_proto::node::{
   DescribeResourceRequest, GetOutDegreeRequest, GetOutDegreeResponse, GetResourceRequest,
   JoinRequest, JoinResponse, LeaveRequest, LeaveResponse, ListResourcesRequest,
   ListResourcesResponse, NodeInfo as ProtoNodeInfo, RegisterRequest, RegisterResponse, Resource,
   SetPrimaryEndpointRequest, SetPrimaryEndpointResponse,
   cluster_server::{Cluster, ClusterServer},
 };
-use lycoris_core::ClusterKey;
 use lycoris_storage::Storage;
 use tokio::sync::watch;
 use tonic::{Request, Response, Status};
@@ -253,9 +253,12 @@ impl Cluster for ClusterService {
   async fn describe_resource(
     &self, request: Request<DescribeResourceRequest>,
   ) -> Result<Response<Resource>, Status> {
-    let request = request.into_inner();
-    let kind = crate::rpc::resource::parse_kind(request.kind)?;
-    let resource = self.mapper.get(kind, &request.id).await?;
-    Ok(Response::new(resource))
+    let inner = request.into_inner();
+    self
+      .get_resource(Request::new(GetResourceRequest {
+        kind: inner.kind,
+        id: inner.id,
+      }))
+      .await
   }
 }

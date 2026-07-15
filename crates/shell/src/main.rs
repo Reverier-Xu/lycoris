@@ -13,7 +13,7 @@ use config::load_client_config;
 use error::ShellError;
 
 fn main() -> Result<(), ShellError> {
-  lycoris_api::install_crypto_provider().map_err(ShellError::CryptoProvider)?;
+  lycoris_client::install_crypto_provider().map_err(ShellError::CryptoProvider)?;
   tracing_subscriber::fmt::init();
 
   let cli = Cli::parse();

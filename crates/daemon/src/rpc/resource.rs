@@ -2,11 +2,11 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use lycoris_api::proto::{
+use lycoris_core::{DEFAULT_EMBEDDING_DIM, matches_selector};
+use lycoris_proto::node::{
   MemoryBody, NodeBody, Resource, ResourceKind, ResourceMetadata, RuleBody, SessionBody, SkillBody,
   WorkspaceBody, resource::Body,
 };
-use lycoris_core::{DEFAULT_EMBEDDING_DIM, matches_selector};
 use lycoris_storage::{
   MemoryEntry, ResourceScope, RuleRecord, Session, SkillRecord, Storage, WorkspaceRecord,
   workspace::VersionedContentStore,
@@ -217,7 +217,7 @@ impl ResourceMapper {
   }
 }
 
-fn node_to_resource(node: lycoris_api::proto::NodeInfo) -> Resource {
+fn node_to_resource(node: lycoris_proto::node::NodeInfo) -> Resource {
   Resource {
     metadata: Some(ResourceMetadata {
       id: node.id.clone(),

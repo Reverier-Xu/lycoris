@@ -1,6 +1,6 @@
 use std::{collections::HashMap, time::Duration};
 
-use lycoris_api::ClusterRpcClient;
+use lycoris_client::{ClientError, ClusterClient, install_crypto_provider};
 use lycoris_core::SimpleNode;
 use lycoris_tls::load_client_tls;
 use thiserror::Error;
@@ -12,14 +12,14 @@ enum ExampleError {
   #[error("io error: {0}")]
   Io(#[from] std::io::Error),
   #[error("cluster client error: {0}")]
-  Cluster(#[from] lycoris_api::ClusterClientError),
+  Cluster(#[from] ClientError),
   #[error("{0} not visible on {1}")]
   NotVisible(String, String),
 }
 
 #[tokio::main]
 async fn main() -> Result<(), ExampleError> {
-  lycoris_api::install_crypto_provider().map_err(ExampleError::CryptoProvider)?;
+  install_crypto_provider().map_err(ExampleError::CryptoProvider)?;
 
   let args: Vec<String> = std::env::args().collect();
   if args.len() != 7 {
@@ -39,7 +39,7 @@ async fn main() -> Result<(), ExampleError> {
 
   let tls = load_client_tls(cert_path, key_path, ca_path)?;
 
-  let mut client = ClusterRpcClient::connect_with_tls(register_addr, tls.clone()).await?;
+  let mut client = ClusterClient::connect_with_tls(register_addr, tls.clone()).await?;
   let node = SimpleNode::new(
     expected_id.clone(),
     "127.0.0.1:59999".to_string(),
@@ -51,10 +51,10 @@ async fn main() -> Result<(), ExampleError> {
 
   tokio::time::sleep(Duration::from_secs(2)).await;
 
-  let mut client = ClusterRpcClient::connect_with_tls(query_addr, tls).await?;
+  let mut client = ClusterClient::connect_with_tls(query_addr, tls).await?;
   let resources = client
     .list_resources(
-      lycoris_api::proto::ResourceKind::Node,
+      lycoris_proto::node::ResourceKind::Node,
       HashMap::new(),
       String::new(),
     )
@@ -62,7 +62,7 @@ async fn main() -> Result<(), ExampleError> {
   let ids: Vec<String> = resources
     .into_iter()
     .filter_map(|resource| match resource.body {
-      Some(lycoris_api::proto::resource::Body::Node(lycoris_api::proto::NodeBody {
+      Some(lycoris_proto::node::resource::Body::Node(lycoris_proto::node::NodeBody {
         node: Some(node),
       })) => Some(node.id),
       _ => None,

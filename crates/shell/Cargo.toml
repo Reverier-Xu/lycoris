@@ -17,11 +17,12 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { workspace = true, features = ["derive"] }
-lycoris-api.workspace = true
+lycoris-client.workspace = true
 lycoris-config.workspace = true
-lycoris-core.workspace = true
+lycoris-core.workspace   = true
 lycoris-daemon.workspace = true
-lycoris-tls.workspace = true
+lycoris-proto.workspace  = true
+lycoris-tls.workspace    = true
 owo-colors.workspace     = true
 rustls.workspace         = true
 serde.workspace          = true

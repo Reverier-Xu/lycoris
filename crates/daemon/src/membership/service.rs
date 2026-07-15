@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-use lycoris_api::proto::NodeInfo as ProtoNodeInfo;
 use lycoris_core::{MemberRegister, MemberState, Membership, matches_selector, time::now_ms};
+use lycoris_proto::node::NodeInfo as ProtoNodeInfo;
 use tokio::sync::Mutex;
 
 use crate::membership::{
@@ -55,11 +55,6 @@ impl MembershipService {
       },
       now,
     )
-  }
-
-  /// Record a heartbeat from an RPC request.
-  pub async fn heartbeat(&self, info: &ProtoNodeInfo) -> Vec<SwimAction> {
-    self.register(info).await
   }
 
   /// Mark a node as leaving the cluster.
@@ -362,14 +357,6 @@ mod tests {
     let snapshot = service.sync_nodes(vec![proto("b")]).await;
     assert!(snapshot.iter().any(|n| n.id == "a"));
     assert!(snapshot.iter().any(|n| n.id == "b"));
-  }
-
-  #[tokio::test]
-  async fn heartbeat_behaves_like_register() {
-    let service = MembershipService::new("local", SwimConfig::default(), register("local"));
-    let _ = service.heartbeat(&proto("peer")).await;
-    let nodes = service.list_nodes(&HashMap::new()).await;
-    assert!(nodes.iter().any(|n| n.id == "peer"));
   }
 
   #[tokio::test]
