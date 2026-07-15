@@ -151,6 +151,8 @@ fn collect_leaf_hashes(node: &MerkleNode, out: &mut Vec<(String, Hash)>) {
 ///
 /// Labels and annotations are sorted by key to ensure that equivalent registers
 /// always hash to the same value regardless of HashMap iteration order.
+/// Volatile fields such as `updated_at_ms` are intentionally excluded so that
+/// heartbeats do not rewrite the whole Merkle tree on every tick.
 fn hash_register(register: &MemberRegister) -> Hash {
   let mut hasher = Hasher::new();
   hasher.update(LEAF_PREFIX);
@@ -161,7 +163,6 @@ fn hash_register(register: &MemberRegister) -> Hash {
   hasher.update(&[register.state.as_u8()]);
   hasher.update(&register.incarnation.to_be_bytes());
   hasher.update(&register.heartbeat.to_be_bytes());
-  hasher.update(&register.updated_at_ms.to_be_bytes());
 
   let mut labels: Vec<(&String, &String)> = register.labels.iter().collect();
   labels.sort_by(|a, b| a.0.cmp(b.0));

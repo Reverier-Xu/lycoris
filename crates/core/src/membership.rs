@@ -35,6 +35,8 @@ impl MemberState {
   }
 }
 
+const OFFLINE_HEARTBEAT_BUMP: u64 = 1_000_000;
+
 /// A single node's membership register.
 ///
 /// This is the unit of replication. Each node owns its own register and
@@ -107,9 +109,14 @@ impl MemberRegister {
   }
 
   /// Bump the heartbeat and update the timestamp.
+  ///
+  /// Only `Active` or `Suspected` nodes are moved back to `Active`; terminal
+  /// states (`Leaving`, `Offline`) are not resurrected by a heartbeat alone.
   pub fn heartbeat(&mut self, now_ms: i64) {
     self.heartbeat = self.heartbeat.saturating_add(1);
-    self.state = MemberState::Active;
+    if matches!(self.state, MemberState::Active | MemberState::Suspected) {
+      self.state = MemberState::Active;
+    }
     self.updated_at_ms = now_ms;
   }
 
@@ -132,8 +139,13 @@ impl MemberRegister {
   }
 
   /// Mark the node as confirmed failed or departed.
+  ///
+  /// The heartbeat is bumped by a large constant so that, within the same
+  /// incarnation, an `Offline` register dominates any concurrent `Suspected`
+  /// register and cannot be accidentally downgraded back to `Suspected`.
   pub fn offline(&mut self, now_ms: i64) {
     self.state = MemberState::Offline;
+    self.heartbeat = self.heartbeat.saturating_add(OFFLINE_HEARTBEAT_BUMP);
     self.updated_at_ms = now_ms;
   }
 
@@ -402,5 +414,30 @@ mod tests {
     assert_eq!(active.len(), 2);
     assert!(active.contains(&"a".to_string()));
     assert!(active.contains(&"b".to_string()));
+  }
+
+  #[test]
+  fn heartbeat_does_not_revive_offline() {
+    let mut r = register("a", 1, 10, MemberState::Offline);
+    r.heartbeat(1000);
+
+    assert_eq!(r.heartbeat, 11);
+    assert_eq!(r.state, MemberState::Offline);
+    assert_eq!(r.updated_at_ms, 1000);
+  }
+
+  #[test]
+  fn offline_dominates_suspect_within_same_incarnation() {
+    let suspected = register("a", 1, 100, MemberState::Suspected);
+    let mut offline = register("a", 1, 1, MemberState::Active);
+    offline.offline(1000);
+
+    let mut membership = Membership::new();
+    membership.merge_register(&suspected);
+    membership.merge_register(&offline);
+
+    let merged = membership.get("a").unwrap();
+    assert_eq!(merged.state, MemberState::Offline);
+    assert!(merged.heartbeat > suspected.heartbeat);
   }
 }
