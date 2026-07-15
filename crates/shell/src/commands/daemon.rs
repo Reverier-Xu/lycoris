@@ -1,7 +1,7 @@
 use std::{path::PathBuf, process::Command};
 
 use lycoris_config::{ClientConfig, DaemonConfig};
-use lycoris_core::{ClusterKey, default_cluster_key_path, paths};
+use lycoris_core::{ClusterKey, paths};
 
 use crate::error::ShellError;
 
@@ -18,7 +18,7 @@ pub async fn run(config: Option<PathBuf>) -> Result<(), ShellError> {
     DaemonConfig::from_file(&config_path).map_err(ShellError::DaemonConfigLoad)?;
 
   write_client_config(&daemon_config);
-  let cluster_key = load_cluster_key();
+  let cluster_key = load_cluster_key(&daemon_config.data_dir);
 
   lycoris_daemon::runtime::run(daemon_config, cluster_key)
     .await
@@ -60,8 +60,8 @@ fn write_client_config(config: &DaemonConfig) {
   }
 }
 
-fn load_cluster_key() -> Option<ClusterKey> {
-  let path = default_cluster_key_path();
+fn load_cluster_key(data_dir: &str) -> Option<ClusterKey> {
+  let path = PathBuf::from(data_dir).join("cluster.key");
   if !path.is_file() {
     return None;
   }
@@ -79,5 +79,23 @@ fn load_cluster_key() -> Option<ClusterKey> {
       );
       None
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn load_cluster_key_uses_configured_data_dir() {
+    let dir = std::env::temp_dir().join(format!("lycoris-key-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let key = ClusterKey::generate().unwrap();
+    key.save(dir.join("cluster.key")).unwrap();
+
+    let loaded = load_cluster_key(dir.to_str().unwrap());
+    assert_eq!(loaded, Some(key));
+
+    std::fs::remove_dir_all(&dir).unwrap();
   }
 }

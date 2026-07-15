@@ -96,6 +96,8 @@ echo "cluster key: ${CLUSTER_KEY}"
 
 echo "copying cluster key to shared keys directory..."
 podman cp "node-0:/root/.local/share/lycoris/cluster.key" "${E2E_DIR}/keys/cluster.key"
+echo "copying cluster key into node-0 data directory..."
+podman cp "${E2E_DIR}/keys/cluster.key" "node-0:/data/cluster.key"
 
 echo "restarting node-0 to pick up cluster key..."
 podman restart node-0 >/dev/null
@@ -121,7 +123,8 @@ for i in $(seq 1 $((NODE_COUNT - 1))); do
     -v "${E2E_DIR}/certs:/certs" \
     -v "${E2E_DIR}/configs/node-${i}.toml:/etc/lycoris/lycoris.toml:ro" \
     -v "${E2E_DIR}/data/node-${i}:/data" \
-    -v "${E2E_DIR}/keys:/root/.local/share/lycoris:ro" \
+    -v "${E2E_DIR}/keys/cluster.key:/data/cluster.key:ro" \
+    -v "${E2E_DIR}/keys/cluster.key:/root/.local/share/lycoris/cluster.key:ro" \
     "${IMAGE}" >/dev/null
 
   run_in_node "${i}" mkdir -p /root/.config/lycoris

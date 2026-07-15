@@ -146,6 +146,8 @@ echo "cluster key: ${CLUSTER_KEY}"
 
 echo "copying cluster key to shared keys directory..."
 podman cp "node-0:/root/.local/share/lycoris/cluster.key" "${E2E_DIR}/keys/cluster.key"
+echo "copying cluster key into node-0 data directory..."
+podman cp "${E2E_DIR}/keys/cluster.key" "node-0:/data/cluster.key"
 
 echo "restarting node-0 to pick up cluster key..."
 podman restart node-0 >/dev/null
@@ -168,7 +170,8 @@ for i in $(seq 1 $((NODE_COUNT - 1))); do
     -v "${E2E_DIR}/certs:/certs" \
     -v "${E2E_DIR}/configs/node-${i}.toml:/etc/lycoris/lycoris.toml:ro" \
     -v "${E2E_DIR}/data/node-${i}:/data" \
-    -v "${E2E_DIR}/keys:/root/.local/share/lycoris:ro" \
+    -v "${E2E_DIR}/keys/cluster.key:/data/cluster.key:ro" \
+    -v "${E2E_DIR}/keys/cluster.key:/root/.local/share/lycoris/cluster.key:ro" \
     "${IMAGE}" >/dev/null
 
   run_in_node "${i}" mkdir -p /root/.config/lycoris
@@ -218,8 +221,33 @@ done
 
 apply_partition "${MAIN_SUBNET}" "${A_SUBNET}"
 
-echo "waiting for partition to settle (SWIM detects failures in ~8-10s)..."
-sleep 15
+echo "waiting for partition to settle..."
+settle_deadline=$((SECONDS + 45))
+while (( SECONDS < settle_deadline )); do
+  LEFT="$(run_in_node 0 lycoris cluster get nodes 2>/dev/null || true)"
+  RIGHT="$(run_in_node 5 lycoris cluster get nodes 2>/dev/null || true)"
+
+  left_ok=true
+  for i in 3 4 5; do
+    if echo "${LEFT}" | grep -q "node-${i}.*active"; then
+      left_ok=false
+      break
+    fi
+  done
+
+  right_ok=true
+  for i in 0 1 2; do
+    if echo "${RIGHT}" | grep -q "node-${i}.*active"; then
+      right_ok=false
+      break
+    fi
+  done
+
+  if ${left_ok} && ${right_ok}; then
+    break
+  fi
+  sleep 1
+done
 
 echo "querying left segment (node-0)..."
 LEFT="$(run_in_node 0 lycoris cluster get nodes)"
