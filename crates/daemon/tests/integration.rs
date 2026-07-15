@@ -152,7 +152,7 @@ async fn registry_converges_across_three_node_chain() {
 
   for config in configs.clone() {
     tokio::spawn(async move {
-      if let Err(e) = lycoris_daemon::runtime::run(config).await {
+      if let Err(e) = lycoris_daemon::runtime::run(config, None).await {
         eprintln!("runtime error: {e:?}");
       }
     });
@@ -231,14 +231,14 @@ async fn primary_failure_falls_back_and_promotes() {
       let shutdown_tx = node0_shutdown_tx.clone();
       handles.push(tokio::spawn(async move {
         if let Err(e) =
-          lycoris_daemon::runtime::run_with_shutdown(config, shutdown_tx, shutdown_rx).await
+          lycoris_daemon::runtime::run_with_shutdown(config, shutdown_tx, shutdown_rx, None).await
         {
           eprintln!("runtime error: {e:?}");
         }
       }));
     } else {
       handles.push(tokio::spawn(async move {
-        if let Err(e) = lycoris_daemon::runtime::run(config).await {
+        if let Err(e) = lycoris_daemon::runtime::run(config, None).await {
           eprintln!("runtime error: {e:?}");
         }
       }));
@@ -327,7 +327,7 @@ async fn partition_merge_reconciles_bidirectional_membership() {
 
   for config in configs.clone() {
     tokio::spawn(async move {
-      if let Err(e) = lycoris_daemon::runtime::run(config).await {
+      if let Err(e) = lycoris_daemon::runtime::run(config, None).await {
         eprintln!("runtime error: {e:?}");
       }
     });
@@ -412,7 +412,7 @@ async fn failure_detector_marks_unresponsive_peer() {
   let mut handles = Vec::new();
   for config in configs.clone() {
     handles.push(tokio::spawn(async move {
-      if let Err(e) = lycoris_daemon::runtime::run(config).await {
+      if let Err(e) = lycoris_daemon::runtime::run(config, None).await {
         eprintln!("runtime error: {e:?}");
       }
     }));

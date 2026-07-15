@@ -1,7 +1,7 @@
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
-use lycoris_config::{ClientConfig, DaemonConfig};
-use lycoris_core::{ClusterKey, default_cluster_key_path, paths, time::now_ms};
+use lycoris_config::DaemonConfig;
+use lycoris_core::{ClusterKey, time::now_ms};
 use lycoris_storage::{Storage, StorageError};
 use lycoris_tls::{TlsError, ensure_tls_bundle};
 use thiserror::Error;
@@ -34,7 +34,9 @@ pub enum RuntimeError {
 }
 
 /// Run the daemon until the process is interrupted.
-pub async fn run(config: DaemonConfig) -> Result<(), RuntimeError> {
+pub async fn run(
+  config: DaemonConfig, cluster_key: Option<ClusterKey>,
+) -> Result<(), RuntimeError> {
   let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
   let shutdown_tx_signal = shutdown_tx.clone();
@@ -56,21 +58,18 @@ pub async fn run(config: DaemonConfig) -> Result<(), RuntimeError> {
     let _ = shutdown_tx_signal.send(true);
   });
 
-  run_with_shutdown(config, shutdown_tx, shutdown_rx).await
+  run_with_shutdown(config, shutdown_tx, shutdown_rx, cluster_key).await
 }
 
 /// Run the daemon until the supplied shutdown signal becomes `true`.
 pub async fn run_with_shutdown(
   config: DaemonConfig, shutdown_tx: watch::Sender<bool>, shutdown: watch::Receiver<bool>,
+  cluster_key: Option<ClusterKey>,
 ) -> Result<(), RuntimeError> {
-  write_client_config(&config);
-
   let data_dir = PathBuf::from(&config.data_dir);
   std::fs::create_dir_all(&data_dir)?;
   let storage = Storage::open(data_dir.join("lycoris.redb"))?;
   let node = storage.node();
-
-  let cluster_key = load_cluster_key();
 
   let tls_bundle = ensure_tls_bundle(
     &config.tls.ca_cert,
@@ -162,43 +161,6 @@ async fn wait_shutdown(mut shutdown: watch::Receiver<bool>) {
   while !*shutdown.borrow() {
     if shutdown.changed().await.is_err() {
       break;
-    }
-  }
-}
-
-fn write_client_config(config: &DaemonConfig) {
-  let client_config = ClientConfig::from_daemon_config(config);
-  if let Some(path) = paths::default_client_config_path() {
-    if let Err(error) = client_config.write_to_file(&path) {
-      tracing::warn!(
-        %error,
-        path = %path.display(),
-        "failed to write client configuration; lycoris CLI may not be able to connect"
-      );
-    } else {
-      tracing::info!(path = %path.display(), "wrote client configuration");
-    }
-  }
-}
-
-fn load_cluster_key() -> Option<ClusterKey> {
-  let path = default_cluster_key_path();
-  if !path.is_file() {
-    return None;
-  }
-
-  match ClusterKey::load(&path) {
-    Ok(key) => {
-      tracing::info!(path = %path.display(), "loaded cluster key");
-      Some(key)
-    }
-    Err(error) => {
-      tracing::warn!(
-        %error,
-        path = %path.display(),
-        "failed to load cluster key; join requests will be rejected"
-      );
-      None
     }
   }
 }

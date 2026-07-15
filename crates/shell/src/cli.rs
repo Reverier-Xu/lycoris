@@ -24,6 +24,13 @@ pub enum Command {
     config: Option<std::path::PathBuf>,
   },
 
+  /// Start the lycoris daemon as a background child process.
+  Start {
+    /// Path to the daemon configuration file.
+    #[arg(short, long)]
+    config: Option<std::path::PathBuf>,
+  },
+
   /// Install lycoris as a user-mode background service.
   Setup,
 }

@@ -58,6 +58,8 @@ pub enum ShellError {
   ClusterKeyNotFound,
   #[error("invalid selector '{0}', expected key=value")]
   InvalidSelector(String),
+  #[error("failed to start daemon: {0}")]
+  DaemonStart(String),
   #[error("setup error: {0}")]
   Setup(String),
   #[error("io error: {0}")]

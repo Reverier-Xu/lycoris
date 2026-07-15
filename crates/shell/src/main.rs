@@ -1,8 +1,6 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
-use std::path::PathBuf;
-
 use clap::Parser;
 
 mod cli;
@@ -54,24 +52,16 @@ fn main() -> Result<(), ShellError> {
         })?;
       }
     },
-    Command::Daemon { config } => run_daemon(config)?,
+    Command::Daemon { config } => {
+      let runtime = tokio::runtime::Runtime::new().map_err(ShellError::RuntimeCreation)?;
+      runtime.block_on(commands::daemon::run(config))?;
+    }
+    Command::Start { config } => {
+      let child = commands::daemon::spawn(config)?;
+      println!("daemon started with pid {}", child.id());
+    }
     Command::Setup => commands::setup::run()?,
   }
 
   Ok(())
-}
-
-fn run_daemon(config: Option<PathBuf>) -> Result<(), ShellError> {
-  let runtime = tokio::runtime::Runtime::new().map_err(ShellError::RuntimeCreation)?;
-  let config_path = config
-    .or_else(lycoris_core::paths::default_daemon_config_path)
-    .ok_or(ShellError::ConfigNotFound)?;
-  let daemon_config =
-    lycoris_config::DaemonConfig::from_file(&config_path).map_err(ShellError::DaemonConfigLoad)?;
-
-  runtime.block_on(async move {
-    lycoris_daemon::runtime::run(daemon_config)
-      .await
-      .map_err(|error| ShellError::Setup(error.to_string()))
-  })
 }
