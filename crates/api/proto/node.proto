@@ -4,14 +4,105 @@ package lycoris.daemon;
 
 service Cluster {
   rpc Register(RegisterRequest) returns (RegisterResponse);
-  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
-  rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
   rpc SetPrimaryEndpoint(SetPrimaryEndpointRequest) returns (SetPrimaryEndpointResponse);
+  rpc Join(JoinRequest) returns (JoinResponse);
+  rpc Leave(LeaveRequest) returns (LeaveResponse);
+  rpc GetOutDegree(GetOutDegreeRequest) returns (GetOutDegreeResponse);
+
+  // Generic resource API.
+  rpc ListResources(ListResourcesRequest) returns (ListResourcesResponse);
+  rpc GetResource(GetResourceRequest) returns (Resource);
+  rpc DescribeResource(DescribeResourceRequest) returns (Resource);
 }
 
-service Sync {
-  rpc SyncNodes(SyncNodesRequest) returns (SyncNodesResponse);
-  rpc PushNode(PushNodeRequest) returns (PushNodeResponse);
+enum ResourceKind {
+  NODE = 0;
+  SESSION = 1;
+  MEMORY = 2;
+  SKILL = 3;
+  RULE = 4;
+  WORKSPACE = 5;
+}
+
+message ResourceMetadata {
+  string id = 1;
+  string name = 2;
+  ResourceKind kind = 3;
+  map<string, string> labels = 4;
+  map<string, string> annotations = 5;
+  // "shared", "local", or empty.
+  string scope = 6;
+  // Origin node for shared resources; empty for local origin.
+  string source_node_id = 7;
+  int64 created_at_ms = 8;
+  int64 updated_at_ms = 9;
+}
+
+message NodeBody {
+  NodeInfo node = 1;
+}
+
+message SessionBody {
+  string title = 1;
+  string host_node_id = 2;
+  map<string, string> metadata = 3;
+}
+
+message MemoryBody {
+  bytes content = 1;
+  map<string, string> metadata = 2;
+}
+
+message SkillBody {
+  uint64 version = 1;
+  string content_hash = 2;
+  string content = 3;
+  map<string, string> metadata = 4;
+}
+
+message RuleBody {
+  uint64 version = 1;
+  string content_hash = 2;
+  string content = 3;
+  map<string, string> metadata = 4;
+}
+
+message WorkspaceBody {
+  string root = 1;
+  repeated string session_ids = 2;
+  map<string, string> metadata = 3;
+}
+
+message Resource {
+  ResourceMetadata metadata = 1;
+  oneof body {
+    NodeBody node = 2;
+    SessionBody session = 3;
+    MemoryBody memory = 4;
+    SkillBody skill = 5;
+    RuleBody rule = 6;
+    WorkspaceBody workspace = 7;
+  }
+}
+
+message ListResourcesRequest {
+  ResourceKind kind = 1;
+  map<string, string> selector = 2;
+  string scope = 3;
+}
+
+message ListResourcesResponse {
+  repeated Resource resources = 1;
+}
+
+message GetResourceRequest {
+  ResourceKind kind = 1;
+  string id = 2;
+}
+
+message DescribeResourceRequest {
+  ResourceKind kind = 1;
+  string id = 2;
 }
 
 message NodeInfo {
@@ -23,6 +114,15 @@ message NodeInfo {
   string state = 6;
   uint64 incarnation = 7;
   uint64 heartbeat = 8;
+  repeated string in_degree = 9;
+  repeated string out_degree = 10;
+}
+
+message GetOutDegreeRequest {}
+
+message GetOutDegreeResponse {
+  string node_id = 1;
+  string address = 2;
 }
 
 message MerkleRootRequest {}
@@ -67,6 +167,11 @@ service Membership {
   rpc State(StateMessage) returns (StateResponse);
 }
 
+service Sync {
+  rpc SyncNodes(SyncNodesRequest) returns (SyncNodesResponse);
+  rpc PushNode(PushNodeRequest) returns (PushNodeResponse);
+}
+
 message StateMessage {
   oneof payload {
     NodeInfo alive = 1;
@@ -98,25 +203,6 @@ message RegisterResponse {
   string reason = 2;
 }
 
-message HeartbeatRequest {
-  string node_id = 1;
-  NodeInfo info = 2;
-}
-
-message HeartbeatResponse {
-  bool accepted = 1;
-  string reason = 2;
-}
-
-message ListNodesRequest {
-  // Optional label selector. Empty means "all alive nodes".
-  map<string, string> selector = 1;
-}
-
-message ListNodesResponse {
-  repeated NodeInfo nodes = 1;
-}
-
 message SyncNodesRequest {
   repeated NodeInfo nodes = 1;
 }
@@ -140,6 +226,25 @@ message SetPrimaryEndpointRequest {
 }
 
 message SetPrimaryEndpointResponse {
+  bool accepted = 1;
+  string reason = 2;
+}
+
+message JoinRequest {
+  NodeInfo info = 1;
+  string cluster_key = 2;
+}
+
+message JoinResponse {
+  bool accepted = 1;
+  string reason = 2;
+}
+
+message LeaveRequest {
+  string node_id = 1;
+}
+
+message LeaveResponse {
   bool accepted = 1;
   string reason = 2;
 }

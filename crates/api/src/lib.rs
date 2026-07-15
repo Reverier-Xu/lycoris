@@ -12,7 +12,7 @@ use tonic::{
 };
 
 pub mod proto {
-  #![allow(clippy::result_large_err)]
+  #![allow(clippy::large_enum_variant, clippy::result_large_err)]
   tonic::include_proto!("lycoris.daemon");
 }
 
@@ -25,11 +25,12 @@ pub fn install_crypto_provider() -> Result<(), std::sync::Arc<rustls::crypto::Cr
 }
 
 use proto::{
-  FetchRegistersRequest, HeartbeatRequest, LeafHash, ListNodesRequest, ListNodesResponse,
-  MerkleRootRequest, NodeInfo as ProtoNodeInfo, ProbeRequest, ProbeResponse, PushNodeRequest,
-  PushRegistersRequest, RegisterRequest, SetPrimaryEndpointRequest, StateMessage, StateResponse,
-  SyncNodesRequest, SyncNodesResponse, cluster_client::ClusterClient,
-  membership_client::MembershipClient, sync_client::SyncClient,
+  DescribeResourceRequest, FetchRegistersRequest, GetOutDegreeRequest, GetOutDegreeResponse,
+  GetResourceRequest, JoinRequest, LeafHash, LeaveRequest, ListResourcesRequest, MerkleRootRequest,
+  NodeInfo as ProtoNodeInfo, ProbeRequest, ProbeResponse, PushNodeRequest, PushRegistersRequest,
+  RegisterRequest, Resource as ProtoResource, ResourceKind as ProtoResourceKind,
+  SetPrimaryEndpointRequest, StateMessage, StateResponse, SyncNodesRequest, SyncNodesResponse,
+  cluster_client::ClusterClient, membership_client::MembershipClient, sync_client::SyncClient,
 };
 
 impl NodeInfo for ProtoNodeInfo {
@@ -82,27 +83,6 @@ impl ClusterRpcClient {
     }
   }
 
-  pub async fn heartbeat<T: NodeInfo>(&self, node: &T) -> Result<(), ClusterClientError> {
-    let request = Request::new(HeartbeatRequest {
-      node_id: node.id().to_string(),
-      info: Some(proto_from_node(node)),
-    });
-    let response = self.inner.lock().await.heartbeat(request).await?;
-    if response.into_inner().accepted {
-      Ok(())
-    } else {
-      Err(ClusterClientError::Rejected("heartbeat".to_string()))
-    }
-  }
-
-  pub async fn list_nodes(
-    &self, selector: HashMap<String, String>,
-  ) -> Result<ListNodesResponse, ClusterClientError> {
-    let request = Request::new(ListNodesRequest { selector });
-    let response = self.inner.lock().await.list_nodes(request).await?;
-    Ok(response.into_inner())
-  }
-
   pub async fn set_primary_endpoint(&self, address: &str) -> Result<(), ClusterClientError> {
     let request = Request::new(SetPrimaryEndpointRequest {
       address: address.to_string(),
@@ -120,6 +100,83 @@ impl ClusterRpcClient {
         "set_primary_endpoint".to_string(),
       ))
     }
+  }
+
+  pub async fn get_out_degree(&self) -> Result<Option<GetOutDegreeResponse>, ClusterClientError> {
+    let request = Request::new(GetOutDegreeRequest {});
+    let response = self.inner.lock().await.get_out_degree(request).await?;
+    Ok(Some(response.into_inner()))
+  }
+
+  pub async fn join<T: NodeInfo>(
+    &self, node: &T, cluster_key: &str,
+  ) -> Result<(), ClusterClientError> {
+    let request = Request::new(JoinRequest {
+      info: Some(proto_from_node(node)),
+      cluster_key: cluster_key.to_string(),
+    });
+    let response = self.inner.lock().await.join(request).await?;
+    if response.into_inner().accepted {
+      Ok(())
+    } else {
+      Err(ClusterClientError::Rejected("join".to_string()))
+    }
+  }
+
+  pub async fn leave(&self, node_id: &str) -> Result<(), ClusterClientError> {
+    let request = Request::new(LeaveRequest {
+      node_id: node_id.to_string(),
+    });
+    let response = self.inner.lock().await.leave(request).await?;
+    if response.into_inner().accepted {
+      Ok(())
+    } else {
+      Err(ClusterClientError::Rejected("leave".to_string()))
+    }
+  }
+
+  pub async fn list_resources(
+    &self, kind: ProtoResourceKind, selector: HashMap<String, String>, scope: String,
+  ) -> Result<Vec<ProtoResource>, ClusterClientError> {
+    let request = Request::new(ListResourcesRequest {
+      kind: kind as i32,
+      selector,
+      scope,
+    });
+    let response = self.inner.lock().await.list_resources(request).await?;
+    Ok(response.into_inner().resources)
+  }
+
+  pub async fn get_resource(
+    &self, kind: ProtoResourceKind, id: &str,
+  ) -> Result<Option<ProtoResource>, ClusterClientError> {
+    let request = Request::new(GetResourceRequest {
+      kind: kind as i32,
+      id: id.to_string(),
+    });
+    let response = self.inner.lock().await.get_resource(request).await?;
+    let resource = response.into_inner();
+    Ok(if resource.metadata.is_some() {
+      Some(resource)
+    } else {
+      None
+    })
+  }
+
+  pub async fn describe_resource(
+    &self, kind: ProtoResourceKind, id: &str,
+  ) -> Result<Option<ProtoResource>, ClusterClientError> {
+    let request = Request::new(DescribeResourceRequest {
+      kind: kind as i32,
+      id: id.to_string(),
+    });
+    let response = self.inner.lock().await.describe_resource(request).await?;
+    let resource = response.into_inner();
+    Ok(if resource.metadata.is_some() {
+      Some(resource)
+    } else {
+      None
+    })
   }
 }
 
@@ -258,6 +315,8 @@ fn proto_from_node<T: NodeInfo>(node: &T) -> ProtoNodeInfo {
     state: "active".to_string(),
     incarnation: 1,
     heartbeat: 0,
+    in_degree: Vec::new(),
+    out_degree: Vec::new(),
   }
 }
 
