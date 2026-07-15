@@ -33,17 +33,20 @@ async-trait   = "0.1"
 clap          = "4.6"
 directories   = "6.0"
 futures-util  = "0.3"
+hex           = "0.4"
 jiff          = "0.2"
 is-root       = "0.1"
 lancedb       = "0.31"
 lycoris-api     = { path = "crates/api" }
 lycoris-config  = { path = "crates/config" }
+lycoris-daemon  = { path = "crates/daemon" }
 lycoris-storage = { path = "crates/storage" }
 blake3        = "1.8"
 owo-colors    = "4.3"
 postcard      = { version = "1.0", features = ["use-std"] }
 prost         = "0.13"
 rcgen         = "0.13"
+ring          = "0.17"
 redb          = "3.0"
 rustls        = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2.2"

@@ -11,10 +11,6 @@ repository.workspace   = true
 rust-version.workspace = true
 version.workspace      = true
 
-[[bin]]
-name = "lycoris-daemon"
-path = "src/main.rs"
-
 [dependencies]
 blake3.workspace         = true
 clap                     = { workspace = true, features = ["derive"] }

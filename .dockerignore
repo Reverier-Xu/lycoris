@@ -1,6 +1,6 @@
 target
 !target/release/lycoris
-!target/release/lycoris-daemon
+!target/x86_64-unknown-linux-musl/release/lycoris
 .git
 cache
 deploy

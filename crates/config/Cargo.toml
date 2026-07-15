@@ -13,7 +13,9 @@ version.workspace      = true
 
 [dependencies]
 directories = { workspace = true }
+hex         = { workspace = true }
 is-root     = { workspace = true }
+ring        = { workspace = true }
 serde       = { workspace = true, features = ["derive"] }
 thiserror   = { workspace = true }
 toml        = { workspace = true }

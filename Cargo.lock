@@ -3780,6 +3780,7 @@ dependencies = [
  "clap",
  "lycoris-api",
  "lycoris-config",
+ "lycoris-daemon",
  "owo-colors",
  "rustls",
  "serde",
@@ -3811,7 +3812,9 @@ name = "lycoris-config"
 version = "0.1.0"
 dependencies = [
  "directories",
+ "hex",
  "is-root",
+ "ring",
  "serde",
  "tempfile",
  "thiserror",
