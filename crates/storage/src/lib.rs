@@ -10,7 +10,8 @@ pub mod workspace;
 use std::{path::Path, sync::Arc};
 
 pub use agent::{
-  AgentDomain, AgentStorageError, MemoryEntry, MemoryStorage, Session, SessionStorage,
+  AgentDomain, AgentStorageError, DEFAULT_EMBEDDING_DIM, MemoryEntry, MemoryStorage, Session,
+  SessionStorage,
 };
 pub use error::StorageError;
 pub use node::{

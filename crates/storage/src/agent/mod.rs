@@ -27,7 +27,7 @@ use crate::{
 };
 
 const SESSIONS: TableDefinition<&str, Bytes> = TableDefinition::new("agent_sessions");
-const DEFAULT_EMBEDDING_DIM: usize = 384;
+pub const DEFAULT_EMBEDDING_DIM: usize = 384;
 const MEMORY_TABLE: &str = "memories";
 
 /// A stored agent session.
