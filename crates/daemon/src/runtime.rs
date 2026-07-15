@@ -13,7 +13,7 @@ use tokio::{
 use crate::{
   cluster_sync::ClusterSync,
   membership::{MemberRegister, MembershipService, SwimConfig},
-  rpc::server::ClusterService,
+  rpc::{resource::ResourceMapper, server::ClusterService},
 };
 
 const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_secs(5);
@@ -79,7 +79,6 @@ pub async fn run_with_shutdown(
     &config.node.id,
   )?;
   let server_tls = tls_bundle.server_config();
-  let client_tls = tls_bundle.client_config();
 
   for peer in &config.cluster.bootstrap_peers {
     node.peers.seed(peer)?;
@@ -109,11 +108,12 @@ pub async fn run_with_shutdown(
     &tls_bundle,
   );
 
-  let cluster_service =
-    ClusterService::new(membership_service.clone(), storage.clone(), client_tls)
-      .with_cluster_sync(cluster_sync.clone())
-      .with_cluster_key(cluster_key)
-      .with_shutdown(shutdown_tx);
+  let mapper = ResourceMapper::new(storage.clone(), membership_service.clone());
+
+  let cluster_service = ClusterService::new(membership_service.clone(), storage.clone(), mapper)
+    .with_cluster_sync(cluster_sync.clone())
+    .with_cluster_key(cluster_key)
+    .with_shutdown(shutdown_tx);
 
   let mut background = tokio::task::JoinSet::new();
 
