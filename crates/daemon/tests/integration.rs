@@ -7,9 +7,9 @@ use std::{
 
 use lycoris_client::{ClusterClient, PeerClient};
 use lycoris_config::{ClusterConfig, DaemonConfig, NodeConfig, TlsConfig};
-use lycoris_core::SimpleNode;
+use lycoris_core::{SimpleNode, time::now_ms};
 use lycoris_proto::node::ResourceKind;
-use lycoris_storage::Storage;
+use lycoris_storage::{ResourceScope, SkillRecord, Storage, workspace::VersionedContentStore};
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
 use tempfile::TempDir;
 use tokio::time;
@@ -434,8 +434,8 @@ async fn failure_detector_marks_unresponsive_peer() {
   handles[1].abort();
 
   // Wait long enough for three consecutive SWIM probe timeouts
-  // (1s interval + 2s timeout per failure = ~7-9s).
-  time::sleep(Duration::from_secs(10)).await;
+  // (1s interval + 3s timeout per failure = ~11s).
+  time::sleep(Duration::from_secs(12)).await;
 
   let mut peer = PeerClient::connect(&node0_url, client_tls.clone())
     .await
@@ -450,4 +450,101 @@ async fn failure_detector_marks_unresponsive_peer() {
     registers[0].state, "suspected",
     "node-1 should be suspected after probes time out"
   );
+}
+
+#[tokio::test]
+async fn shared_skills_replicate_via_anti_entropy() {
+  let _ = lycoris_client::install_crypto_provider();
+
+  let (node_count, base_port) = (3, alloc_base_port());
+  let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
+  let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
+
+  {
+    let storage =
+      Storage::open(data_dirs[0].path().join("lycoris.redb")).expect("open node-0 storage");
+    let skill = SkillRecord {
+      id: "shared-skill".to_string(),
+      name: "shared skill".to_string(),
+      version: 1,
+      content_hash: "abc".to_string(),
+      scope: ResourceScope::ClusterShared,
+      source_node_id: Some("node-0".to_string()),
+      updated_at_ms: now_ms(),
+      metadata: HashMap::new(),
+    };
+    storage
+      .workspace()
+      .skills()
+      .upsert(&skill)
+      .expect("upsert shared skill");
+    storage
+      .workspace()
+      .skill_content()
+      .write("shared-skill", "skill content", "abc")
+      .expect("write shared skill content");
+  }
+
+  let configs: Vec<DaemonConfig> = (0..node_count)
+    .map(|i| {
+      let port = base_port + i as u16;
+      let peers = match i {
+        0 => vec![format!("https://127.0.0.1:{}", base_port + 1)],
+        1 => vec![
+          format!("https://127.0.0.1:{}", base_port),
+          format!("https://127.0.0.1:{}", base_port + 2),
+        ],
+        2 => vec![format!("https://127.0.0.1:{}", base_port + 1)],
+        _ => unreachable!(),
+      };
+      build_config(
+        &format!("node-{i}"),
+        port,
+        peers,
+        data_dirs[i].path().to_path_buf(),
+        &ca_cert_path,
+        &ca_key_path,
+        &cert_paths[i],
+        &key_paths[i],
+      )
+    })
+    .collect();
+
+  for config in configs.clone() {
+    tokio::spawn(async move {
+      if let Err(e) = lycoris_daemon::runtime::run(config, None).await {
+        eprintln!("runtime error: {e:?}");
+      }
+    });
+  }
+
+  time::sleep(Duration::from_millis(300)).await;
+
+  let node2_url = format!("https://127.0.0.1:{}", base_port + 2);
+  let client_tls = client_tls_config(&cert_paths[2], &key_paths[2], &ca_cert_path);
+  let mut client = ClusterClient::connect_with_tls(&node2_url, client_tls)
+    .await
+    .expect("failed to connect to node-2");
+
+  let start = std::time::Instant::now();
+  loop {
+    let resources = client
+      .list_resources(ResourceKind::Skill, HashMap::new(), String::new())
+      .await
+      .expect("list skills failed");
+    let found = resources.iter().any(|resource| {
+      resource
+        .metadata
+        .as_ref()
+        .map(|metadata| metadata.id == "shared-skill")
+        .unwrap_or(false)
+    });
+    if found {
+      break;
+    }
+    if start.elapsed() >= Duration::from_secs(10) {
+      panic!("timed out waiting for shared skill to replicate to node-2");
+    }
+    time::sleep(Duration::from_millis(200)).await;
+  }
 }

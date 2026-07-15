@@ -101,14 +101,15 @@ pub async fn run_with_shutdown(
     local_register,
   ));
 
+  let mapper = ResourceMapper::new(storage.clone(), membership_service.clone());
+
   let cluster_sync = ClusterSync::new(
     config.node.id.clone(),
     membership_service.clone(),
     node.clone(),
+    mapper.clone(),
     &tls_bundle,
   );
-
-  let mapper = ResourceMapper::new(storage.clone(), membership_service.clone());
 
   let cluster_service = ClusterService::new(membership_service.clone(), storage.clone(), mapper)
     .with_cluster_sync(cluster_sync.clone())

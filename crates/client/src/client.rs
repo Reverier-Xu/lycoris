@@ -10,8 +10,8 @@ use lycoris_proto::node::{
   GetResourceRequest, JoinRequest, LeaveRequest, ListResourcesRequest, NodeInfo as ProtoNodeInfo,
   ProbeRequest, ProbeResponse, PushNodeRequest, PushRegistersRequest, RegisterRequest,
   Resource as ProtoResource, ResourceKind as ProtoResourceKind, SetPrimaryEndpointRequest,
-  StateMessage, StateResponse, SyncNodesRequest, SyncNodesResponse, cluster_client::ClusterClient,
-  membership_client::MembershipClient, sync_client::SyncClient,
+  StateMessage, StateResponse, SyncNodesRequest, SyncNodesResponse, SyncResourcesRequest,
+  cluster_client::ClusterClient, membership_client::MembershipClient, sync_client::SyncClient,
 };
 use lycoris_tls::load_client_tls;
 use thiserror::Error;
@@ -157,6 +157,14 @@ impl SyncClientHandle {
     let request = Request::new(SyncNodesRequest { nodes });
     let response = self.inner.sync_nodes(request).await?;
     Ok(response.into_inner())
+  }
+
+  pub async fn sync_resources(
+    &mut self, resources: Vec<ProtoResource>,
+  ) -> Result<Vec<ProtoResource>, ClientError> {
+    let request = Request::new(SyncResourcesRequest { resources });
+    let response = self.inner.sync_resources(request).await?;
+    Ok(response.into_inner().resources)
   }
 
   pub async fn push_node(

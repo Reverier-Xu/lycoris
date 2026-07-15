@@ -170,6 +170,15 @@ service Membership {
 service Sync {
   rpc SyncNodes(SyncNodesRequest) returns (SyncNodesResponse);
   rpc PushNode(PushNodeRequest) returns (PushNodeResponse);
+  rpc SyncResources(SyncResourcesRequest) returns (SyncResourcesResponse);
+}
+
+message SyncResourcesRequest {
+  repeated Resource resources = 1;
+}
+
+message SyncResourcesResponse {
+  repeated Resource resources = 1;
 }
 
 message StateMessage {

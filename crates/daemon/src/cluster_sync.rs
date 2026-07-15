@@ -24,8 +24,11 @@ use tokio::{
 };
 use tonic::{Request, Response, Status, transport::ClientTlsConfig};
 
-use crate::membership::{
-  MembershipService, SwimAction, SwimMessage, merkle::Hash as MerkleHash, register_to_proto,
+use crate::{
+  membership::{
+    MembershipService, SwimAction, SwimMessage, merkle::Hash as MerkleHash, register_to_proto,
+  },
+  rpc::resource::ResourceMapper,
 };
 
 /// Orchestrates peer-to-peer membership synchronization.
@@ -38,6 +41,7 @@ pub struct ClusterSync {
   local_node_id: String,
   service: Arc<MembershipService>,
   storage: NodeDomain,
+  mapper: ResourceMapper,
   tls: ClientTlsConfig,
   clients: Arc<Mutex<HashMap<String, PeerClient>>>,
   seen_pushes: Arc<Mutex<HashSet<(String, u64)>>>,
@@ -50,7 +54,7 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(3);
 impl ClusterSync {
   pub fn new(
     local_node_id: String, service: Arc<MembershipService>, storage: NodeDomain,
-    tls_bundle: &TlsBundle,
+    mapper: ResourceMapper, tls_bundle: &TlsBundle,
   ) -> Self {
     let tls = ClientTlsConfig::new()
       .identity(tls_bundle.identity.clone())
@@ -60,6 +64,7 @@ impl ClusterSync {
       local_node_id,
       service,
       storage,
+      mapper,
       tls,
       clients: Arc::new(Mutex::new(HashMap::new())),
       seen_pushes: Arc::new(Mutex::new(HashSet::new())),
@@ -347,6 +352,7 @@ impl ClusterSync {
     }
 
     let _ = self.storage.peers.mark_seen(peer, now_ms());
+    let _ = self.sync_resources_with_peer(peer).await;
     Ok(())
   }
 
@@ -364,7 +370,65 @@ impl ClusterSync {
     }
 
     let _ = self.storage.peers.mark_seen(peer, now_ms());
+    let _ = self.sync_resources_with_peer(peer).await;
     Ok(())
+  }
+
+  /// Exchange cluster-shared skills and rules with a peer.
+  ///
+  /// This is a simple full-set anti-entropy: each side sends its shared
+  /// resources and merges the remote set by version. It runs opportunistically
+  /// after membership sync so it does not block convergence.
+  async fn sync_resources_with_peer(&self, peer: &str) -> Result<(), ClientError> {
+    let mut client = self.connect_peer(peer).await?;
+
+    let local_resources = match self.mapper.local_shared_resources() {
+      Ok(resources) => resources,
+      Err(error) => {
+        tracing::warn!(%peer, %error, "failed to read local shared resources");
+        return Ok(());
+      }
+    };
+
+    let remote_resources =
+      match timeout(RPC_TIMEOUT, client.sync.sync_resources(local_resources)).await {
+        Ok(Ok(resources)) => resources,
+        Ok(Err(error)) => {
+          tracing::warn!(%peer, %error, "resource sync rpc failed");
+          return Ok(());
+        }
+        Err(_) => {
+          tracing::warn!(%peer, "resource sync rpc timed out");
+          return Ok(());
+        }
+      };
+
+    for resource in remote_resources {
+      if let Err(error) = self.mapper.apply_resource(&resource).await {
+        tracing::warn!(%peer, %error, "failed to apply remote resource");
+      }
+    }
+
+    Ok(())
+  }
+
+  /// Handle an incoming `SyncResources` RPC: merge remote resources and return
+  /// the local shared set.
+  #[allow(clippy::result_large_err)]
+  pub async fn handle_sync_resources(
+    &self, request: Request<lycoris_proto::node::SyncResourcesRequest>,
+  ) -> Result<Response<lycoris_proto::node::SyncResourcesResponse>, Status> {
+    let remote_resources = request.into_inner().resources;
+    for resource in &remote_resources {
+      if let Err(error) = self.mapper.apply_resource(resource).await {
+        tracing::warn!(%error, "failed to apply resource during sync");
+      }
+    }
+
+    let local_resources = self.mapper.local_shared_resources().unwrap_or_default();
+    Ok(Response::new(lycoris_proto::node::SyncResourcesResponse {
+      resources: local_resources,
+    }))
   }
 
   async fn broadcast_push(&self, info: ProtoNodeInfo, origin: String, sequence: u64) {
@@ -675,6 +739,12 @@ impl Sync for ClusterSync {
     &self, request: Request<PushNodeRequest>,
   ) -> Result<Response<PushNodeResponse>, Status> {
     self.handle_push_node(request).await
+  }
+
+  async fn sync_resources(
+    &self, request: Request<lycoris_proto::node::SyncResourcesRequest>,
+  ) -> Result<Response<lycoris_proto::node::SyncResourcesResponse>, Status> {
+    self.handle_sync_resources(request).await
   }
 }
 

@@ -9,7 +9,7 @@ use lycoris_proto::node::{
 };
 use lycoris_storage::{
   MemoryEntry, ResourceScope, RuleRecord, Session, SkillRecord, Storage, WorkspaceRecord,
-  workspace::VersionedContentStore,
+  workspace::{VersionedContentStore, versioned::VersionedResource},
 };
 use tonic::Status;
 
@@ -375,5 +375,171 @@ pub fn parse_scope(raw: &str) -> Result<Option<ResourceScope>, Status> {
     _ => Err(Status::invalid_argument(format!(
       "invalid scope '{raw}'; expected 'shared' or 'local'"
     ))),
+  }
+}
+
+impl ResourceMapper {
+  /// Merge an incoming shared resource into local storage.
+  ///
+  /// Only `ClusterShared` skills and rules are accepted. The content body is
+  /// written to the filesystem-backed content store when present.
+  pub async fn apply_resource(&self, resource: &Resource) -> Result<(), Status> {
+    let metadata = resource
+      .metadata
+      .as_ref()
+      .ok_or_else(|| Status::invalid_argument("missing resource metadata"))?;
+    let kind = parse_kind(metadata.kind)?;
+    let scope = parse_scope(&metadata.scope)?;
+
+    if scope != Some(ResourceScope::ClusterShared) {
+      return Ok(());
+    }
+
+    match (kind, resource.body.as_ref()) {
+      (ResourceKind::Skill, Some(Body::Skill(body))) => {
+        let record = resource_to_skill(metadata, body)?;
+        let local = self
+          .storage
+          .workspace()
+          .skills()
+          .get(&record.id)
+          .map_err(|error| Status::internal(format!("failed to read skill: {error}")))?;
+        if !should_apply_resource(local.as_ref(), &record) {
+          return Ok(());
+        }
+        self
+          .storage
+          .workspace()
+          .skills()
+          .upsert(&record)
+          .map_err(|error| Status::internal(format!("failed to upsert skill: {error}")))?;
+        if should_write_content(local.as_ref(), body.content.is_empty(), &body.content_hash) {
+          self
+            .storage
+            .workspace()
+            .skill_content()
+            .write(&record.id, &body.content, &record.content_hash)
+            .map_err(|error| Status::internal(format!("failed to write skill content: {error}")))?;
+        }
+      }
+      (ResourceKind::Rule, Some(Body::Rule(body))) => {
+        let record = resource_to_rule(metadata, body)?;
+        let local = self
+          .storage
+          .workspace()
+          .rules()
+          .get(&record.id)
+          .map_err(|error| Status::internal(format!("failed to read rule: {error}")))?;
+        if !should_apply_resource(local.as_ref(), &record) {
+          return Ok(());
+        }
+        self
+          .storage
+          .workspace()
+          .rules()
+          .upsert(&record)
+          .map_err(|error| Status::internal(format!("failed to upsert rule: {error}")))?;
+        if should_write_content(local.as_ref(), body.content.is_empty(), &body.content_hash) {
+          self
+            .storage
+            .workspace()
+            .rule_content()
+            .write(&record.id, &body.content, &record.content_hash)
+            .map_err(|error| Status::internal(format!("failed to write rule content: {error}")))?;
+        }
+      }
+      _ => {}
+    }
+
+    Ok(())
+  }
+
+  /// Return all cluster-shared skills and rules as `Resource` protos.
+  pub fn local_shared_resources(&self) -> Result<Vec<Resource>, Status> {
+    let mut resources = Vec::new();
+
+    let skills = self
+      .storage
+      .workspace()
+      .skills()
+      .list_shared()
+      .map_err(|error| Status::internal(format!("failed to list shared skills: {error}")))?;
+    for skill in skills {
+      let content = self
+        .storage
+        .workspace()
+        .skill_content()
+        .read(&skill.id)
+        .map_err(|error| Status::internal(format!("failed to read skill content: {error}")))?;
+      resources.push(skill_to_resource(skill, content));
+    }
+
+    let rules = self
+      .storage
+      .workspace()
+      .rules()
+      .list_shared()
+      .map_err(|error| Status::internal(format!("failed to list shared rules: {error}")))?;
+    for rule in rules {
+      let content = self
+        .storage
+        .workspace()
+        .rule_content()
+        .read(&rule.id)
+        .map_err(|error| Status::internal(format!("failed to read rule content: {error}")))?;
+      resources.push(rule_to_resource(rule, content));
+    }
+
+    Ok(resources)
+  }
+}
+
+fn resource_to_skill(metadata: &ResourceMetadata, body: &SkillBody) -> Result<SkillRecord, Status> {
+  Ok(SkillRecord {
+    id: metadata.id.clone(),
+    name: metadata.name.clone(),
+    version: body.version,
+    content_hash: body.content_hash.clone(),
+    scope: ResourceScope::ClusterShared,
+    source_node_id: Some(metadata.source_node_id.clone()).filter(|s| !s.is_empty()),
+    updated_at_ms: metadata.updated_at_ms,
+    metadata: metadata.labels.clone(),
+  })
+}
+
+fn resource_to_rule(metadata: &ResourceMetadata, body: &RuleBody) -> Result<RuleRecord, Status> {
+  Ok(RuleRecord {
+    id: metadata.id.clone(),
+    name: metadata.name.clone(),
+    version: body.version,
+    content_hash: body.content_hash.clone(),
+    scope: ResourceScope::ClusterShared,
+    source_node_id: Some(metadata.source_node_id.clone()).filter(|s| !s.is_empty()),
+    updated_at_ms: metadata.updated_at_ms,
+    metadata: metadata.labels.clone(),
+  })
+}
+
+fn should_apply_resource(local: Option<&VersionedResource>, remote: &VersionedResource) -> bool {
+  match local {
+    None => true,
+    Some(local) => {
+      if remote.version != local.version {
+        return remote.version > local.version;
+      }
+      remote.updated_at_ms > local.updated_at_ms
+    }
+  }
+}
+
+fn should_write_content(
+  local: Option<&VersionedResource>, remote_content_empty: bool, remote_content_hash: &str,
+) -> bool {
+  if remote_content_empty {
+    return false;
+  }
+  match local {
+    None => true,
+    Some(local) => local.content_hash != remote_content_hash,
   }
 }
