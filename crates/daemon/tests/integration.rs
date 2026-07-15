@@ -7,7 +7,7 @@ use std::{
 
 use lycoris_client::{ClusterClient, PeerClient};
 use lycoris_config::{ClusterConfig, DaemonConfig, NodeConfig, TlsConfig};
-use lycoris_core::{SimpleNode, time::now_ms};
+use lycoris_core::{ClusterKey, SimpleNode, time::now_ms};
 use lycoris_proto::node::ResourceKind;
 use lycoris_storage::{ResourceScope, SkillRecord, Storage, workspace::VersionedContentStore};
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
@@ -93,6 +93,15 @@ fn client_tls_config(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn spawn_runtime(config: DaemonConfig, key: ClusterKey) {
+  tokio::spawn(async move {
+    if let Err(e) = lycoris_daemon::runtime::run(config, Some(key)).await {
+      eprintln!("runtime error: {e:?}");
+    }
+  });
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_config(
   id: &str, listen_port: u16, bootstrap_peers: Vec<String>, data_dir: PathBuf,
   ca_cert_path: &std::path::Path, ca_key_path: &std::path::Path, cert_path: &std::path::Path,
@@ -126,6 +135,9 @@ async fn registry_converges_across_three_node_chain() {
 
   let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
 
+  let cluster_key = ClusterKey::generate().expect("generate cluster key");
+  let key_hex = cluster_key.to_hex();
+
   let configs: Vec<DaemonConfig> = (0..node_count)
     .map(|i| {
       let port = base_port + i as u16;
@@ -152,11 +164,7 @@ async fn registry_converges_across_three_node_chain() {
     .collect();
 
   for config in configs.clone() {
-    tokio::spawn(async move {
-      if let Err(e) = lycoris_daemon::runtime::run(config, None).await {
-        eprintln!("runtime error: {e:?}");
-      }
-    });
+    spawn_runtime(config, cluster_key.clone());
   }
 
   // Wait for all nodes to start listening.
@@ -178,7 +186,10 @@ async fn registry_converges_across_three_node_chain() {
     HashMap::new(),
     HashMap::new(),
   );
-  client.register(&external).await.expect("register failed");
+  client
+    .register(&external, &key_hex)
+    .await
+    .expect("register failed");
 
   // Wait for push + anti-entropy to propagate through the chain.
   time::sleep(Duration::from_millis(10000)).await;
@@ -206,6 +217,9 @@ async fn primary_failure_falls_back_and_promotes() {
   let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
   let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
 
+  let cluster_key = ClusterKey::generate().expect("generate cluster key");
+  let key_hex = cluster_key.to_hex();
+
   let configs: Vec<DaemonConfig> = (0..node_count)
     .map(|i| {
       let port = base_port + i as u16;
@@ -230,16 +244,19 @@ async fn primary_failure_falls_back_and_promotes() {
     if i == 0 {
       let shutdown_rx = node0_shutdown_rx.clone();
       let shutdown_tx = node0_shutdown_tx.clone();
+      let key = cluster_key.clone();
       handles.push(tokio::spawn(async move {
         if let Err(e) =
-          lycoris_daemon::runtime::run_with_shutdown(config, shutdown_tx, shutdown_rx, None).await
+          lycoris_daemon::runtime::run_with_shutdown(config, shutdown_tx, shutdown_rx, Some(key))
+            .await
         {
           eprintln!("runtime error: {e:?}");
         }
       }));
     } else {
+      let key = cluster_key.clone();
       handles.push(tokio::spawn(async move {
-        if let Err(e) = lycoris_daemon::runtime::run(config, None).await {
+        if let Err(e) = lycoris_daemon::runtime::run(config, Some(key)).await {
           eprintln!("runtime error: {e:?}");
         }
       }));
@@ -270,7 +287,10 @@ async fn primary_failure_falls_back_and_promotes() {
     HashMap::new(),
     HashMap::new(),
   );
-  client.register(&external).await.expect("register failed");
+  client
+    .register(&external, &key_hex)
+    .await
+    .expect("register failed");
 
   time::sleep(Duration::from_millis(5500)).await;
 
@@ -309,6 +329,9 @@ async fn partition_merge_reconciles_bidirectional_membership() {
   let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
   let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
 
+  let cluster_key = ClusterKey::generate().expect("generate cluster key");
+  let key_hex = cluster_key.to_hex();
+
   let configs: Vec<DaemonConfig> = (0..node_count)
     .map(|i| {
       let port = base_port + i as u16;
@@ -327,11 +350,7 @@ async fn partition_merge_reconciles_bidirectional_membership() {
     .collect();
 
   for config in configs.clone() {
-    tokio::spawn(async move {
-      if let Err(e) = lycoris_daemon::runtime::run(config, None).await {
-        eprintln!("runtime error: {e:?}");
-      }
-    });
+    spawn_runtime(config, cluster_key.clone());
   }
 
   time::sleep(Duration::from_millis(300)).await;
@@ -353,7 +372,7 @@ async fn partition_merge_reconciles_bidirectional_membership() {
     HashMap::new(),
   );
   client
-    .register(&alpha)
+    .register(&alpha, &key_hex)
     .await
     .expect("register alpha failed");
 
@@ -369,7 +388,10 @@ async fn partition_merge_reconciles_bidirectional_membership() {
     HashMap::new(),
     HashMap::new(),
   );
-  client.register(&beta).await.expect("register beta failed");
+  client
+    .register(&beta, &key_hex)
+    .await
+    .expect("register beta failed");
 
   time::sleep(Duration::from_millis(1500)).await;
 
@@ -393,6 +415,8 @@ async fn failure_detector_marks_unresponsive_peer() {
   let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
   let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
 
+  let cluster_key = ClusterKey::generate().expect("generate cluster key");
+
   let configs: Vec<DaemonConfig> = (0..node_count)
     .map(|i| {
       let port = base_port + i as u16;
@@ -412,8 +436,9 @@ async fn failure_detector_marks_unresponsive_peer() {
 
   let mut handles = Vec::new();
   for config in configs.clone() {
+    let key = cluster_key.clone();
     handles.push(tokio::spawn(async move {
-      if let Err(e) = lycoris_daemon::runtime::run(config, None).await {
+      if let Err(e) = lycoris_daemon::runtime::run(config, Some(key)).await {
         eprintln!("runtime error: {e:?}");
       }
     }));
@@ -459,6 +484,8 @@ async fn shared_skills_replicate_via_anti_entropy() {
   let (node_count, base_port) = (3, alloc_base_port());
   let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
   let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
+
+  let cluster_key = ClusterKey::generate().expect("generate cluster key");
 
   {
     let storage =
@@ -511,11 +538,7 @@ async fn shared_skills_replicate_via_anti_entropy() {
     .collect();
 
   for config in configs.clone() {
-    tokio::spawn(async move {
-      if let Err(e) = lycoris_daemon::runtime::run(config, None).await {
-        eprintln!("runtime error: {e:?}");
-      }
-    });
+    spawn_runtime(config, cluster_key.clone());
   }
 
   time::sleep(Duration::from_millis(300)).await;

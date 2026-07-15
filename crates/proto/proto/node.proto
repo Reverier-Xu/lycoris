@@ -205,6 +205,7 @@ message StateResponse {
 
 message RegisterRequest {
   NodeInfo info = 1;
+  string cluster_key = 2;
 }
 
 message RegisterResponse {

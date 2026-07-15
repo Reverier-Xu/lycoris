@@ -55,9 +55,12 @@ impl ClusterClientHandle {
     }
   }
 
-  pub async fn register(&mut self, node: &dyn NodeInfo) -> Result<(), ClientError> {
+  pub async fn register(
+    &mut self, node: &dyn NodeInfo, cluster_key: &str,
+  ) -> Result<(), ClientError> {
     let request = Request::new(RegisterRequest {
       info: Some(proto_from_node(node)),
+      cluster_key: cluster_key.to_string(),
     });
     let response = self.inner.register(request).await?;
     accepted(response.into_inner().accepted, "register")

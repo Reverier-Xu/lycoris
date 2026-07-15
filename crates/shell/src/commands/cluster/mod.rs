@@ -77,8 +77,9 @@ pub async fn describe_resource(
 }
 
 pub async fn register(
-  client_config: &ClientConfig, id: String, address: String,
+  client_config: &ClientConfig, id: String, address: String, key: String,
 ) -> Result<(), ShellError> {
+  let key = key.trim().to_string();
   let mut client = connect_cluster(client_config).await?;
   let node = SimpleNode::new(
     id.clone(),
@@ -86,14 +87,17 @@ pub async fn register(
     std::collections::HashMap::new(),
     std::collections::HashMap::new(),
   );
-  client.register(&node).await.map_err(ShellError::Register)?;
+  client
+    .register(&node, &key)
+    .await
+    .map_err(ShellError::Register)?;
   println!("registered node {}", id.cyan());
   Ok(())
 }
 
 pub fn init_cluster(key: Option<String>) -> Result<(), ShellError> {
   let cluster_key = match key {
-    Some(hex) => ClusterKey::from_hex(&hex).map_err(ShellError::ClusterKey)?,
+    Some(hex) => ClusterKey::from_hex(hex.trim()).map_err(ShellError::ClusterKey)?,
     None => ClusterKey::generate().map_err(ShellError::ClusterKey)?,
   };
 
@@ -110,6 +114,7 @@ pub fn init_cluster(key: Option<String>) -> Result<(), ShellError> {
 pub async fn join_cluster(
   client_config: &ClientConfig, peer: String, key: String,
 ) -> Result<(), ShellError> {
+  let key = key.trim().to_string();
   let daemon_config = load_daemon_config()?;
   let tls = load_client_tls(
     &client_config.cert,

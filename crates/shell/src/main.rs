@@ -40,8 +40,8 @@ fn main() -> Result<(), ShellError> {
             ClusterCommand::Describe { resource, name } => {
               commands::cluster::describe_resource(&client_config, &resource, &name).await
             }
-            ClusterCommand::Register { id, address } => {
-              commands::cluster::register(&client_config, id, address).await
+            ClusterCommand::Register { id, address, key } => {
+              commands::cluster::register(&client_config, id, address, key).await
             }
             ClusterCommand::Join { peer, key } => {
               commands::cluster::join_cluster(&client_config, peer, key).await

@@ -89,8 +89,8 @@ impl Cluster for ClusterService {
   async fn register(
     &self, request: Request<RegisterRequest>,
   ) -> Result<Response<RegisterResponse>, Status> {
+    let request = request.into_inner();
     let info = request
-      .into_inner()
       .info
       .ok_or_else(|| Status::invalid_argument("missing node info"))?;
 
@@ -98,6 +98,23 @@ impl Cluster for ClusterService {
       return Ok(Response::new(RegisterResponse {
         accepted: false,
         reason: "node id must not be empty".to_string(),
+      }));
+    }
+
+    if let Some(expected) = &self.cluster_key {
+      let provided = ClusterKey::from_hex(&request.cluster_key)
+        .map_err(|_| Status::permission_denied("invalid cluster key format"))?;
+      if provided != *expected {
+        return Ok(Response::new(RegisterResponse {
+          accepted: false,
+          reason: "cluster key mismatch".to_string(),
+        }));
+      }
+    } else {
+      return Ok(Response::new(RegisterResponse {
+        accepted: false,
+        reason: "this node has not initialized a cluster key; run 'lycoris cluster init' first"
+          .to_string(),
       }));
     }
 

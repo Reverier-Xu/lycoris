@@ -67,6 +67,9 @@ pub enum ClusterCommand {
     /// Node address in host:port form.
     #[arg(long)]
     address: String,
+    /// Cluster shared key in hex.
+    #[arg(long)]
+    key: String,
   },
 
   /// Initialize this machine as a new cluster, generating or storing a

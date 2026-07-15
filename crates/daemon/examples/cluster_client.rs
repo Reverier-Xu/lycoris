@@ -22,9 +22,9 @@ async fn main() -> Result<(), ExampleError> {
   install_crypto_provider().map_err(ExampleError::CryptoProvider)?;
 
   let args: Vec<String> = std::env::args().collect();
-  if args.len() != 7 {
+  if args.len() != 8 {
     eprintln!(
-      "usage: {} <register-addr> <query-addr> <ca> <cert> <key> <expected-id>",
+      "usage: {} <register-addr> <query-addr> <ca> <cert> <key> <expected-id> <cluster-key>",
       args[0]
     );
     std::process::exit(1);
@@ -36,6 +36,7 @@ async fn main() -> Result<(), ExampleError> {
   let cert_path = &args[4];
   let key_path = &args[5];
   let expected_id = &args[6];
+  let cluster_key = &args[7];
 
   let tls = load_client_tls(cert_path, key_path, ca_path)?;
 
@@ -46,7 +47,7 @@ async fn main() -> Result<(), ExampleError> {
     HashMap::new(),
     HashMap::new(),
   );
-  client.register(&node).await?;
+  client.register(&node, cluster_key).await?;
   println!("registered {expected_id} via {register_addr}");
 
   tokio::time::sleep(Duration::from_secs(2)).await;

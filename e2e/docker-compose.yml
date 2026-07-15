@@ -9,6 +9,7 @@ services:
     volumes:
       - ./certs:/etc/lycoris/certs:ro
       - ./config/node-0.toml:/etc/lycoris/config.toml:ro
+      - ./keys/cluster.key:/root/.local/share/lycoris/cluster.key:ro
       - node-0-data:/var/lib/lycoris
     networks:
       - left
@@ -23,6 +24,7 @@ services:
     volumes:
       - ./certs:/etc/lycoris/certs:ro
       - ./config/node-1.toml:/etc/lycoris/config.toml:ro
+      - ./keys/cluster.key:/root/.local/share/lycoris/cluster.key:ro
       - node-1-data:/var/lib/lycoris
     networks:
       - left
@@ -38,6 +40,7 @@ services:
     volumes:
       - ./certs:/etc/lycoris/certs:ro
       - ./config/node-2.toml:/etc/lycoris/config.toml:ro
+      - ./keys/cluster.key:/root/.local/share/lycoris/cluster.key:ro
       - node-2-data:/var/lib/lycoris
     networks:
       - right
