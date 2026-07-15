@@ -60,7 +60,7 @@ strip_ansi() {
 wait_for_cluster() {
   local deadline=$((SECONDS + 60))
   while (( SECONDS < deadline )); do
-    if lycoris_in lycoris-e2e-node-0 cluster nodes 2>/dev/null | strip_ansi | grep -q 'node-2'; then
+    if lycoris_in lycoris-e2e-node-0 cluster get nodes 2>/dev/null | strip_ansi | grep -q 'node-2'; then
       return 0
     fi
     echo "  waiting for cluster convergence..."
@@ -72,13 +72,13 @@ wait_for_cluster() {
 
 node_count() {
   local container="$1"
-  lycoris_in "${container}" cluster nodes 2>/dev/null | strip_ansi | grep -c '^[^ ]' || true
+  lycoris_in "${container}" cluster get nodes 2>/dev/null | strip_ansi | grep -c '^[^ ]' || true
 }
 
 has_node() {
   local container="$1"
   local node_id="$2"
-  lycoris_in "${container}" cluster nodes 2>/dev/null | strip_ansi | grep -q "^${node_id}$"
+  lycoris_in "${container}" cluster get nodes 2>/dev/null | strip_ansi | grep -q "^${node_id}$"
 }
 
 register_node() {

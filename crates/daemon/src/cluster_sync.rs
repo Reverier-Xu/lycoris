@@ -1,5 +1,6 @@
 use std::{
-  collections::{HashMap, HashSet},
+  collections::{HashMap, HashSet, VecDeque},
+  hash::Hash,
   sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -31,6 +32,40 @@ use crate::{
   rpc::resource::ResourceMapper,
 };
 
+/// A fixed-capacity deduplication set with FIFO eviction.
+///
+/// Used for gossip caches so that long-lived clusters do not grow memory
+/// unbounded. Insert returns `true` when the key was newly added.
+#[derive(Debug, Clone)]
+struct DedupSet<T: Clone + Eq + Hash> {
+  inner: HashSet<T>,
+  order: VecDeque<T>,
+  capacity: usize,
+}
+
+impl<T: Clone + Eq + Hash> DedupSet<T> {
+  fn new(capacity: usize) -> Self {
+    Self {
+      inner: HashSet::with_capacity(capacity),
+      order: VecDeque::with_capacity(capacity),
+      capacity,
+    }
+  }
+
+  fn insert(&mut self, key: T) -> bool {
+    if !self.inner.insert(key.clone()) {
+      return false;
+    }
+    self.order.push_back(key);
+    if self.order.len() > self.capacity
+      && let Some(oldest) = self.order.pop_front()
+    {
+      self.inner.remove(&oldest);
+    }
+    true
+  }
+}
+
 /// Orchestrates peer-to-peer membership synchronization.
 ///
 /// `ClusterSync` combines backward-compatible `Sync` RPCs, the new `Membership`
@@ -44,12 +79,14 @@ pub struct ClusterSync {
   mapper: ResourceMapper,
   tls: ClientTlsConfig,
   clients: Arc<Mutex<HashMap<String, PeerClient>>>,
-  seen_pushes: Arc<Mutex<HashSet<(String, u64)>>>,
-  seen_states: Arc<Mutex<HashSet<(String, u64, u8)>>>,
+  seen_pushes: Arc<Mutex<DedupSet<(String, u64)>>>,
+  seen_states: Arc<Mutex<DedupSet<(String, u64, u8)>>>,
   sequence: Arc<AtomicU64>,
 }
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(3);
+const MAX_SEEN_PUSHES: usize = 10_000;
+const MAX_SEEN_STATES: usize = 10_000;
 
 impl ClusterSync {
   pub fn new(
@@ -67,8 +104,8 @@ impl ClusterSync {
       mapper,
       tls,
       clients: Arc::new(Mutex::new(HashMap::new())),
-      seen_pushes: Arc::new(Mutex::new(HashSet::new())),
-      seen_states: Arc::new(Mutex::new(HashSet::new())),
+      seen_pushes: Arc::new(Mutex::new(DedupSet::new(MAX_SEEN_PUSHES))),
+      seen_states: Arc::new(Mutex::new(DedupSet::new(MAX_SEEN_STATES))),
       sequence: Arc::new(AtomicU64::new(1)),
     }
   }

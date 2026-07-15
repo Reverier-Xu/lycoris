@@ -131,6 +131,12 @@ impl MemberRegister {
     self.updated_at_ms = now_ms;
   }
 
+  /// Mark the node as confirmed failed or departed.
+  pub fn offline(&mut self, now_ms: i64) {
+    self.state = MemberState::Offline;
+    self.updated_at_ms = now_ms;
+  }
+
   /// Rejoin with a higher incarnation.
   pub fn rejoin(&mut self, address: impl Into<String>, now_ms: i64) {
     self.incarnation = self.incarnation.saturating_add(1);

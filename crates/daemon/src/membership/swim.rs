@@ -11,6 +11,8 @@ pub struct SwimConfig {
   pub ping_timeout_ms: u64,
   /// Consecutive probe failures required before marking a peer suspected.
   pub failure_threshold: u32,
+  /// Milliseconds a peer may stay suspected before being marked offline.
+  pub suspect_timeout_ms: u64,
 }
 
 impl Default for SwimConfig {
@@ -19,6 +21,7 @@ impl Default for SwimConfig {
       ping_interval_ms: 1_000,
       ping_timeout_ms: 3_000,
       failure_threshold: 3,
+      suspect_timeout_ms: 30_000,
     }
   }
 }
@@ -147,6 +150,7 @@ impl Swim {
   pub fn tick(&mut self, now_ms: i64) -> Vec<SwimAction> {
     let now_u64 = u64::try_from(now_ms).unwrap_or(0);
     let mut actions = self.check_timeouts(now_u64, now_ms);
+    actions.extend(self.check_suspect_timeouts(now_ms));
     actions.extend(self.generate_probes(now_u64, now_ms));
     actions
   }
@@ -272,6 +276,29 @@ impl Swim {
     actions
   }
 
+  fn check_suspect_timeouts(&mut self, now_ms: i64) -> Vec<SwimAction> {
+    let timeout = i64::try_from(self.config.suspect_timeout_ms).unwrap_or(i64::MAX);
+    let expired: Vec<String> = self
+      .membership
+      .active()
+      .into_iter()
+      .filter(|register| {
+        register.node_id != self.local_node_id
+          && register.state == MemberState::Suspected
+          && now_ms.saturating_sub(register.updated_at_ms) >= timeout
+      })
+      .map(|register| register.node_id.clone())
+      .collect();
+
+    for node_id in expired {
+      if let Some(register) = self.membership.get_mut(&node_id) {
+        register.offline(now_ms);
+      }
+    }
+
+    Vec::new()
+  }
+
   fn mark_suspected(&mut self, target: &str, now_ms: i64) -> Vec<SwimAction> {
     let mut actions = Vec::new();
     let failures = self
@@ -370,6 +397,7 @@ mod tests {
       ping_interval_ms: 1_000,
       ping_timeout_ms: 2_000,
       failure_threshold: 1,
+      suspect_timeout_ms: 60_000,
     };
     let mut swim = Swim::new("local", config, local_register("local"));
     swim.membership.merge_register(&peer_register("peer"));
@@ -396,6 +424,7 @@ mod tests {
       ping_interval_ms: 1_000,
       ping_timeout_ms: 2_000,
       failure_threshold: 3,
+      suspect_timeout_ms: 60_000,
     };
     let mut swim = Swim::new("local", config, local_register("local"));
     swim.membership.merge_register(&peer_register("peer"));
