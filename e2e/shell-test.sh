@@ -181,12 +181,16 @@ if ! echo "${DESCRIBE_OUTPUT}" | grep -q "address:"; then
   echo "error: describe output missing address field" >&2
   exit 1
 fi
-if ! echo "${DESCRIBE_OUTPUT}" | grep -q "in-degree:"; then
-  echo "error: describe output missing in-degree field" >&2
+if ! echo "${DESCRIBE_OUTPUT}" | grep -q "state:"; then
+  echo "error: describe output missing state field" >&2
   exit 1
 fi
-if ! echo "${DESCRIBE_OUTPUT}" | grep -q "out-degree:"; then
-  echo "error: describe output missing out-degree field" >&2
+if ! echo "${DESCRIBE_OUTPUT}" | grep -q "incarnation:"; then
+  echo "error: describe output missing incarnation field" >&2
+  exit 1
+fi
+if ! echo "${DESCRIBE_OUTPUT}" | grep -q "heartbeat:"; then
+  echo "error: describe output missing heartbeat field" >&2
   exit 1
 fi
 echo "ok: describe output looks correct"
