@@ -35,7 +35,19 @@ impl DaemonConfig {
   pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
     let content = fs::read_to_string(path.as_ref())?;
     let config: DaemonConfig = toml::from_str(&content)?;
+    config.validate()?;
     Ok(config)
+  }
+
+  fn validate(&self) -> Result<(), ConfigError> {
+    validate_cluster_address(&self.node.address)?;
+    for (index, peer) in self.cluster.bootstrap_peers.iter().enumerate() {
+      validate_cluster_address(peer).map_err(|error| ConfigError::InvalidPeerAddress {
+        index,
+        source: error,
+      })?;
+    }
+    Ok(())
   }
 
   /// Write the daemon configuration to a TOML file, creating parent directories
@@ -83,6 +95,40 @@ pub enum ConfigError {
   Parse(#[from] toml::de::Error),
   #[error("serialize error: {0}")]
   Serialize(#[from] toml::ser::Error),
+  #[error("node address '{address}' must start with https://")]
+  InvalidNodeAddress { address: String },
+  #[error("bootstrap peer at index {index} is not a valid https:// address: {source}")]
+  InvalidPeerAddress {
+    index: usize,
+    #[source]
+    source: InvalidAddressError,
+  },
+}
+
+#[derive(Debug, Error)]
+#[error("'{0}' must start with https://")]
+pub struct InvalidAddressError(String);
+
+impl InvalidAddressError {
+  fn into_address(self) -> String {
+    self.0
+  }
+}
+
+fn validate_cluster_address(address: &str) -> Result<(), InvalidAddressError> {
+  if address.starts_with("https://") {
+    Ok(())
+  } else {
+    Err(InvalidAddressError(address.to_string()))
+  }
+}
+
+impl From<InvalidAddressError> for ConfigError {
+  fn from(error: InvalidAddressError) -> Self {
+    Self::InvalidNodeAddress {
+      address: error.into_address(),
+    }
+  }
 }
 
 #[cfg(test)]
@@ -96,7 +142,7 @@ mod tests {
 
             [node]
             id = "node-01"
-            address = "127.0.0.1:5001"
+            address = "https://127.0.0.1:5001"
 
             [cluster]
             listen_address = "0.0.0.0:5001"
@@ -121,7 +167,7 @@ mod tests {
 
             [node]
             id = ""
-            address = "127.0.0.1:5001"
+            address = "https://127.0.0.1:5001"
 
             [cluster]
             listen_address = "0.0.0.0:5001"
