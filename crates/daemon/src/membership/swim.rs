@@ -126,10 +126,7 @@ impl Swim {
       SwimMessage::Suspect {
         node_id,
         incarnation,
-      } => {
-        self.handle_suspect_state(&node_id, incarnation, now_ms);
-        Vec::new()
-      }
+      } => self.handle_suspect_state(&node_id, incarnation, now_ms),
       SwimMessage::Alive { register } => {
         self.handle_alive_state(&register, now_ms);
         Vec::new()
@@ -209,20 +206,29 @@ impl Swim {
     actions
   }
 
-  fn handle_suspect_state(&mut self, node_id: &str, incarnation: u64, now_ms: i64) {
+  fn handle_suspect_state(
+    &mut self, node_id: &str, incarnation: u64, now_ms: i64,
+  ) -> Vec<SwimAction> {
     if node_id == self.local_node_id {
-      return;
+      if let Some(register) = self.membership.get_mut(node_id) {
+        register.refute(now_ms);
+        return vec![SwimAction::Broadcast(SwimMessage::Alive {
+          register: register.clone(),
+        })];
+      }
+      return Vec::new();
     }
 
     if let Some(existing) = self.membership.get(node_id) {
       if existing.incarnation > incarnation {
-        return;
+        return Vec::new();
       }
       let mut register = existing.clone();
       register.incarnation = incarnation;
       register.suspect(now_ms);
       self.membership.merge_register(&register);
     }
+    Vec::new()
   }
 
   fn handle_alive_state(&mut self, register: &MemberRegister, now_ms: i64) {
@@ -442,6 +448,32 @@ mod tests {
     assert_eq!(
       swim.membership.get("peer").unwrap().state,
       MemberState::Suspected
+    );
+  }
+
+  #[test]
+  fn suspect_for_local_refutes_with_higher_incarnation() {
+    let mut swim = Swim::new("local", SwimConfig::default(), local_register("local"));
+    swim.membership.merge_register(&peer_register("peer"));
+
+    let actions = swim.on_message(
+      "peer",
+      SwimMessage::Suspect {
+        node_id: "local".to_string(),
+        incarnation: 1,
+      },
+      1_000,
+    );
+
+    let local = swim.membership.get("local").unwrap();
+    assert_eq!(local.state, MemberState::Active);
+    assert!(local.incarnation > 1);
+    assert!(
+      actions.iter().any(|a| matches!(
+        a,
+        SwimAction::Broadcast(SwimMessage::Alive { register }) if register.node_id == "local"
+      )),
+      "expected an Alive broadcast for the local node"
     );
   }
 

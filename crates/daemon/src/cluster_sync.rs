@@ -7,17 +7,15 @@ use std::{
   time::Duration,
 };
 
-use lycoris_api::{
-  ClusterClientError, PeerClient,
-  proto::{
-    LeaveMessage as ProtoLeave, NodeInfo as ProtoNodeInfo, ProbeRequest, ProbeResponse,
-    PushNodeRequest, PushNodeResponse, StateMessage, SuspectMessage as ProtoSuspect,
-    SyncNodesRequest, SyncNodesResponse,
-    membership_server::{Membership, MembershipServer},
-    sync_server::{Sync, SyncServer},
-  },
-};
+use lycoris_client::{ClientError, PeerClient};
 use lycoris_core::time::now_ms;
+use lycoris_proto::node::{
+  LeaveMessage as ProtoLeave, NodeInfo as ProtoNodeInfo, ProbeRequest, ProbeResponse,
+  PushNodeRequest, PushNodeResponse, StateMessage, SuspectMessage as ProtoSuspect,
+  SyncNodesRequest, SyncNodesResponse,
+  membership_server::{Membership, MembershipServer},
+  sync_server::{Sync, SyncServer},
+};
 use lycoris_storage::NodeDomain;
 use lycoris_tls::TlsBundle;
 use tokio::{
@@ -43,6 +41,7 @@ pub struct ClusterSync {
   tls: ClientTlsConfig,
   clients: Arc<Mutex<HashMap<String, PeerClient>>>,
   seen_pushes: Arc<Mutex<HashSet<(String, u64)>>>,
+  seen_states: Arc<Mutex<HashSet<(String, u64, u8)>>>,
   sequence: Arc<AtomicU64>,
 }
 
@@ -64,6 +63,7 @@ impl ClusterSync {
       tls,
       clients: Arc::new(Mutex::new(HashMap::new())),
       seen_pushes: Arc::new(Mutex::new(HashSet::new())),
+      seen_states: Arc::new(Mutex::new(HashSet::new())),
       sequence: Arc::new(AtomicU64::new(1)),
     }
   }
@@ -136,8 +136,13 @@ impl ClusterSync {
           incarnation,
         }) => {
           self
+            .seen_states
+            .lock()
+            .await
+            .insert((node_id.clone(), incarnation, 1));
+          self
             .broadcast_state_message(StateMessage {
-              payload: Some(lycoris_api::proto::state_message::Payload::Suspect(
+              payload: Some(lycoris_proto::node::state_message::Payload::Suspect(
                 ProtoSuspect {
                   node_id,
                   incarnation,
@@ -151,8 +156,13 @@ impl ClusterSync {
           incarnation,
         }) => {
           self
+            .seen_states
+            .lock()
+            .await
+            .insert((node_id.clone(), incarnation, 2));
+          self
             .broadcast_state_message(StateMessage {
-              payload: Some(lycoris_api::proto::state_message::Payload::Leave(
+              payload: Some(lycoris_proto::node::state_message::Payload::Leave(
                 ProtoLeave {
                   node_id,
                   incarnation,
@@ -264,7 +274,7 @@ impl ClusterSync {
 
   async fn sync_with_peer(
     &self, peer: &str, _snapshot: Vec<ProtoNodeInfo>,
-  ) -> Result<(), ClusterClientError> {
+  ) -> Result<(), ClientError> {
     let mut client = self.connect_peer(peer).await?;
     let local_address = self.local_address().await.unwrap_or_default();
 
@@ -275,14 +285,14 @@ impl ClusterSync {
           tracing::warn!(%peer, %error, "merkle root failed, falling back to full sync");
           return timeout(RPC_TIMEOUT, self.full_sync_with_peer(peer))
             .await
-            .map_err(|_| ClusterClientError::Timeout)
+            .map_err(|_| ClientError::Timeout)
             .and_then(|result| result);
         }
         Err(_) => {
           tracing::warn!(%peer, "merkle root timed out, falling back to full sync");
           return timeout(RPC_TIMEOUT, self.full_sync_with_peer(peer))
             .await
-            .map_err(|_| ClusterClientError::Timeout)
+            .map_err(|_| ClientError::Timeout)
             .and_then(|result| result);
         }
       };
@@ -340,7 +350,7 @@ impl ClusterSync {
     Ok(())
   }
 
-  async fn full_sync_with_peer(&self, peer: &str) -> Result<(), ClusterClientError> {
+  async fn full_sync_with_peer(&self, peer: &str) -> Result<(), ClientError> {
     let mut client = self.connect_peer(peer).await?;
     let snapshot = self.service.list_nodes(&HashMap::new()).await;
     let response = client.sync.sync_nodes(snapshot).await?;
@@ -387,7 +397,7 @@ impl ClusterSync {
 
   async fn push_to_peer(
     &self, peer: &str, info: ProtoNodeInfo, origin: String, sequence: u64,
-  ) -> Result<(), ClusterClientError> {
+  ) -> Result<(), ClientError> {
     let mut client = self.connect_peer(peer).await?;
     client.sync.push_node(info, origin, sequence).await?;
     Ok(())
@@ -417,7 +427,7 @@ impl ClusterSync {
 
   async fn send_state_message_to_peer(
     &self, peer: &str, message: StateMessage,
-  ) -> Result<(), ClusterClientError> {
+  ) -> Result<(), ClientError> {
     let mut client = self.connect_peer(peer).await?;
     client.membership.state(message).await?;
     Ok(())
@@ -447,7 +457,7 @@ impl ClusterSync {
     self.service.member_address(&self.local_node_id).await
   }
 
-  async fn connect_peer(&self, address: &str) -> Result<PeerClient, ClusterClientError> {
+  async fn connect_peer(&self, address: &str) -> Result<PeerClient, ClientError> {
     {
       let clients = self.clients.lock().await;
       if let Some(client) = clients.get(address) {
@@ -459,7 +469,7 @@ impl ClusterSync {
     let client = match timeout(Duration::from_secs(3), connect).await {
       Ok(Ok(client)) => client,
       Ok(Err(error)) => return Err(error),
-      Err(_) => return Err(ClusterClientError::Timeout),
+      Err(_) => return Err(ClientError::Timeout),
     };
 
     let mut clients = self.clients.lock().await;
@@ -559,14 +569,39 @@ impl ClusterSync {
   #[allow(clippy::result_large_err)]
   pub async fn handle_state_message(
     &self, request: Request<StateMessage>,
-  ) -> Result<Response<lycoris_api::proto::StateResponse>, Status> {
+  ) -> Result<Response<lycoris_proto::node::StateResponse>, Status> {
     let from = self.local_node_id.clone();
     let message = request.into_inner();
+
+    // Deduplicate gossiped Suspect/Leave/Alive state messages to prevent them
+    // from cycling around the graph forever.
+    let state_key = match &message.payload {
+      Some(lycoris_proto::node::state_message::Payload::Alive(info)) => {
+        Some((info.id.clone(), info.incarnation, 0u8))
+      }
+      Some(lycoris_proto::node::state_message::Payload::Suspect(suspect)) => {
+        Some((suspect.node_id.clone(), suspect.incarnation, 1u8))
+      }
+      Some(lycoris_proto::node::state_message::Payload::Leave(leave)) => {
+        Some((leave.node_id.clone(), leave.incarnation, 2u8))
+      }
+      None => None,
+    };
+
+    if let Some(key) = state_key {
+      let already_seen = !self.seen_states.lock().await.insert(key);
+      if already_seen {
+        return Ok(Response::new(lycoris_proto::node::StateResponse {
+          accepted: true,
+        }));
+      }
+    }
+
     let actions = match message.payload {
-      Some(lycoris_api::proto::state_message::Payload::Alive(info)) => {
+      Some(lycoris_proto::node::state_message::Payload::Alive(info)) => {
         self.service.register(&info).await
       }
-      Some(lycoris_api::proto::state_message::Payload::Suspect(suspect)) => {
+      Some(lycoris_proto::node::state_message::Payload::Suspect(suspect)) => {
         self
           .service
           .on_probe(
@@ -578,7 +613,7 @@ impl ClusterSync {
           )
           .await
       }
-      Some(lycoris_api::proto::state_message::Payload::Leave(leave)) => {
+      Some(lycoris_proto::node::state_message::Payload::Leave(leave)) => {
         self
           .service
           .on_probe(
@@ -596,7 +631,7 @@ impl ClusterSync {
     tokio::spawn(async move {
       sync.dispatch(actions).await;
     });
-    Ok(Response::new(lycoris_api::proto::StateResponse {
+    Ok(Response::new(lycoris_proto::node::StateResponse {
       accepted: true,
     }))
   }
@@ -647,36 +682,36 @@ impl Sync for ClusterSync {
 #[allow(clippy::result_large_err)]
 impl Membership for ClusterSync {
   async fn merkle_root(
-    &self, _request: Request<lycoris_api::proto::MerkleRootRequest>,
-  ) -> Result<Response<lycoris_api::proto::MerkleRootResponse>, Status> {
+    &self, _request: Request<lycoris_proto::node::MerkleRootRequest>,
+  ) -> Result<Response<lycoris_proto::node::MerkleRootResponse>, Status> {
     let root = self.service.merkle_root().await;
-    Ok(Response::new(lycoris_api::proto::MerkleRootResponse {
+    Ok(Response::new(lycoris_proto::node::MerkleRootResponse {
       root_hash: root.root_hash,
       leaf_hashes: root
         .leaf_hashes
         .into_iter()
-        .map(|(node_id, hash)| lycoris_api::proto::LeafHash { node_id, hash })
+        .map(|(node_id, hash)| lycoris_proto::node::LeafHash { node_id, hash })
         .collect(),
     }))
   }
 
   async fn fetch_registers(
-    &self, request: Request<lycoris_api::proto::FetchRegistersRequest>,
-  ) -> Result<Response<lycoris_api::proto::FetchRegistersResponse>, Status> {
+    &self, request: Request<lycoris_proto::node::FetchRegistersRequest>,
+  ) -> Result<Response<lycoris_proto::node::FetchRegistersResponse>, Status> {
     let inner = request.into_inner();
     let node_ids: Vec<&str> = inner.node_ids.iter().map(String::as_str).collect();
     let registers = self.service.fetch_registers(&node_ids).await;
-    Ok(Response::new(lycoris_api::proto::FetchRegistersResponse {
+    Ok(Response::new(lycoris_proto::node::FetchRegistersResponse {
       registers,
     }))
   }
 
   async fn push_registers(
-    &self, request: Request<lycoris_api::proto::PushRegistersRequest>,
-  ) -> Result<Response<lycoris_api::proto::FetchRegistersResponse>, Status> {
+    &self, request: Request<lycoris_proto::node::PushRegistersRequest>,
+  ) -> Result<Response<lycoris_proto::node::FetchRegistersResponse>, Status> {
     let registers = request.into_inner().registers;
     let _ = self.service.sync_nodes(registers).await;
-    Ok(Response::new(lycoris_api::proto::FetchRegistersResponse {
+    Ok(Response::new(lycoris_proto::node::FetchRegistersResponse {
       registers: Vec::new(),
     }))
   }
@@ -687,7 +722,7 @@ impl Membership for ClusterSync {
 
   async fn state(
     &self, request: Request<StateMessage>,
-  ) -> Result<Response<lycoris_api::proto::StateResponse>, Status> {
+  ) -> Result<Response<lycoris_proto::node::StateResponse>, Status> {
     self.handle_state_message(request).await
   }
 }

@@ -139,6 +139,17 @@ impl MemberRegister {
     self.state = MemberState::Active;
     self.updated_at_ms = now_ms;
   }
+
+  /// Refute a suspect rumor about ourselves by bumping incarnation.
+  ///
+  /// This produces a strictly dominant register that overrides the
+  /// suspicion and can be gossiped back as an `Alive` message.
+  pub fn refute(&mut self, now_ms: i64) {
+    self.incarnation = self.incarnation.saturating_add(1);
+    self.heartbeat = self.heartbeat.saturating_add(1);
+    self.state = MemberState::Active;
+    self.updated_at_ms = now_ms;
+  }
 }
 
 /// The cluster membership CRDT.
