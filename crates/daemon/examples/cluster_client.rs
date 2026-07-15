@@ -1,8 +1,9 @@
 use std::{collections::HashMap, time::Duration};
 
-use lycoris_api::{ClusterRpcClient, tls::load_client_tls};
+use lycoris_api::ClusterRpcClient;
 use lycoris_config::NodeConfig;
 use lycoris_storage::{LocalNode, Storage};
+use lycoris_tls::load_client_tls;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -41,7 +42,7 @@ async fn main() -> Result<(), ExampleError> {
 
   let tls = load_client_tls(cert_path, key_path, ca_path)?;
 
-  let client = ClusterRpcClient::connect(register_addr, tls.clone()).await?;
+  let mut client = ClusterRpcClient::connect_with_tls(register_addr, tls.clone()).await?;
   let storage_dir = std::env::temp_dir().join(format!("lycoris-client-{expected_id}"));
   std::fs::create_dir_all(&storage_dir)?;
   let storage = Storage::open(storage_dir.join("client.redb"))?;
@@ -51,13 +52,13 @@ async fn main() -> Result<(), ExampleError> {
       address: "127.0.0.1:59999".to_string(),
     },
     storage.node().local,
-  );
+  )?;
   client.register(&node).await?;
   println!("registered {expected_id} via {register_addr}");
 
   tokio::time::sleep(Duration::from_secs(2)).await;
 
-  let client = ClusterRpcClient::connect(query_addr, tls).await?;
+  let mut client = ClusterRpcClient::connect_with_tls(query_addr, tls).await?;
   let resources = client
     .list_resources(
       lycoris_api::proto::ResourceKind::Node,

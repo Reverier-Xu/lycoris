@@ -12,16 +12,9 @@ rust-version.workspace = true
 version.workspace      = true
 
 [dependencies]
-lycoris-config.workspace = true
-prost.workspace          = true
-rustls.workspace         = true
-thiserror.workspace      = true
-tokio.workspace          = true
-tokio-rustls.workspace   = true
-tonic.workspace          = true
-
-[build-dependencies]
-tonic-build.workspace = true
+lycoris-client = { workspace = true }
+lycoris-proto  = { workspace = true }
+lycoris-tls    = { workspace = true }
 
 [lints]
 workspace = true

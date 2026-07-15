@@ -20,7 +20,7 @@ fn alloc_base_port() -> u16 {
   NEXT_BASE_PORT.fetch_add(100, Ordering::SeqCst)
 }
 
-async fn wait_for_node(client: &ClusterRpcClient, node_id: &str, timeout: Duration) {
+async fn wait_for_node(client: &mut ClusterRpcClient, node_id: &str, timeout: Duration) {
   let start = std::time::Instant::now();
   loop {
     let ids = list_node_ids(client).await;
@@ -34,7 +34,7 @@ async fn wait_for_node(client: &ClusterRpcClient, node_id: &str, timeout: Durati
   }
 }
 
-async fn list_node_ids(client: &ClusterRpcClient) -> Vec<String> {
+async fn list_node_ids(client: &mut ClusterRpcClient) -> Vec<String> {
   client
     .list_resources(ResourceKind::Node, HashMap::new(), String::new())
     .await
@@ -87,7 +87,7 @@ fn generate_test_certs(
 fn client_tls_config(
   cert_path: &std::path::Path, key_path: &std::path::Path, ca_path: &std::path::Path,
 ) -> tonic::transport::ClientTlsConfig {
-  lycoris_api::tls::load_client_tls(cert_path, key_path, ca_path).unwrap()
+  lycoris_tls::load_client_tls(cert_path, key_path, ca_path).unwrap()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -163,7 +163,7 @@ async fn registry_converges_across_three_node_chain() {
   // Register an external node through node-0.
   let client_tls = client_tls_config(&cert_paths[0], &key_paths[0], &ca_cert_path);
   let node0_url = format!("https://127.0.0.1:{base_port}");
-  let client = ClusterRpcClient::connect(&node0_url, client_tls)
+  let mut client = ClusterRpcClient::connect_with_tls(&node0_url, client_tls)
     .await
     .expect("failed to connect to node-0");
 
@@ -176,7 +176,8 @@ async fn registry_converges_across_three_node_chain() {
       address: format!("127.0.0.1:{}", base_port + 99),
     },
     external_storage.node().local,
-  );
+  )
+  .unwrap();
   client.register(&external).await.expect("register failed");
 
   // Wait for push + anti-entropy to propagate through the chain.
@@ -185,11 +186,11 @@ async fn registry_converges_across_three_node_chain() {
   // Query node-2 (the far end of the chain) and verify it knows external-node.
   let client_tls = client_tls_config(&cert_paths[2], &key_paths[2], &ca_cert_path);
   let node2_url = format!("https://127.0.0.1:{}", base_port + 2);
-  let client = ClusterRpcClient::connect(&node2_url, client_tls)
+  let mut client = ClusterRpcClient::connect_with_tls(&node2_url, client_tls)
     .await
     .expect("failed to connect to node-2");
 
-  let ids = list_node_ids(&client).await;
+  let ids = list_node_ids(&mut client).await;
 
   assert!(ids.contains(&"external-node".to_string()));
   assert!(ids.contains(&"node-0".to_string()));
@@ -250,7 +251,7 @@ async fn primary_failure_falls_back_and_promotes() {
   // Point node-0's primary at an unreachable address.
   let node0_url = format!("https://127.0.0.1:{base_port}");
   let client_tls = client_tls_config(&cert_paths[0], &key_paths[0], &ca_cert_path);
-  let client = ClusterRpcClient::connect(&node0_url, client_tls.clone())
+  let mut client = ClusterRpcClient::connect_with_tls(&node0_url, client_tls.clone())
     .await
     .expect("failed to connect to node-0");
   client
@@ -269,17 +270,18 @@ async fn primary_failure_falls_back_and_promotes() {
       address: format!("127.0.0.1:{}", base_port + 99),
     },
     external_storage.node().local,
-  );
+  )
+  .unwrap();
   client.register(&external).await.expect("register failed");
 
   time::sleep(Duration::from_millis(5500)).await;
 
   // Verify node-1 received the external node via fallback sync.
   let node1_url = format!("https://127.0.0.1:{}", base_port + 1);
-  let client = ClusterRpcClient::connect(&node1_url, client_tls)
+  let mut client = ClusterRpcClient::connect_with_tls(&node1_url, client_tls)
     .await
     .expect("failed to connect to node-1");
-  let ids = list_node_ids(&client).await;
+  let ids = list_node_ids(&mut client).await;
   assert!(ids.contains(&"fallback-external-node".to_string()));
 
   // Stop node-0 so that its redb database is closed and can be reopened.
@@ -339,7 +341,7 @@ async fn partition_merge_reconciles_bidirectional_membership() {
   let node0_url = format!("https://127.0.0.1:{base_port}");
   let node1_url = format!("https://127.0.0.1:{}", base_port + 1);
   let client_tls = client_tls_config(&cert_paths[0], &key_paths[0], &ca_cert_path);
-  let client = ClusterRpcClient::connect(&node0_url, client_tls.clone())
+  let mut client = ClusterRpcClient::connect_with_tls(&node0_url, client_tls.clone())
     .await
     .expect("failed to connect to node-0");
 
@@ -352,13 +354,14 @@ async fn partition_merge_reconciles_bidirectional_membership() {
       address: format!("127.0.0.1:{}", base_port + 98),
     },
     alpha_storage.node().local,
-  );
+  )
+  .unwrap();
   client
     .register(&alpha)
     .await
     .expect("register alpha failed");
 
-  let client = ClusterRpcClient::connect(&node1_url, client_tls.clone())
+  let mut client = ClusterRpcClient::connect_with_tls(&node1_url, client_tls.clone())
     .await
     .expect("failed to connect to node-1");
 
@@ -370,16 +373,17 @@ async fn partition_merge_reconciles_bidirectional_membership() {
       address: format!("127.0.0.1:{}", base_port + 97),
     },
     beta_storage.node().local,
-  );
+  )
+  .unwrap();
   client.register(&beta).await.expect("register beta failed");
 
   time::sleep(Duration::from_millis(1500)).await;
 
   for url in [&node0_url, &node1_url] {
-    let client = ClusterRpcClient::connect(url, client_tls.clone())
+    let mut client = ClusterRpcClient::connect_with_tls(url, client_tls.clone())
       .await
       .expect("failed to connect");
-    let ids = list_node_ids(&client).await;
+    let ids = list_node_ids(&mut client).await;
     assert!(ids.contains(&"alpha".to_string()));
     assert!(ids.contains(&"beta".to_string()));
     assert!(ids.contains(&"node-0".to_string()));
@@ -426,11 +430,11 @@ async fn failure_detector_marks_unresponsive_peer() {
   let node0_url = format!("https://127.0.0.1:{base_port}");
   let _node1_url = format!("https://127.0.0.1:{}", base_port + 1);
   let client_tls = client_tls_config(&cert_paths[0], &key_paths[0], &ca_cert_path);
-  let client = ClusterRpcClient::connect(&node0_url, client_tls.clone())
+  let mut client = ClusterRpcClient::connect_with_tls(&node0_url, client_tls.clone())
     .await
     .expect("failed to connect to node-0");
 
-  wait_for_node(&client, "node-1", Duration::from_millis(2000)).await;
+  wait_for_node(&mut client, "node-1", Duration::from_millis(2000)).await;
 
   // Stop node-1 so that node-0's SWIM probes begin to fail.
   handles[1].abort();
@@ -439,7 +443,7 @@ async fn failure_detector_marks_unresponsive_peer() {
   // (1s interval + 2s timeout per failure = ~7-9s).
   time::sleep(Duration::from_secs(10)).await;
 
-  let peer = PeerClient::connect(&node0_url, client_tls.clone())
+  let mut peer = PeerClient::connect(&node0_url, client_tls.clone())
     .await
     .expect("failed to connect membership client");
   let registers = peer

@@ -14,7 +14,7 @@ use lycoris_api::{
     resource::Body,
   },
 };
-use lycoris_config::ClusterKey;
+use lycoris_core::ClusterKey;
 use lycoris_storage::{
   MemoryEntry, ResourceScope, RuleRecord, Session, SkillRecord, Storage, WorkspaceRecord,
 };
@@ -107,8 +107,8 @@ impl ClusterService {
         continue;
       }
 
-      match ClusterRpcClient::connect(&node.address, self.tls.clone()).await {
-        Ok(client) => match client.get_out_degree().await {
+      match ClusterRpcClient::connect_with_tls(&node.address, self.tls.clone()).await {
+        Ok(mut client) => match client.get_out_degree().await {
           Ok(Some(response)) if !response.node_id.is_empty() => {
             out_degrees
               .entry(node.id.clone())
@@ -661,7 +661,7 @@ impl Cluster for ClusterService {
     if node_id != local_id {
       let actions = self
         .service
-        .leave(&node_id, lycoris_config::time::now_ms())
+        .leave(&node_id, lycoris_core::time::now_ms())
         .await;
       if let Some(cluster_sync) = &self.cluster_sync {
         cluster_sync.dispatch(actions).await;
@@ -674,7 +674,7 @@ impl Cluster for ClusterService {
 
     let actions = self
       .service
-      .leave(&local_id, lycoris_config::time::now_ms())
+      .leave(&local_id, lycoris_core::time::now_ms())
       .await;
     if let Some(cluster_sync) = &self.cluster_sync {
       cluster_sync.dispatch(actions).await;

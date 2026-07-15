@@ -34,9 +34,9 @@ mod platform {
     let home = home_dir()?;
     let systemd_dir = home.join(".config/systemd/user");
     let config_dir =
-      lycoris_config::paths::user_config_dir().unwrap_or_else(|| home.join(".config/lycoris"));
+      lycoris_core::paths::user_config_dir().unwrap_or_else(|| home.join(".config/lycoris"));
     let data_dir =
-      lycoris_config::paths::user_data_dir().unwrap_or_else(|| home.join(".local/share/lycoris"));
+      lycoris_core::paths::user_data_dir().unwrap_or_else(|| home.join(".local/share/lycoris"));
 
     install_common(bin_dir, &systemd_dir, &config_dir, &data_dir)?;
     reload_and_enable_user_systemd()?;
@@ -262,9 +262,9 @@ mod platform {
   pub fn install(bin_dir: &Path) -> Result<(), ShellError> {
     let home = home_dir()?;
     let launchd_dir = home.join("Library/LaunchAgents");
-    let config_dir = lycoris_config::paths::user_config_dir()
+    let config_dir = lycoris_core::paths::user_config_dir()
       .unwrap_or_else(|| home.join("Library/Application Support/lycoris"));
-    let data_dir = lycoris_config::paths::user_data_dir()
+    let data_dir = lycoris_core::paths::user_data_dir()
       .unwrap_or_else(|| home.join("Library/Application Support/lycoris"));
 
     install_common(bin_dir, &launchd_dir, &config_dir, &data_dir)?;
@@ -403,9 +403,9 @@ mod platform {
       )));
     }
 
-    let config_dir = lycoris_config::paths::user_config_dir()
+    let config_dir = lycoris_core::paths::user_config_dir()
       .ok_or_else(|| ShellError::setup("failed to determine user config directory"))?;
-    let data_dir = lycoris_config::paths::user_data_dir()
+    let data_dir = lycoris_core::paths::user_data_dir()
       .ok_or_else(|| ShellError::setup("failed to determine user data directory"))?;
 
     fs::create_dir_all(&config_dir).map_err(|error| {

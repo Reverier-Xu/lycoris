@@ -1,8 +1,9 @@
 use std::path::Path;
 
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+use tonic::transport::{Certificate, Identity};
 
-use crate::tls::{TlsBundle, TlsError};
+use crate::{TlsBundle, TlsError};
 
 const CA_SUBJECT: &str = "lycoris-cluster-ca";
 
@@ -100,8 +101,8 @@ fn bundle_from_strings(
   cert_pem: String, key_pem: String, ca_pem: String,
 ) -> Result<TlsBundle, TlsError> {
   Ok(TlsBundle {
-    identity: tonic::transport::Identity::from_pem(cert_pem, key_pem),
-    ca: tonic::transport::Certificate::from_pem(ca_pem),
+    identity: Identity::from_pem(cert_pem, key_pem),
+    ca: Certificate::from_pem(ca_pem),
   })
 }
 

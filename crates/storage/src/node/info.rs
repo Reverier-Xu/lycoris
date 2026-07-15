@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
-use lycoris_config::{NodeConfig, NodeInfo};
+use lycoris_config::NodeConfig;
+use lycoris_core::NodeInfo;
 
 use crate::node::local::LocalStorage;
 
@@ -9,16 +10,20 @@ use crate::node::local::LocalStorage;
 pub struct LocalNode {
   id: String,
   address: String,
-  local: LocalStorage,
+  labels: HashMap<String, String>,
+  annotations: HashMap<String, String>,
 }
 
 impl LocalNode {
-  pub fn from_config(config: &NodeConfig, local: LocalStorage) -> Self {
-    Self {
+  pub fn from_config(
+    config: &NodeConfig, local: LocalStorage,
+  ) -> Result<Self, crate::StorageError> {
+    Ok(Self {
       id: config.id.clone(),
       address: config.address.clone(),
-      local,
-    }
+      labels: local.labels()?,
+      annotations: local.annotations()?,
+    })
   }
 }
 
@@ -31,11 +36,11 @@ impl NodeInfo for LocalNode {
     &self.address
   }
 
-  fn labels(&self) -> HashMap<String, String> {
-    self.local.labels().unwrap_or_default()
+  fn labels(&self) -> &HashMap<String, String> {
+    &self.labels
   }
 
-  fn annotations(&self) -> HashMap<String, String> {
-    self.local.annotations().unwrap_or_default()
+  fn annotations(&self) -> &HashMap<String, String> {
+    &self.annotations
   }
 }

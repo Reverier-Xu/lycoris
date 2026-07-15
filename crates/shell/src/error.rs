@@ -53,7 +53,7 @@ pub enum ShellError {
   #[error("failed to set primary endpoint: {0}")]
   SetPrimary(lycoris_api::ClusterClientError),
   #[error("cluster key error: {0}")]
-  ClusterKey(lycoris_config::ClusterKeyError),
+  ClusterKey(lycoris_core::ClusterKeyError),
   #[error("no cluster key found; run 'lycoris cluster init' first")]
   ClusterKeyNotFound,
   #[error("invalid selector '{0}', expected key=value")]
@@ -70,8 +70,8 @@ impl ShellError {
   }
 }
 
-impl From<lycoris_config::ClusterKeyError> for ShellError {
-  fn from(error: lycoris_config::ClusterKeyError) -> Self {
+impl From<lycoris_core::ClusterKeyError> for ShellError {
+  fn from(error: lycoris_core::ClusterKeyError) -> Self {
     Self::ClusterKey(error)
   }
 }

@@ -64,7 +64,7 @@ fn main() -> Result<(), ShellError> {
 fn run_daemon(config: Option<PathBuf>) -> Result<(), ShellError> {
   let runtime = tokio::runtime::Runtime::new().map_err(ShellError::RuntimeCreation)?;
   let config_path = config
-    .or_else(lycoris_config::paths::default_daemon_config_path)
+    .or_else(lycoris_core::paths::default_daemon_config_path)
     .ok_or(ShellError::ConfigNotFound)?;
   let daemon_config =
     lycoris_config::DaemonConfig::from_file(&config_path).map_err(ShellError::DaemonConfigLoad)?;

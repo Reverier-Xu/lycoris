@@ -18,6 +18,7 @@ async-trait    = { workspace = true }
 futures-util   = { workspace = true }
 jiff           = { workspace = true }
 lycoris-config = { workspace = true }
+lycoris-core   = { workspace = true }
 lancedb        = { workspace = true }
 postcard       = { workspace = true }
 redb           = { workspace = true }

@@ -1,21 +1,19 @@
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
-use lycoris_config::{
-  ClientConfig, ClusterKey, DaemonConfig, default_cluster_key_path, paths, time::now_ms,
-};
+use lycoris_config::{ClientConfig, DaemonConfig};
+use lycoris_core::{ClusterKey, default_cluster_key_path, paths, time::now_ms};
 use lycoris_storage::{Storage, StorageError};
+use lycoris_tls::{TlsError, ensure_tls_bundle};
 use thiserror::Error;
 use tokio::{
   signal::unix::{SignalKind, signal},
   sync::watch,
 };
-use tonic::transport::{ClientTlsConfig, ServerTlsConfig};
 
 use crate::{
   cluster_sync::ClusterSync,
   membership::{MemberRegister, MembershipService, SwimConfig},
   rpc::server::ClusterService,
-  tls::{TlsError, ensure_tls_bundle},
 };
 
 const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_secs(5);
@@ -81,12 +79,8 @@ pub async fn run_with_shutdown(
     &config.tls.key,
     &config.node.id,
   )?;
-  let server_tls = ServerTlsConfig::new()
-    .identity(tls_bundle.identity.clone())
-    .client_ca_root(tls_bundle.ca.clone());
-  let client_tls = ClientTlsConfig::new()
-    .identity(tls_bundle.identity.clone())
-    .ca_certificate(tls_bundle.ca.clone());
+  let server_tls = tls_bundle.server_config();
+  let client_tls = tls_bundle.client_config();
 
   for peer in &config.cluster.bootstrap_peers {
     node.peers.seed(peer)?;

@@ -1,6 +1,6 @@
 use std::{collections::HashMap, time::Duration};
 
-use lycoris_config::{NodeInfo, time::now_ms};
+use lycoris_core::{NodeInfo, matches_selector, time::now_ms};
 
 use crate::node::{
   NodeDomain, NodeState,
@@ -29,8 +29,8 @@ impl NodeRegistry {
       address: node.address().to_string(),
       last_heartbeat_ms: now_ms(),
       state: NodeState::Alive,
-      labels: node.labels(),
-      annotations: node.annotations(),
+      labels: node.labels().clone(),
+      annotations: node.annotations().clone(),
     };
     self.cluster.upsert(&record)
   }
@@ -88,15 +88,6 @@ impl NodeRegistry {
   }
 }
 
-fn matches_selector(labels: &HashMap<String, String>, selector: &HashMap<String, String>) -> bool {
-  if selector.is_empty() {
-    return true;
-  }
-  selector
-    .iter()
-    .all(|(key, value)| labels.get(key) == Some(value))
-}
-
 #[cfg(test)]
 mod tests {
   use std::time::Duration;
@@ -129,7 +120,7 @@ mod tests {
       id: "node-1".to_string(),
       address: "127.0.0.1:5001".to_string(),
     };
-    let node = LocalNode::from_config(&config, node_domain.local.clone());
+    let node = LocalNode::from_config(&config, node_domain.local.clone()).unwrap();
     registry.register_or_update(&node).unwrap();
 
     let all = registry.list_alive(&HashMap::new()).unwrap();
@@ -179,7 +170,8 @@ mod tests {
         address: "127.0.0.1:1".to_string(),
       },
       node_domain_a.local.clone(),
-    );
+    )
+    .unwrap();
 
     let dir = TempDir::new().unwrap();
     let node_domain_b = node_storage(&dir);
@@ -190,7 +182,8 @@ mod tests {
         address: "127.0.0.1:2".to_string(),
       },
       node_domain_b.local.clone(),
-    );
+    )
+    .unwrap();
 
     registry.register_or_update(&node_a).unwrap();
     registry.register_or_update(&node_b).unwrap();

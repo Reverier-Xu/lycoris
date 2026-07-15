@@ -1,9 +1,10 @@
 use std::{fs, path::Path};
 
+use lycoris_core::validation::non_empty_string;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{daemon::DaemonConfig, validation::non_empty_string};
+use crate::daemon::DaemonConfig;
 
 /// Client configuration used by the `lycoris` CLI to talk to a daemon node.
 #[derive(Debug, Clone, Deserialize, Serialize)]

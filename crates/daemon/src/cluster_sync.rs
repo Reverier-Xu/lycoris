@@ -17,19 +17,17 @@ use lycoris_api::{
     sync_server::{Sync, SyncServer},
   },
 };
-use lycoris_config::time::now_ms;
+use lycoris_core::time::now_ms;
 use lycoris_storage::NodeDomain;
+use lycoris_tls::TlsBundle;
 use tokio::{
   sync::Mutex,
   time::{self, MissedTickBehavior, timeout},
 };
 use tonic::{Request, Response, Status, transport::ClientTlsConfig};
 
-use crate::{
-  membership::{
-    MembershipService, SwimAction, SwimMessage, merkle::Hash as MerkleHash, register_to_proto,
-  },
-  tls::TlsBundle,
+use crate::membership::{
+  MembershipService, SwimAction, SwimMessage, merkle::Hash as MerkleHash, register_to_proto,
 };
 
 /// Orchestrates peer-to-peer membership synchronization.
@@ -177,7 +175,7 @@ impl ClusterSync {
       None => return false,
     };
 
-    let client = match self.connect_peer(&address).await {
+    let mut client = match self.connect_peer(&address).await {
       Ok(client) => client,
       Err(_) => {
         self.remove_client(&address).await;
@@ -214,7 +212,7 @@ impl ClusterSync {
       None => return,
     };
 
-    let client = match self.connect_peer(&address).await {
+    let mut client = match self.connect_peer(&address).await {
       Ok(client) => client,
       Err(_) => {
         self.remove_client(&address).await;
@@ -306,7 +304,7 @@ impl ClusterSync {
   async fn sync_with_peer(
     &self, peer: &str, _snapshot: Vec<ProtoNodeInfo>,
   ) -> Result<(), ClusterClientError> {
-    let client = self.connect_peer(peer).await?;
+    let mut client = self.connect_peer(peer).await?;
     let local_address = self.local_address().await.unwrap_or_default();
 
     let (remote_root, remote_leaves) =
@@ -382,7 +380,7 @@ impl ClusterSync {
   }
 
   async fn full_sync_with_peer(&self, peer: &str) -> Result<(), ClusterClientError> {
-    let client = self.connect_peer(peer).await?;
+    let mut client = self.connect_peer(peer).await?;
     let snapshot = self.service.list_nodes(&HashMap::new()).await;
     let response = client.sync.sync_nodes(snapshot).await?;
     let _ = self.service.sync_nodes(response.nodes).await;
@@ -429,7 +427,7 @@ impl ClusterSync {
   async fn push_to_peer(
     &self, peer: &str, info: ProtoNodeInfo, origin: String, sequence: u64,
   ) -> Result<(), ClusterClientError> {
-    let client = self.connect_peer(peer).await?;
+    let mut client = self.connect_peer(peer).await?;
     client.sync.push_node(info, origin, sequence).await?;
     Ok(())
   }
@@ -459,7 +457,7 @@ impl ClusterSync {
   async fn send_state_message_to_peer(
     &self, peer: &str, message: StateMessage,
   ) -> Result<(), ClusterClientError> {
-    let client = self.connect_peer(peer).await?;
+    let mut client = self.connect_peer(peer).await?;
     client.membership.state(message).await?;
     Ok(())
   }

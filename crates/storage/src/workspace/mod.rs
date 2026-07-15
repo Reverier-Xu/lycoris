@@ -110,7 +110,7 @@ impl WorkspaceDomain {
 
 #[cfg(test)]
 mod tests {
-  use lycoris_config::time::now_ms;
+  use lycoris_core::time::now_ms;
   use tempfile::TempDir;
 
   use super::*;

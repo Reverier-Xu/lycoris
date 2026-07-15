@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use lycoris_config::time::now_ms;
+use lycoris_core::time::now_ms;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 

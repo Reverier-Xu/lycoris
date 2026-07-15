@@ -1,5 +1,5 @@
 [package]
-name = "lycoris-workers"
+name = "lycoris-tls"
 
 authors.workspace      = true
 description.workspace  = true
@@ -12,6 +12,12 @@ rust-version.workspace = true
 version.workspace      = true
 
 [dependencies]
+rcgen     = { workspace = true }
+thiserror = { workspace = true }
+tonic     = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

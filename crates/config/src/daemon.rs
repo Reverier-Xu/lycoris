@@ -1,9 +1,11 @@
 use std::{fs, path::Path};
 
-use serde::Deserialize;
+use lycoris_core::{
+  paths::{default_data_dir, ensure_dir},
+  validation::non_empty_string,
+};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
-
-use crate::{paths::default_data_dir, validation::non_empty_string};
 
 /// Node bootstrap configuration.
 ///
@@ -12,7 +14,7 @@ use crate::{paths::default_data_dir, validation::non_empty_string};
 /// location, data directory). All dynamic runtime state such as peer list,
 /// primary endpoint, node labels/annotations, and peer reachability is stored
 /// in the SQLite database under `data_dir`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonConfig {
   pub node: NodeConfig,
@@ -35,9 +37,20 @@ impl DaemonConfig {
     let config: DaemonConfig = toml::from_str(&content)?;
     Ok(config)
   }
+
+  /// Write the daemon configuration to a TOML file, creating parent directories
+  /// if necessary.
+  pub fn write_to_file<P: AsRef<Path>>(&self, path: P) -> Result<(), ConfigError> {
+    let parent = path.as_ref().parent();
+    if let Some(parent) = parent {
+      ensure_dir(parent)?;
+    }
+    fs::write(path.as_ref(), toml::to_string_pretty(self)?)?;
+    Ok(())
+  }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NodeConfig {
   #[serde(deserialize_with = "non_empty_string")]
   pub id: String,
@@ -45,7 +58,7 @@ pub struct NodeConfig {
   pub address: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ClusterConfig {
   #[serde(deserialize_with = "non_empty_string")]
   pub listen_address: String,
@@ -54,7 +67,7 @@ pub struct ClusterConfig {
   pub bootstrap_peers: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TlsConfig {
   pub ca_cert: String,
   pub ca_key: String,
@@ -68,6 +81,8 @@ pub enum ConfigError {
   Io(#[from] std::io::Error),
   #[error("parse error: {0}")]
   Parse(#[from] toml::de::Error),
+  #[error("serialize error: {0}")]
+  Serialize(#[from] toml::ser::Error),
 }
 
 #[cfg(test)]

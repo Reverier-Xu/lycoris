@@ -38,9 +38,13 @@ jiff          = "0.2"
 is-root       = "0.1"
 lancedb       = "0.31"
 lycoris-api     = { path = "crates/api" }
+lycoris-client  = { path = "crates/client" }
 lycoris-config  = { path = "crates/config" }
+lycoris-core    = { path = "crates/core" }
 lycoris-daemon  = { path = "crates/daemon" }
+lycoris-proto   = { path = "crates/proto" }
 lycoris-storage = { path = "crates/storage" }
+lycoris-tls     = { path = "crates/tls" }
 blake3        = "1.8"
 owo-colors    = "4.3"
 postcard      = { version = "1.0", features = ["use-std"] }

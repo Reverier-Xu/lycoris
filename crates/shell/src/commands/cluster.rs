@@ -3,12 +3,12 @@ use std::collections::HashMap;
 use lycoris_api::{
   ClusterRpcClient,
   proto::{NodeBody, Resource as ProtoResource, ResourceKind, resource::Body},
-  tls::load_client_tls,
 };
-use lycoris_config::{
-  ClientConfig, ClusterKey, DaemonConfig, NodeInfo, default_cluster_key_path,
-  paths::default_daemon_config_path,
+use lycoris_config::{ClientConfig, DaemonConfig};
+use lycoris_core::{
+  ClusterKey, NodeInfo, default_cluster_key_path, paths::default_daemon_config_path,
 };
+use lycoris_tls::load_client_tls;
 use owo_colors::OwoColorize;
 
 use crate::error::ShellError;
@@ -17,7 +17,7 @@ pub async fn get_resources(
   client_config: &ClientConfig, resource: &str, name: Option<String>, selectors: &[String],
   scope: Option<String>,
 ) -> Result<(), ShellError> {
-  let client = connect_cluster(client_config).await?;
+  let mut client = connect_cluster(client_config).await?;
   let kind = parse_resource_kind(resource)?;
   let kind_name = resource_name(kind);
 
@@ -57,7 +57,7 @@ pub async fn get_resources(
 pub async fn describe_resource(
   client_config: &ClientConfig, resource: &str, name: &str,
 ) -> Result<(), ShellError> {
-  let client = connect_cluster(client_config).await?;
+  let mut client = connect_cluster(client_config).await?;
   let kind = parse_resource_kind(resource)?;
   let kind_name = resource_name(kind);
 
@@ -81,7 +81,7 @@ pub async fn describe_resource(
 pub async fn register(
   client_config: &ClientConfig, id: String, address: String,
 ) -> Result<(), ShellError> {
-  let client = connect_cluster(client_config).await?;
+  let mut client = connect_cluster(client_config).await?;
   let node = SimpleNode {
     id: id.clone(),
     address,
@@ -119,7 +119,7 @@ pub async fn join_cluster(
     &client_config.ca_cert,
   )
   .map_err(ShellError::TlsLoad)?;
-  let client = ClusterRpcClient::connect(&peer, tls)
+  let mut client = ClusterRpcClient::connect_with_tls(&peer, tls)
     .await
     .map_err(|source| ShellError::Connect {
       address: peer.clone(),
@@ -135,7 +135,7 @@ pub async fn join_cluster(
 
   client.join(&node, &key).await.map_err(ShellError::Join)?;
 
-  let local_client = connect_cluster(client_config).await?;
+  let mut local_client = connect_cluster(client_config).await?;
   local_client
     .set_primary_endpoint(&peer)
     .await
@@ -151,7 +151,7 @@ pub async fn join_cluster(
 
 pub async fn leave_cluster(client_config: &ClientConfig) -> Result<(), ShellError> {
   let daemon_config = load_daemon_config()?;
-  let client = connect_cluster(client_config).await?;
+  let mut client = connect_cluster(client_config).await?;
   client
     .leave(&daemon_config.node.id)
     .await
@@ -181,7 +181,7 @@ async fn connect_cluster(client_config: &ClientConfig) -> Result<ClusterRpcClien
     &client_config.ca_cert,
   )
   .map_err(ShellError::TlsLoad)?;
-  ClusterRpcClient::connect(&client_config.api_address, tls)
+  ClusterRpcClient::connect_with_tls(&client_config.api_address, tls)
     .await
     .map_err(|source| ShellError::Connect {
       address: client_config.api_address.clone(),
@@ -417,11 +417,11 @@ impl NodeInfo for SimpleNode {
     &self.address
   }
 
-  fn labels(&self) -> HashMap<String, String> {
-    self.labels.clone()
+  fn labels(&self) -> &HashMap<String, String> {
+    &self.labels
   }
 
-  fn annotations(&self) -> HashMap<String, String> {
-    self.annotations.clone()
+  fn annotations(&self) -> &HashMap<String, String> {
+    &self.annotations
   }
 }

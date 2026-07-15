@@ -1,5 +1,5 @@
 [package]
-name = "lycoris-config"
+name = "lycoris-proto"
 
 authors.workspace      = true
 description.workspace  = true
@@ -12,13 +12,12 @@ rust-version.workspace = true
 version.workspace      = true
 
 [dependencies]
-lycoris-core = { workspace = true }
-serde        = { workspace = true, features = ["derive"] }
-thiserror    = { workspace = true }
-toml         = { workspace = true }
+prost.workspace = true
+serde.workspace = true
+tonic.workspace = true
 
-[dev-dependencies]
-tempfile = { workspace = true }
+[build-dependencies]
+tonic-build.workspace = true
 
 [lints]
 workspace = true

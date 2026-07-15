@@ -3780,7 +3780,9 @@ dependencies = [
  "clap",
  "lycoris-api",
  "lycoris-config",
+ "lycoris-core",
  "lycoris-daemon",
+ "lycoris-tls",
  "owo-colors",
  "rustls",
  "serde",
@@ -3797,18 +3799,39 @@ dependencies = [
 name = "lycoris-api"
 version = "0.1.0"
 dependencies = [
+ "lycoris-client",
+ "lycoris-proto",
+ "lycoris-tls",
+]
+
+[[package]]
+name = "lycoris-client"
+version = "0.1.0"
+dependencies = [
  "lycoris-config",
+ "lycoris-core",
+ "lycoris-proto",
+ "lycoris-tls",
  "prost 0.13.5",
  "rustls",
  "thiserror",
  "tokio",
- "tokio-rustls",
  "tonic",
- "tonic-build",
 ]
 
 [[package]]
 name = "lycoris-config"
+version = "0.1.0"
+dependencies = [
+ "lycoris-core",
+ "serde",
+ "tempfile",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
+name = "lycoris-core"
 version = "0.1.0"
 dependencies = [
  "directories",
@@ -3826,28 +3849,31 @@ name = "lycoris-daemon"
 version = "0.1.0"
 dependencies = [
  "blake3",
- "clap",
  "lycoris-api",
  "lycoris-config",
+ "lycoris-core",
+ "lycoris-proto",
  "lycoris-storage",
+ "lycoris-tls",
  "prost 0.13.5",
  "rcgen",
  "rustls",
- "rustls-pemfile",
- "serde",
  "tempfile",
  "thiserror",
  "tokio",
- "tokio-rustls",
- "toml",
  "tonic",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
-name = "lycoris-providers"
+name = "lycoris-proto"
 version = "0.1.0"
+dependencies = [
+ "prost 0.13.5",
+ "serde",
+ "tonic",
+ "tonic-build",
+]
 
 [[package]]
 name = "lycoris-storage"
@@ -3860,6 +3886,7 @@ dependencies = [
  "jiff",
  "lancedb",
  "lycoris-config",
+ "lycoris-core",
  "postcard",
  "redb",
  "serde",
@@ -3870,8 +3897,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "lycoris-workers"
+name = "lycoris-tls"
 version = "0.1.0"
+dependencies = [
+ "rcgen",
+ "tempfile",
+ "thiserror",
+ "tonic",
+]
 
 [[package]]
 name = "lz4"
@@ -5145,15 +5178,6 @@ dependencies = [
  "rustls-pki-types",
  "schannel",
  "security-framework",
-]
-
-[[package]]
-name = "rustls-pemfile"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
-dependencies = [
- "rustls-pki-types",
 ]
 
 [[package]]

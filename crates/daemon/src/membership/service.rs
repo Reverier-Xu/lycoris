@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use lycoris_api::proto::NodeInfo as ProtoNodeInfo;
-use lycoris_config::time::now_ms;
+use lycoris_core::time::now_ms;
 use tokio::sync::Mutex;
 
 use crate::membership::{

@@ -1,7 +1,5 @@
-use lycoris_config::{
-  ClientConfig, DaemonConfig,
-  paths::{default_client_config_path, default_daemon_config_path},
-};
+use lycoris_config::{ClientConfig, DaemonConfig};
+use lycoris_core::paths::{default_client_config_path, default_daemon_config_path};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
