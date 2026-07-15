@@ -110,7 +110,7 @@ fn build_config(
   DaemonConfig {
     node: NodeConfig {
       id: id.to_string(),
-      address: format!("127.0.0.1:{listen_port}"),
+      address: format!("https://127.0.0.1:{listen_port}"),
     },
     cluster: ClusterConfig {
       listen_address: format!("127.0.0.1:{listen_port}"),
@@ -490,11 +490,13 @@ async fn shared_skills_replicate_via_anti_entropy() {
   {
     let storage =
       Storage::open(data_dirs[0].path().join("lycoris.redb")).expect("open node-0 storage");
+    let content = "skill content";
+    let content_hash = blake3::hash(content.as_bytes()).to_hex().to_string();
     let skill = SkillRecord {
       id: "shared-skill".to_string(),
       name: "shared skill".to_string(),
       version: 1,
-      content_hash: "abc".to_string(),
+      content_hash: content_hash.clone(),
       scope: ResourceScope::ClusterShared,
       source_node_id: Some("node-0".to_string()),
       updated_at_ms: now_ms(),
@@ -508,7 +510,7 @@ async fn shared_skills_replicate_via_anti_entropy() {
     storage
       .workspace()
       .skill_content()
-      .write("shared-skill", "skill content", "abc")
+      .write("shared-skill", content, &content_hash)
       .expect("write shared skill content");
   }
 

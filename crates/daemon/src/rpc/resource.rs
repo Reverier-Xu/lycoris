@@ -398,6 +398,9 @@ impl ResourceMapper {
     match (kind, resource.body.as_ref()) {
       (ResourceKind::Skill, Some(Body::Skill(body))) => {
         let record = resource_to_skill(metadata, body)?;
+        if !body.content.is_empty() {
+          verify_content_hash(&body.content, &body.content_hash)?;
+        }
         let local = self
           .storage
           .workspace()
@@ -424,6 +427,9 @@ impl ResourceMapper {
       }
       (ResourceKind::Rule, Some(Body::Rule(body))) => {
         let record = resource_to_rule(metadata, body)?;
+        if !body.content.is_empty() {
+          verify_content_hash(&body.content, &body.content_hash)?;
+        }
         let local = self
           .storage
           .workspace()
@@ -518,6 +524,16 @@ fn resource_to_rule(metadata: &ResourceMetadata, body: &RuleBody) -> Result<Rule
     updated_at_ms: metadata.updated_at_ms,
     metadata: metadata.labels.clone(),
   })
+}
+
+fn verify_content_hash(content: &str, expected: &str) -> Result<(), Status> {
+  let actual = blake3::hash(content.as_bytes()).to_hex().to_string();
+  if actual != expected {
+    return Err(Status::invalid_argument(format!(
+      "content hash mismatch: expected {expected}, got {actual}"
+    )));
+  }
+  Ok(())
 }
 
 fn should_apply_resource(local: Option<&VersionedResource>, remote: &VersionedResource) -> bool {
