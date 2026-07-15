@@ -30,9 +30,16 @@ fi
 
 cd "${SCRIPT_DIR}"
 
-echo "=== generating certificates and configs ==="
+echo "=== generating certificates, configs and cluster key ==="
 ./gen-certs.sh
 ./gen-configs.sh
+
+mkdir -p "${SCRIPT_DIR}/keys"
+openssl rand -hex 32 > "${SCRIPT_DIR}/keys/cluster.key"
+CLUSTER_KEY="$(cat "${SCRIPT_DIR}/keys/cluster.key")"
+
+echo "=== building static musl binary ==="
+cargo build --release --target x86_64-unknown-linux-musl -p lycoris
 
 echo "=== building container image ==="
 ${DOCKER_COMPOSE} -f "${COMPOSE_FILE}" build
@@ -78,7 +85,7 @@ node_count() {
 has_node() {
   local container="$1"
   local node_id="$2"
-  lycoris_in "${container}" cluster get nodes 2>/dev/null | strip_ansi | grep -q "^${node_id}$"
+  lycoris_in "${container}" cluster get nodes 2>/dev/null | strip_ansi | grep -q "${node_id}"
 }
 
 register_node() {
@@ -86,7 +93,24 @@ register_node() {
   local node_id="$2"
   local address="$3"
   echo "  registering ${node_id} via ${container}"
-  lycoris_in "${container}" cluster register --id "${node_id}" --address "${address}"
+  lycoris_in "${container}" cluster register \
+    --id "${node_id}" \
+    --address "${address}" \
+    --key "${CLUSTER_KEY}"
+}
+
+wait_for_node() {
+  local container="$1"
+  local node_id="$2"
+  local timeout_secs="${3:-15}"
+  local deadline=$((SECONDS + timeout_secs))
+  while (( SECONDS < deadline )); do
+    if has_node "${container}" "${node_id}"; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
 }
 
 echo "=== waiting for initial convergence ==="
@@ -95,8 +119,7 @@ wait_for_cluster
 echo ""
 echo "=== test 1: register a node and observe convergence ==="
 register_node lycoris-e2e-node-0 alpha https://alpha:5001
-sleep 3
-if has_node lycoris-e2e-node-2 alpha; then
+if wait_for_node lycoris-e2e-node-2 alpha; then
   echo "  ok: alpha propagated to node-2"
 else
   echo "  fail: alpha did not propagate to node-2" >&2
@@ -124,9 +147,8 @@ fi
 echo "  reconnecting node-1"
 ${EXEC} network connect "${NETWORK_LEFT}" lycoris-e2e-node-1
 ${EXEC} network connect "${NETWORK_RIGHT}" lycoris-e2e-node-1
-sleep 5
 
-if has_node lycoris-e2e-node-2 beta; then
+if wait_for_node lycoris-e2e-node-2 beta; then
   echo "  ok: beta propagated to node-2 after reconnect"
 else
   echo "  fail: beta did not propagate to node-2 after reconnect" >&2
@@ -139,9 +161,8 @@ echo "  stopping node-2"
 ${EXEC} stop lycoris-e2e-node-2
 
 register_node lycoris-e2e-node-0 gamma https://gamma:5001
-sleep 3
 
-if has_node lycoris-e2e-node-1 gamma; then
+if wait_for_node lycoris-e2e-node-1 gamma; then
   echo "  ok: gamma reached node-1 while node-2 was down"
 else
   echo "  fail: gamma did not reach node-1" >&2
@@ -151,9 +172,8 @@ fi
 
 echo "  restarting node-2"
 ${EXEC} start lycoris-e2e-node-2
-sleep 5
 
-if has_node lycoris-e2e-node-2 gamma; then
+if wait_for_node lycoris-e2e-node-2 gamma; then
   echo "  ok: gamma propagated to node-2 after restart"
 else
   echo "  fail: gamma did not propagate to node-2 after restart" >&2

@@ -1,11 +1,10 @@
 # syntax=docker/dockerfile:1
-FROM ubuntu:24.04
+FROM alpine:3.20
 
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates \
-  && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache ca-certificates
 
-COPY target/release/lycoris /usr/local/bin/lycoris
+COPY target/x86_64-unknown-linux-musl/release/lycoris /usr/local/bin/lycoris
+RUN chmod 755 /usr/local/bin/lycoris
 
 RUN mkdir -p /etc/lycoris /var/lib/lycoris
 
