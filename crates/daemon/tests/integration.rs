@@ -7,9 +7,12 @@ use std::{
 
 use lycoris_client::{ClusterClient, PeerClient};
 use lycoris_config::{ClusterConfig, DaemonConfig, NodeConfig, TlsConfig};
-use lycoris_core::{ClusterKey, SimpleNode, time::now_ms};
+use lycoris_core::{ClusterKey, DEFAULT_EMBEDDING_DIM, SimpleNode, time::now_ms};
 use lycoris_proto::node::ResourceKind;
-use lycoris_storage::{ResourceScope, SkillRecord, Storage, workspace::VersionedContentStore};
+use lycoris_storage::{
+  MemoryEntry, ResourceScope, SkillRecord, Storage, WorkspaceRecord,
+  workspace::VersionedContentStore,
+};
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
 use tempfile::TempDir;
 use tokio::time;
@@ -572,4 +575,644 @@ async fn shared_skills_replicate_via_anti_entropy() {
     }
     time::sleep(Duration::from_millis(200)).await;
   }
+}
+
+async fn wait_for_resource(
+  client: &mut ClusterClient, kind: ResourceKind, id: &str, timeout: Duration,
+) {
+  let start = std::time::Instant::now();
+  loop {
+    let resources = client
+      .list_resources(kind, HashMap::new(), String::new())
+      .await
+      .expect("list resources failed");
+    if resources.iter().any(|resource| {
+      resource
+        .metadata
+        .as_ref()
+        .map(|metadata| metadata.id == id)
+        .unwrap_or(false)
+    }) {
+      return;
+    }
+    if start.elapsed() >= timeout {
+      panic!("timed out waiting for {id} to appear in {kind:?}");
+    }
+    time::sleep(Duration::from_millis(200)).await;
+  }
+}
+
+fn memory_entry(
+  id: &str, embedding: Vec<f32>, scope: ResourceScope, updated_at_ms: i64,
+) -> MemoryEntry {
+  let content = id.as_bytes().to_vec();
+  let content_hash = MemoryEntry::compute_content_hash(&content);
+  MemoryEntry {
+    id: id.to_string(),
+    content,
+    embedding,
+    metadata: [("source".to_string(), "integration-test".to_string())]
+      .into_iter()
+      .collect(),
+    scope,
+    source_node_id: Some("node-0".to_string()),
+    updated_at_ms,
+    content_hash,
+  }
+}
+
+fn workspace_record(id: &str, scope: ResourceScope, updated_at_ms: i64) -> WorkspaceRecord {
+  WorkspaceRecord {
+    id: id.to_string(),
+    root: PathBuf::from(format!("/tmp/{id}")),
+    session_ids: vec![],
+    metadata: [("project".to_string(), "lycoris".to_string())]
+      .into_iter()
+      .collect(),
+    scope,
+    source_node_id: Some("node-0".to_string()),
+    version: 1,
+    content_hash: String::new(),
+    created_at_ms: updated_at_ms,
+    updated_at_ms,
+  }
+}
+
+#[tokio::test]
+async fn shared_memories_replicate_via_anti_entropy() {
+  let _ = lycoris_client::install_crypto_provider();
+
+  let (node_count, base_port) = (3, alloc_base_port());
+  let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
+  let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
+
+  let cluster_key = ClusterKey::generate().expect("generate cluster key");
+
+  {
+    let storage =
+      Storage::open(data_dirs[0].path().join("lycoris.redb")).expect("open node-0 storage");
+    let dim = DEFAULT_EMBEDDING_DIM;
+    let embedding = (0..dim).map(|i| i as f32 * 0.01).collect();
+    let memory = memory_entry(
+      "shared-memory",
+      embedding,
+      ResourceScope::ClusterShared,
+      now_ms(),
+    );
+    storage
+      .agent()
+      .memory()
+      .store(&memory)
+      .await
+      .expect("store shared memory");
+  }
+
+  let configs: Vec<DaemonConfig> = (0..node_count)
+    .map(|i| {
+      let port = base_port + i as u16;
+      let peers = match i {
+        0 => vec![format!("https://127.0.0.1:{}", base_port + 1)],
+        1 => vec![
+          format!("https://127.0.0.1:{}", base_port),
+          format!("https://127.0.0.1:{}", base_port + 2),
+        ],
+        2 => vec![format!("https://127.0.0.1:{}", base_port + 1)],
+        _ => unreachable!(),
+      };
+      build_config(
+        &format!("node-{i}"),
+        port,
+        peers,
+        data_dirs[i].path().to_path_buf(),
+        &ca_cert_path,
+        &ca_key_path,
+        &cert_paths[i],
+        &key_paths[i],
+      )
+    })
+    .collect();
+
+  for config in configs.clone() {
+    spawn_runtime(config, cluster_key.clone());
+  }
+
+  time::sleep(Duration::from_millis(300)).await;
+
+  let node2_url = format!("https://127.0.0.1:{}", base_port + 2);
+  let client_tls = client_tls_config(&cert_paths[2], &key_paths[2], &ca_cert_path);
+  let mut client = ClusterClient::connect_with_tls(&node2_url, client_tls)
+    .await
+    .expect("failed to connect to node-2");
+
+  wait_for_resource(
+    &mut client,
+    ResourceKind::Memory,
+    "shared-memory",
+    Duration::from_secs(10),
+  )
+  .await;
+}
+
+#[tokio::test]
+async fn shared_workspaces_replicate_via_anti_entropy() {
+  let _ = lycoris_client::install_crypto_provider();
+
+  let (node_count, base_port) = (3, alloc_base_port());
+  let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
+  let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
+
+  let cluster_key = ClusterKey::generate().expect("generate cluster key");
+
+  {
+    let storage =
+      Storage::open(data_dirs[0].path().join("lycoris.redb")).expect("open node-0 storage");
+    let workspace = workspace_record("shared-workspace", ResourceScope::ClusterShared, now_ms());
+    storage
+      .workspace()
+      .workspaces()
+      .upsert(&workspace)
+      .expect("upsert shared workspace");
+  }
+
+  let configs: Vec<DaemonConfig> = (0..node_count)
+    .map(|i| {
+      let port = base_port + i as u16;
+      let peers = match i {
+        0 => vec![format!("https://127.0.0.1:{}", base_port + 1)],
+        1 => vec![
+          format!("https://127.0.0.1:{}", base_port),
+          format!("https://127.0.0.1:{}", base_port + 2),
+        ],
+        2 => vec![format!("https://127.0.0.1:{}", base_port + 1)],
+        _ => unreachable!(),
+      };
+      build_config(
+        &format!("node-{i}"),
+        port,
+        peers,
+        data_dirs[i].path().to_path_buf(),
+        &ca_cert_path,
+        &ca_key_path,
+        &cert_paths[i],
+        &key_paths[i],
+      )
+    })
+    .collect();
+
+  for config in configs.clone() {
+    spawn_runtime(config, cluster_key.clone());
+  }
+
+  time::sleep(Duration::from_millis(300)).await;
+
+  let node2_url = format!("https://127.0.0.1:{}", base_port + 2);
+  let client_tls = client_tls_config(&cert_paths[2], &key_paths[2], &ca_cert_path);
+  let mut client = ClusterClient::connect_with_tls(&node2_url, client_tls)
+    .await
+    .expect("failed to connect to node-2");
+
+  wait_for_resource(
+    &mut client,
+    ResourceKind::Workspace,
+    "shared-workspace",
+    Duration::from_secs(10),
+  )
+  .await;
+}
+
+#[tokio::test]
+async fn local_resources_do_not_replicate() {
+  let _ = lycoris_client::install_crypto_provider();
+
+  let (node_count, base_port) = (2, alloc_base_port());
+  let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
+  let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
+
+  let cluster_key = ClusterKey::generate().expect("generate cluster key");
+
+  {
+    let storage =
+      Storage::open(data_dirs[0].path().join("lycoris.redb")).expect("open node-0 storage");
+
+    let dim = DEFAULT_EMBEDDING_DIM;
+    let memory = memory_entry(
+      "local-memory",
+      (0..dim).map(|i| i as f32 * 0.01).collect(),
+      ResourceScope::NodeLocal,
+      now_ms(),
+    );
+    storage
+      .agent()
+      .memory()
+      .store(&memory)
+      .await
+      .expect("store local memory");
+
+    let workspace = workspace_record("local-workspace", ResourceScope::NodeLocal, now_ms());
+    storage
+      .workspace()
+      .workspaces()
+      .upsert(&workspace)
+      .expect("upsert local workspace");
+  }
+
+  let configs: Vec<DaemonConfig> = (0..node_count)
+    .map(|i| {
+      let port = base_port + i as u16;
+      let peer = format!("https://127.0.0.1:{}", base_port + ((i + 1) % 2) as u16);
+      build_config(
+        &format!("node-{i}"),
+        port,
+        vec![peer],
+        data_dirs[i].path().to_path_buf(),
+        &ca_cert_path,
+        &ca_key_path,
+        &cert_paths[i],
+        &key_paths[i],
+      )
+    })
+    .collect();
+
+  for config in configs.clone() {
+    spawn_runtime(config, cluster_key.clone());
+  }
+
+  time::sleep(Duration::from_millis(300)).await;
+
+  let node1_url = format!("https://127.0.0.1:{}", base_port + 1);
+  let client_tls = client_tls_config(&cert_paths[1], &key_paths[1], &ca_cert_path);
+  let mut client = ClusterClient::connect_with_tls(&node1_url, client_tls)
+    .await
+    .expect("failed to connect to node-1");
+
+  time::sleep(Duration::from_secs(2)).await;
+
+  let memories = client
+    .list_resources(ResourceKind::Memory, HashMap::new(), String::new())
+    .await
+    .expect("list memories failed");
+  assert!(
+    !memories.iter().any(|resource| {
+      resource
+        .metadata
+        .as_ref()
+        .map(|metadata| metadata.id == "local-memory")
+        .unwrap_or(false)
+    }),
+    "local memory should not replicate"
+  );
+
+  let workspaces = client
+    .list_resources(ResourceKind::Workspace, HashMap::new(), String::new())
+    .await
+    .expect("list workspaces failed");
+  assert!(
+    !workspaces.iter().any(|resource| {
+      resource
+        .metadata
+        .as_ref()
+        .map(|metadata| metadata.id == "local-workspace")
+        .unwrap_or(false)
+    }),
+    "local workspace should not replicate"
+  );
+}
+
+#[tokio::test]
+async fn partition_merge_reconciles_shared_resources() {
+  let _ = lycoris_client::install_crypto_provider();
+
+  let (node_count, base_port) = (2, alloc_base_port());
+  let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
+  let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
+
+  let cluster_key = ClusterKey::generate().expect("generate cluster key");
+
+  {
+    let storage_a =
+      Storage::open(data_dirs[0].path().join("lycoris.redb")).expect("open node-0 storage");
+    let dim = DEFAULT_EMBEDDING_DIM;
+    let memory_a = memory_entry(
+      "partition-memory-a",
+      (0..dim).map(|i| i as f32 * 0.01).collect(),
+      ResourceScope::ClusterShared,
+      now_ms(),
+    );
+    storage_a
+      .agent()
+      .memory()
+      .store(&memory_a)
+      .await
+      .expect("store partition memory a");
+
+    let workspace_a = workspace_record(
+      "partition-workspace-a",
+      ResourceScope::ClusterShared,
+      now_ms(),
+    );
+    storage_a
+      .workspace()
+      .workspaces()
+      .upsert(&workspace_a)
+      .expect("upsert partition workspace a");
+  }
+
+  {
+    let storage_b =
+      Storage::open(data_dirs[1].path().join("lycoris.redb")).expect("open node-1 storage");
+    let dim = DEFAULT_EMBEDDING_DIM;
+    let memory_b = memory_entry(
+      "partition-memory-b",
+      (0..dim).map(|i| -(i as f32) * 0.01).collect(),
+      ResourceScope::ClusterShared,
+      now_ms(),
+    );
+    storage_b
+      .agent()
+      .memory()
+      .store(&memory_b)
+      .await
+      .expect("store partition memory b");
+
+    let workspace_b = workspace_record(
+      "partition-workspace-b",
+      ResourceScope::ClusterShared,
+      now_ms(),
+    );
+    storage_b
+      .workspace()
+      .workspaces()
+      .upsert(&workspace_b)
+      .expect("upsert partition workspace b");
+  }
+
+  let configs: Vec<DaemonConfig> = (0..node_count)
+    .map(|i| {
+      let port = base_port + i as u16;
+      let peer = format!("https://127.0.0.1:{}", base_port + ((i + 1) % 2) as u16);
+      build_config(
+        &format!("node-{i}"),
+        port,
+        vec![peer],
+        data_dirs[i].path().to_path_buf(),
+        &ca_cert_path,
+        &ca_key_path,
+        &cert_paths[i],
+        &key_paths[i],
+      )
+    })
+    .collect();
+
+  for config in configs.clone() {
+    spawn_runtime(config, cluster_key.clone());
+  }
+
+  time::sleep(Duration::from_millis(300)).await;
+
+  let node1_url = format!("https://127.0.0.1:{}", base_port + 1);
+  let client_tls = client_tls_config(&cert_paths[1], &key_paths[1], &ca_cert_path);
+  let mut client = ClusterClient::connect_with_tls(&node1_url, client_tls)
+    .await
+    .expect("failed to connect to node-1");
+
+  wait_for_resource(
+    &mut client,
+    ResourceKind::Memory,
+    "partition-memory-a",
+    Duration::from_secs(10),
+  )
+  .await;
+  wait_for_resource(
+    &mut client,
+    ResourceKind::Memory,
+    "partition-memory-b",
+    Duration::from_secs(10),
+  )
+  .await;
+  wait_for_resource(
+    &mut client,
+    ResourceKind::Workspace,
+    "partition-workspace-a",
+    Duration::from_secs(10),
+  )
+  .await;
+  wait_for_resource(
+    &mut client,
+    ResourceKind::Workspace,
+    "partition-workspace-b",
+    Duration::from_secs(10),
+  )
+  .await;
+}
+
+#[tokio::test]
+async fn workspace_content_hash_verifies_on_apply() {
+  let _ = lycoris_client::install_crypto_provider();
+
+  let (node_count, base_port) = (2, alloc_base_port());
+  let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
+  let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
+
+  let cluster_key = ClusterKey::generate().expect("generate cluster key");
+
+  {
+    let storage =
+      Storage::open(data_dirs[0].path().join("lycoris.redb")).expect("open node-0 storage");
+    let mut workspace = workspace_record(
+      "hash-checked-workspace",
+      ResourceScope::ClusterShared,
+      now_ms(),
+    );
+    workspace.content_hash = workspace
+      .compute_content_hash()
+      .expect("compute content hash");
+    storage
+      .workspace()
+      .workspaces()
+      .upsert(&workspace)
+      .expect("upsert workspace");
+  }
+
+  let configs: Vec<DaemonConfig> = (0..node_count)
+    .map(|i| {
+      let port = base_port + i as u16;
+      let peer = format!("https://127.0.0.1:{}", base_port + ((i + 1) % 2) as u16);
+      build_config(
+        &format!("node-{i}"),
+        port,
+        vec![peer],
+        data_dirs[i].path().to_path_buf(),
+        &ca_cert_path,
+        &ca_key_path,
+        &cert_paths[i],
+        &key_paths[i],
+      )
+    })
+    .collect();
+
+  for config in configs.clone() {
+    spawn_runtime(config, cluster_key.clone());
+  }
+
+  time::sleep(Duration::from_millis(300)).await;
+
+  let node1_url = format!("https://127.0.0.1:{}", base_port + 1);
+  let client_tls = client_tls_config(&cert_paths[1], &key_paths[1], &ca_cert_path);
+  let mut client = ClusterClient::connect_with_tls(&node1_url, client_tls)
+    .await
+    .expect("failed to connect to node-1");
+
+  wait_for_resource(
+    &mut client,
+    ResourceKind::Workspace,
+    "hash-checked-workspace",
+    Duration::from_secs(10),
+  )
+  .await;
+}
+
+#[tokio::test]
+async fn memory_content_hash_verifies_on_apply() {
+  let _ = lycoris_client::install_crypto_provider();
+
+  let (node_count, base_port) = (2, alloc_base_port());
+  let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
+  let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
+
+  let cluster_key = ClusterKey::generate().expect("generate cluster key");
+
+  {
+    let storage =
+      Storage::open(data_dirs[0].path().join("lycoris.redb")).expect("open node-0 storage");
+    let dim = DEFAULT_EMBEDDING_DIM;
+    let memory = memory_entry(
+      "hash-checked-memory",
+      (0..dim).map(|i| i as f32 * 0.01).collect(),
+      ResourceScope::ClusterShared,
+      now_ms(),
+    );
+    storage
+      .agent()
+      .memory()
+      .store(&memory)
+      .await
+      .expect("store memory");
+  }
+
+  let configs: Vec<DaemonConfig> = (0..node_count)
+    .map(|i| {
+      let port = base_port + i as u16;
+      let peer = format!("https://127.0.0.1:{}", base_port + ((i + 1) % 2) as u16);
+      build_config(
+        &format!("node-{i}"),
+        port,
+        vec![peer],
+        data_dirs[i].path().to_path_buf(),
+        &ca_cert_path,
+        &ca_key_path,
+        &cert_paths[i],
+        &key_paths[i],
+      )
+    })
+    .collect();
+
+  for config in configs.clone() {
+    spawn_runtime(config, cluster_key.clone());
+  }
+
+  time::sleep(Duration::from_millis(300)).await;
+
+  let node1_url = format!("https://127.0.0.1:{}", base_port + 1);
+  let client_tls = client_tls_config(&cert_paths[1], &key_paths[1], &ca_cert_path);
+  let mut client = ClusterClient::connect_with_tls(&node1_url, client_tls)
+    .await
+    .expect("failed to connect to node-1");
+
+  wait_for_resource(
+    &mut client,
+    ResourceKind::Memory,
+    "hash-checked-memory",
+    Duration::from_secs(10),
+  )
+  .await;
+}
+
+#[tokio::test]
+async fn memory_recall_works_after_replication() {
+  let _ = lycoris_client::install_crypto_provider();
+
+  let (node_count, base_port) = (2, alloc_base_port());
+  let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
+  let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
+
+  let cluster_key = ClusterKey::generate().expect("generate cluster key");
+
+  {
+    let storage =
+      Storage::open(data_dirs[0].path().join("lycoris.redb")).expect("open node-0 storage");
+    let dim = DEFAULT_EMBEDDING_DIM;
+    let mut near = vec![0.0_f32; dim];
+    near[0] = 1.0;
+    let memory = memory_entry(
+      "recall-target",
+      near,
+      ResourceScope::ClusterShared,
+      now_ms(),
+    );
+    storage
+      .agent()
+      .memory()
+      .store(&memory)
+      .await
+      .expect("store memory");
+  }
+
+  let configs: Vec<DaemonConfig> = (0..node_count)
+    .map(|i| {
+      let port = base_port + i as u16;
+      let peer = format!("https://127.0.0.1:{}", base_port + ((i + 1) % 2) as u16);
+      build_config(
+        &format!("node-{i}"),
+        port,
+        vec![peer],
+        data_dirs[i].path().to_path_buf(),
+        &ca_cert_path,
+        &ca_key_path,
+        &cert_paths[i],
+        &key_paths[i],
+      )
+    })
+    .collect();
+
+  for config in configs.clone() {
+    spawn_runtime(config, cluster_key.clone());
+  }
+
+  time::sleep(Duration::from_millis(300)).await;
+
+  let node1_url = format!("https://127.0.0.1:{}", base_port + 1);
+  let client_tls = client_tls_config(&cert_paths[1], &key_paths[1], &ca_cert_path);
+  let mut client = ClusterClient::connect_with_tls(&node1_url, client_tls)
+    .await
+    .expect("failed to connect to node-1");
+
+  wait_for_resource(
+    &mut client,
+    ResourceKind::Memory,
+    "recall-target",
+    Duration::from_secs(10),
+  )
+  .await;
+
+  let resource = client
+    .get_resource(ResourceKind::Memory, "recall-target")
+    .await
+    .expect("get memory failed")
+    .expect("memory not found");
+  let body = match resource.body {
+    Some(lycoris_proto::node::resource::Body::Memory(body)) => body,
+    _ => panic!("unexpected resource body"),
+  };
+  assert_eq!(body.content, b"recall-target");
+  assert!(!body.embedding.is_empty());
 }
