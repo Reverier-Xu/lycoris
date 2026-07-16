@@ -2,7 +2,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use lycoris_core::{DEFAULT_EMBEDDING_DIM, matches_selector};
+use lycoris_core::matches_selector;
 use lycoris_proto::node::{
   MemoryBody, NodeBody, Resource, ResourceKind, ResourceMetadata, RuleBody, SessionBody, SkillBody,
   WorkspaceBody, resource::Body,
@@ -52,7 +52,7 @@ impl ResourceMapper {
       }
       ResourceKind::Memory => {
         let entries = self
-          .recall_memories(100)
+          .list_memories(scope)
           .await
           .map_err(|error| Status::internal(format!("failed to list memories: {error}")))?;
         Ok(
@@ -89,10 +89,7 @@ impl ResourceMapper {
       }
       ResourceKind::Workspace => {
         let workspaces = self
-          .storage
-          .workspace()
-          .workspaces()
-          .list()
+          .list_workspaces(scope)
           .map_err(|error| Status::internal(format!("failed to list workspaces: {error}")))?;
         Ok(
           workspaces
@@ -124,13 +121,14 @@ impl ResourceMapper {
         .map(session_to_resource)
         .ok_or_else(|| not_found(id)),
       ResourceKind::Memory => {
-        let entries = self
-          .recall_memories(1000)
+        let entry = self
+          .storage
+          .agent()
+          .memory()
+          .get(id)
           .await
           .map_err(|error| Status::internal(format!("failed to get memory: {error}")))?;
-        entries
-          .into_iter()
-          .find(|entry| entry.id == id)
+        entry
           .map(|entry| memory_to_resource(entry, true))
           .ok_or_else(|| not_found(id))
       }
@@ -176,14 +174,29 @@ impl ResourceMapper {
           None => Err(not_found(id)),
         }
       }
-      ResourceKind::Workspace => self
-        .storage
-        .workspace()
-        .workspaces()
-        .get(id)
-        .map_err(|error| Status::internal(format!("failed to get workspace: {error}")))?
-        .map(workspace_to_resource)
-        .ok_or_else(|| not_found(id)),
+      ResourceKind::Workspace => {
+        let workspace = self
+          .storage
+          .workspace()
+          .workspaces()
+          .get(id)
+          .map_err(|error| Status::internal(format!("failed to get workspace: {error}")))?;
+        workspace
+          .map(workspace_to_resource)
+          .ok_or_else(|| not_found(id))
+      }
+    }
+  }
+
+  async fn list_memories(
+    &self, scope: Option<ResourceScope>,
+  ) -> Result<Vec<MemoryEntry>, lycoris_storage::AgentStorageError> {
+    let agent = self.storage.agent();
+    let memory = agent.memory();
+    match scope {
+      Some(ResourceScope::ClusterShared) => memory.list_shared().await,
+      Some(ResourceScope::NodeLocal) => memory.list_local().await,
+      None => memory.list().await,
     }
   }
 
@@ -209,11 +222,237 @@ impl ResourceMapper {
     }
   }
 
-  async fn recall_memories(
-    &self, limit: usize,
-  ) -> Result<Vec<MemoryEntry>, lycoris_storage::AgentStorageError> {
-    let query = vec![0.0f32; DEFAULT_EMBEDDING_DIM];
-    self.storage.agent().memory().recall(query, limit).await
+  fn list_workspaces(
+    &self, scope: Option<ResourceScope>,
+  ) -> Result<Vec<WorkspaceRecord>, lycoris_storage::WorkspaceStorageError> {
+    let workspaces = self.storage.workspace().workspaces();
+    match scope {
+      Some(ResourceScope::ClusterShared) => workspaces.list_shared(),
+      Some(ResourceScope::NodeLocal) => workspaces.list_local(),
+      None => workspaces.list(),
+    }
+  }
+
+  /// Merge an incoming shared resource into local storage.
+  ///
+  /// Only `ClusterShared` resources are accepted. The content body is written
+  /// to the filesystem-backed content store when present.
+  pub async fn apply_resource(&self, resource: &Resource) -> Result<(), Status> {
+    let metadata = resource
+      .metadata
+      .as_ref()
+      .ok_or_else(|| Status::invalid_argument("missing resource metadata"))?;
+    let kind = parse_kind(metadata.kind)?;
+    let scope = parse_scope(&metadata.scope)?;
+
+    if scope != Some(ResourceScope::ClusterShared) {
+      return Ok(());
+    }
+
+    match (kind, resource.body.as_ref()) {
+      (ResourceKind::Memory, Some(Body::Memory(body))) => {
+        if body.content.is_empty() {
+          return Ok(());
+        }
+        let record = resource_to_memory(metadata, body)?;
+        verify_content_hash_bytes(&body.content, &body.content_hash)?;
+        let local = self
+          .storage
+          .agent()
+          .memory()
+          .get(&record.id)
+          .await
+          .map_err(|error| Status::internal(format!("failed to read memory: {error}")))?;
+        if !should_apply_versioned(
+          local.as_ref().map(|local| local.version()),
+          local.as_ref().map(|local| local.updated_at_ms),
+          local.as_ref().map(|local| local.scope),
+          0,
+          record.updated_at_ms,
+          ResourceScope::ClusterShared,
+        ) {
+          return Ok(());
+        }
+        self
+          .storage
+          .agent()
+          .memory()
+          .store(&record)
+          .await
+          .map_err(|error| Status::internal(format!("failed to store memory: {error}")))?;
+      }
+      (ResourceKind::Skill, Some(Body::Skill(body))) => {
+        if body.content.is_empty() {
+          return Ok(());
+        }
+        let record = resource_to_skill(metadata, body)?;
+        verify_content_hash(&body.content, &body.content_hash)?;
+        let local = self
+          .storage
+          .workspace()
+          .skills()
+          .get(&record.id)
+          .map_err(|error| Status::internal(format!("failed to read skill: {error}")))?;
+        if !should_apply_versioned(
+          local.as_ref().map(|local| local.version),
+          local.as_ref().map(|local| local.updated_at_ms),
+          local.as_ref().map(|local| local.scope),
+          record.version,
+          record.updated_at_ms,
+          ResourceScope::ClusterShared,
+        ) {
+          return Ok(());
+        }
+        self
+          .storage
+          .workspace()
+          .skills()
+          .upsert(&record)
+          .map_err(|error| Status::internal(format!("failed to upsert skill: {error}")))?;
+        if should_write_content(local.as_ref(), body.content.is_empty(), &body.content_hash) {
+          self
+            .storage
+            .workspace()
+            .skill_content()
+            .write(&record.id, &body.content, &record.content_hash)
+            .map_err(|error| Status::internal(format!("failed to write skill content: {error}")))?;
+        }
+      }
+      (ResourceKind::Rule, Some(Body::Rule(body))) => {
+        if body.content.is_empty() {
+          return Ok(());
+        }
+        let record = resource_to_rule(metadata, body)?;
+        verify_content_hash(&body.content, &body.content_hash)?;
+        let local = self
+          .storage
+          .workspace()
+          .rules()
+          .get(&record.id)
+          .map_err(|error| Status::internal(format!("failed to read rule: {error}")))?;
+        if !should_apply_versioned(
+          local.as_ref().map(|local| local.version),
+          local.as_ref().map(|local| local.updated_at_ms),
+          local.as_ref().map(|local| local.scope),
+          record.version,
+          record.updated_at_ms,
+          ResourceScope::ClusterShared,
+        ) {
+          return Ok(());
+        }
+        self
+          .storage
+          .workspace()
+          .rules()
+          .upsert(&record)
+          .map_err(|error| Status::internal(format!("failed to upsert rule: {error}")))?;
+        if should_write_content(local.as_ref(), body.content.is_empty(), &body.content_hash) {
+          self
+            .storage
+            .workspace()
+            .rule_content()
+            .write(&record.id, &body.content, &record.content_hash)
+            .map_err(|error| Status::internal(format!("failed to write rule content: {error}")))?;
+        }
+      }
+      (ResourceKind::Workspace, Some(Body::Workspace(body))) => {
+        let record = resource_to_workspace(metadata, body)?;
+        let computed_hash = record.compute_content_hash().map_err(|error| {
+          Status::internal(format!("failed to compute workspace content hash: {error}"))
+        })?;
+        if computed_hash != body.content_hash {
+          return Err(Status::invalid_argument(format!(
+            "workspace content hash mismatch: expected {}, got {}",
+            body.content_hash, computed_hash
+          )));
+        }
+        let local = self
+          .storage
+          .workspace()
+          .workspaces()
+          .get(&record.id)
+          .map_err(|error| Status::internal(format!("failed to read workspace: {error}")))?;
+        if !should_apply_versioned(
+          local.as_ref().map(|local| local.version),
+          local.as_ref().map(|local| local.updated_at_ms),
+          local.as_ref().map(|local| local.scope),
+          record.version,
+          record.updated_at_ms,
+          ResourceScope::ClusterShared,
+        ) {
+          return Ok(());
+        }
+        self
+          .storage
+          .workspace()
+          .workspaces()
+          .upsert(&record)
+          .map_err(|error| Status::internal(format!("failed to upsert workspace: {error}")))?;
+      }
+      _ => {}
+    }
+
+    Ok(())
+  }
+
+  /// Return all cluster-shared resources as `Resource` protos.
+  pub async fn local_shared_resources(&self) -> Result<Vec<Resource>, Status> {
+    let mut resources = Vec::new();
+
+    let memories = self
+      .storage
+      .agent()
+      .memory()
+      .list_shared()
+      .await
+      .map_err(|error| Status::internal(format!("failed to list shared memories: {error}")))?;
+    for entry in memories {
+      resources.push(memory_to_resource(entry, true));
+    }
+
+    let workspaces = self
+      .storage
+      .workspace()
+      .workspaces()
+      .list_shared()
+      .map_err(|error| Status::internal(format!("failed to list shared workspaces: {error}")))?;
+    for workspace in workspaces {
+      resources.push(workspace_to_resource(workspace));
+    }
+
+    let skills = self
+      .storage
+      .workspace()
+      .skills()
+      .list_shared()
+      .map_err(|error| Status::internal(format!("failed to list shared skills: {error}")))?;
+    for skill in skills {
+      let content = self
+        .storage
+        .workspace()
+        .skill_content()
+        .read(&skill.id)
+        .map_err(|error| Status::internal(format!("failed to read skill content: {error}")))?;
+      resources.push(skill_to_resource(skill, content));
+    }
+
+    let rules = self
+      .storage
+      .workspace()
+      .rules()
+      .list_shared()
+      .map_err(|error| Status::internal(format!("failed to list shared rules: {error}")))?;
+    for rule in rules {
+      let content = self
+        .storage
+        .workspace()
+        .rule_content()
+        .read(&rule.id)
+        .map_err(|error| Status::internal(format!("failed to read rule content: {error}")))?;
+      resources.push(rule_to_resource(rule, content));
+    }
+
+    Ok(resources)
   }
 }
 
@@ -263,7 +502,16 @@ fn session_to_resource(session: Session) -> Resource {
 }
 
 fn memory_to_resource(entry: MemoryEntry, full: bool) -> Resource {
-  let content = if full { entry.content } else { Vec::new() };
+  let content = if full {
+    entry.content.clone()
+  } else {
+    Vec::new()
+  };
+  let embedding = if full {
+    entry.embedding.clone()
+  } else {
+    Vec::new()
+  };
 
   Resource {
     metadata: Some(ResourceMetadata {
@@ -272,14 +520,19 @@ fn memory_to_resource(entry: MemoryEntry, full: bool) -> Resource {
       kind: ResourceKind::Memory as i32,
       labels: entry.metadata.clone(),
       annotations: HashMap::new(),
-      scope: String::new(),
-      source_node_id: String::new(),
+      scope: scope_to_string(entry.scope),
+      source_node_id: entry.source_node_id.clone().unwrap_or_default(),
       created_at_ms: 0,
-      updated_at_ms: 0,
+      updated_at_ms: entry.updated_at_ms,
     }),
     body: Some(Body::Memory(MemoryBody {
       content,
       metadata: entry.metadata,
+      scope: scope_to_string(entry.scope),
+      source_node_id: entry.source_node_id.unwrap_or_default(),
+      updated_at_ms: entry.updated_at_ms,
+      content_hash: entry.content_hash,
+      embedding,
     })),
   }
 }
@@ -293,7 +546,7 @@ fn skill_to_resource(skill: SkillRecord, content: Option<String>) -> Resource {
       labels: skill.metadata.clone(),
       annotations: HashMap::new(),
       scope: scope_to_string(skill.scope),
-      source_node_id: skill.source_node_id.unwrap_or_default(),
+      source_node_id: skill.source_node_id.clone().unwrap_or_default(),
       created_at_ms: skill.updated_at_ms,
       updated_at_ms: skill.updated_at_ms,
     }),
@@ -315,7 +568,7 @@ fn rule_to_resource(rule: RuleRecord, content: Option<String>) -> Resource {
       labels: rule.metadata.clone(),
       annotations: HashMap::new(),
       scope: scope_to_string(rule.scope),
-      source_node_id: rule.source_node_id.unwrap_or_default(),
+      source_node_id: rule.source_node_id.clone().unwrap_or_default(),
       created_at_ms: rule.updated_at_ms,
       updated_at_ms: rule.updated_at_ms,
     }),
@@ -336,8 +589,8 @@ fn workspace_to_resource(workspace: WorkspaceRecord) -> Resource {
       kind: ResourceKind::Workspace as i32,
       labels: workspace.metadata.clone(),
       annotations: HashMap::new(),
-      scope: String::new(),
-      source_node_id: String::new(),
+      scope: scope_to_string(workspace.scope),
+      source_node_id: workspace.source_node_id.clone().unwrap_or_default(),
       created_at_ms: workspace.created_at_ms,
       updated_at_ms: workspace.updated_at_ms,
     }),
@@ -345,6 +598,10 @@ fn workspace_to_resource(workspace: WorkspaceRecord) -> Resource {
       root: workspace.root.to_string_lossy().to_string(),
       session_ids: workspace.session_ids,
       metadata: workspace.metadata,
+      scope: scope_to_string(workspace.scope),
+      source_node_id: workspace.source_node_id.unwrap_or_default(),
+      version: workspace.version,
+      content_hash: workspace.content_hash,
     })),
   }
 }
@@ -378,128 +635,19 @@ pub fn parse_scope(raw: &str) -> Result<Option<ResourceScope>, Status> {
   }
 }
 
-impl ResourceMapper {
-  /// Merge an incoming shared resource into local storage.
-  ///
-  /// Only `ClusterShared` skills and rules are accepted. The content body is
-  /// written to the filesystem-backed content store when present.
-  pub async fn apply_resource(&self, resource: &Resource) -> Result<(), Status> {
-    let metadata = resource
-      .metadata
-      .as_ref()
-      .ok_or_else(|| Status::invalid_argument("missing resource metadata"))?;
-    let kind = parse_kind(metadata.kind)?;
-    let scope = parse_scope(&metadata.scope)?;
-
-    if scope != Some(ResourceScope::ClusterShared) {
-      return Ok(());
-    }
-
-    match (kind, resource.body.as_ref()) {
-      (ResourceKind::Skill, Some(Body::Skill(body))) => {
-        if body.content.is_empty() {
-          return Ok(());
-        }
-        let record = resource_to_skill(metadata, body)?;
-        verify_content_hash(&body.content, &body.content_hash)?;
-        let local = self
-          .storage
-          .workspace()
-          .skills()
-          .get(&record.id)
-          .map_err(|error| Status::internal(format!("failed to read skill: {error}")))?;
-        if !should_apply_resource(local.as_ref(), &record) {
-          return Ok(());
-        }
-        self
-          .storage
-          .workspace()
-          .skills()
-          .upsert(&record)
-          .map_err(|error| Status::internal(format!("failed to upsert skill: {error}")))?;
-        if should_write_content(local.as_ref(), body.content.is_empty(), &body.content_hash) {
-          self
-            .storage
-            .workspace()
-            .skill_content()
-            .write(&record.id, &body.content, &record.content_hash)
-            .map_err(|error| Status::internal(format!("failed to write skill content: {error}")))?;
-        }
-      }
-      (ResourceKind::Rule, Some(Body::Rule(body))) => {
-        if body.content.is_empty() {
-          return Ok(());
-        }
-        let record = resource_to_rule(metadata, body)?;
-        verify_content_hash(&body.content, &body.content_hash)?;
-        let local = self
-          .storage
-          .workspace()
-          .rules()
-          .get(&record.id)
-          .map_err(|error| Status::internal(format!("failed to read rule: {error}")))?;
-        if !should_apply_resource(local.as_ref(), &record) {
-          return Ok(());
-        }
-        self
-          .storage
-          .workspace()
-          .rules()
-          .upsert(&record)
-          .map_err(|error| Status::internal(format!("failed to upsert rule: {error}")))?;
-        if should_write_content(local.as_ref(), body.content.is_empty(), &body.content_hash) {
-          self
-            .storage
-            .workspace()
-            .rule_content()
-            .write(&record.id, &body.content, &record.content_hash)
-            .map_err(|error| Status::internal(format!("failed to write rule content: {error}")))?;
-        }
-      }
-      _ => {}
-    }
-
-    Ok(())
-  }
-
-  /// Return all cluster-shared skills and rules as `Resource` protos.
-  pub fn local_shared_resources(&self) -> Result<Vec<Resource>, Status> {
-    let mut resources = Vec::new();
-
-    let skills = self
-      .storage
-      .workspace()
-      .skills()
-      .list_shared()
-      .map_err(|error| Status::internal(format!("failed to list shared skills: {error}")))?;
-    for skill in skills {
-      let content = self
-        .storage
-        .workspace()
-        .skill_content()
-        .read(&skill.id)
-        .map_err(|error| Status::internal(format!("failed to read skill content: {error}")))?;
-      resources.push(skill_to_resource(skill, content));
-    }
-
-    let rules = self
-      .storage
-      .workspace()
-      .rules()
-      .list_shared()
-      .map_err(|error| Status::internal(format!("failed to list shared rules: {error}")))?;
-    for rule in rules {
-      let content = self
-        .storage
-        .workspace()
-        .rule_content()
-        .read(&rule.id)
-        .map_err(|error| Status::internal(format!("failed to read rule content: {error}")))?;
-      resources.push(rule_to_resource(rule, content));
-    }
-
-    Ok(resources)
-  }
+fn resource_to_memory(
+  metadata: &ResourceMetadata, body: &MemoryBody,
+) -> Result<MemoryEntry, Status> {
+  Ok(MemoryEntry {
+    id: metadata.id.clone(),
+    content: body.content.clone(),
+    embedding: body.embedding.clone(),
+    metadata: body.metadata.clone(),
+    scope: ResourceScope::ClusterShared,
+    source_node_id: Some(metadata.source_node_id.clone()).filter(|s| !s.is_empty()),
+    updated_at_ms: metadata.updated_at_ms,
+    content_hash: body.content_hash.clone(),
+  })
 }
 
 fn resource_to_skill(metadata: &ResourceMetadata, body: &SkillBody) -> Result<SkillRecord, Status> {
@@ -528,6 +676,23 @@ fn resource_to_rule(metadata: &ResourceMetadata, body: &RuleBody) -> Result<Rule
   })
 }
 
+fn resource_to_workspace(
+  metadata: &ResourceMetadata, body: &WorkspaceBody,
+) -> Result<WorkspaceRecord, Status> {
+  Ok(WorkspaceRecord {
+    id: metadata.id.clone(),
+    root: body.root.clone().into(),
+    session_ids: body.session_ids.clone(),
+    metadata: body.metadata.clone(),
+    scope: ResourceScope::ClusterShared,
+    source_node_id: Some(metadata.source_node_id.clone()).filter(|s| !s.is_empty()),
+    version: body.version,
+    content_hash: body.content_hash.clone(),
+    created_at_ms: metadata.created_at_ms,
+    updated_at_ms: metadata.updated_at_ms,
+  })
+}
+
 fn verify_content_hash(content: &str, expected: &str) -> Result<(), Status> {
   let actual = blake3::hash(content.as_bytes()).to_hex().to_string();
   if actual != expected {
@@ -538,15 +703,34 @@ fn verify_content_hash(content: &str, expected: &str) -> Result<(), Status> {
   Ok(())
 }
 
-fn should_apply_resource(local: Option<&VersionedResource>, remote: &VersionedResource) -> bool {
-  match local {
-    None => true,
-    Some(local) => {
-      if remote.version != local.version {
-        return remote.version > local.version;
-      }
-      remote.updated_at_ms > local.updated_at_ms
-    }
+fn verify_content_hash_bytes(content: &[u8], expected: &str) -> Result<(), Status> {
+  let actual = blake3::hash(content).to_hex().to_string();
+  if actual != expected {
+    return Err(Status::invalid_argument(format!(
+      "content hash mismatch: expected {expected}, got {actual}"
+    )));
+  }
+  Ok(())
+}
+
+/// Determine whether a remote resource should overwrite a local one.
+///
+/// Local `NodeLocal` resources are never overwritten by remote shared
+/// resources. Otherwise, the higher version wins; if versions are equal, the
+/// more recent `updated_at_ms` wins.
+fn should_apply_versioned(
+  local_version: Option<u64>, local_updated_at_ms: Option<i64>, local_scope: Option<ResourceScope>,
+  remote_version: u64, remote_updated_at_ms: i64, remote_scope: ResourceScope,
+) -> bool {
+  if remote_scope != ResourceScope::ClusterShared {
+    return false;
+  }
+  match (local_version, local_updated_at_ms, local_scope) {
+    (None, ..) => true,
+    (_, _, Some(ResourceScope::NodeLocal)) => false,
+    (Some(local_version), ..) if remote_version != local_version => remote_version > local_version,
+    (Some(_), Some(local_updated_at_ms), _) => remote_updated_at_ms > local_updated_at_ms,
+    (Some(_), None, _) => true,
   }
 }
 

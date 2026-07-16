@@ -419,7 +419,7 @@ impl ClusterSync {
   async fn sync_resources_with_peer(&self, peer: &str) -> Result<(), ClientError> {
     let mut client = self.connect_peer(peer).await?;
 
-    let local_resources = match self.mapper.local_shared_resources() {
+    let local_resources = match self.mapper.local_shared_resources().await {
       Ok(resources) => resources,
       Err(error) => {
         tracing::warn!(%peer, %error, "failed to read local shared resources");
@@ -462,7 +462,11 @@ impl ClusterSync {
       }
     }
 
-    let local_resources = self.mapper.local_shared_resources().unwrap_or_default();
+    let local_resources = self
+      .mapper
+      .local_shared_resources()
+      .await
+      .unwrap_or_default();
     Ok(Response::new(lycoris_proto::node::SyncResourcesResponse {
       resources: local_resources,
     }))

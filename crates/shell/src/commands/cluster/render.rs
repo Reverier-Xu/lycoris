@@ -127,6 +127,8 @@ fn render_generic(resource: &ProtoResource, compact: bool) {
       }
       Some(Body::Memory(body)) => {
         println!("  content length: {}", body.content.len());
+        println!("  embedding dim:  {}", body.embedding.len());
+        println!("  content hash:   {}", body.content_hash);
         println!("  metadata:       {:?}", body.metadata);
       }
       Some(Body::Skill(body)) => {
@@ -143,6 +145,8 @@ fn render_generic(resource: &ProtoResource, compact: bool) {
       }
       Some(Body::Workspace(body)) => {
         println!("  root:           {}", body.root);
+        println!("  version:        {}", body.version);
+        println!("  content hash:   {}", body.content_hash);
         println!("  sessions:       {:?}", body.session_ids);
         println!("  metadata:       {:?}", body.metadata);
       }
