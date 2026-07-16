@@ -1,9 +1,10 @@
-use lycoris_config::{ClientConfig, DaemonConfig};
-use lycoris_core::paths::{default_client_config_path, default_daemon_config_path};
+use lycoris_config::{
+  ClientConfig, DaemonConfig, default_client_config_path, default_daemon_config_path,
+};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
-pub enum ShellConfigError {
+pub(crate) enum ShellConfigError {
   #[error("client config not found and no daemon config available to derive one")]
   NotFound,
   #[error("failed to read client config: {0}")]
@@ -18,7 +19,7 @@ pub enum ShellConfigError {
 ///    directory, use it.
 /// 2. Otherwise, fall back to parsing the daemon configuration and deriving a
 ///    client configuration from it (same node address + TLS material).
-pub fn load_client_config() -> Result<ClientConfig, ShellConfigError> {
+pub(crate) fn load_client_config() -> Result<ClientConfig, ShellConfigError> {
   if let Some(path) = default_client_config_path()
     && path.is_file()
   {

@@ -3,7 +3,7 @@ use owo_colors::OwoColorize;
 
 use super::parse::resource_name;
 
-pub fn render_list(kind: ResourceKind, resources: &[ProtoResource], local_id: &str) {
+pub(crate) fn render_list(kind: ResourceKind, resources: &[ProtoResource], local_id: &str) {
   match kind {
     ResourceKind::Node => render_node_list(resources, local_id),
     _ => render_generic_list(resources),
@@ -60,7 +60,7 @@ fn render_generic_list(resources: &[ProtoResource]) {
   }
 }
 
-pub fn render_resource(
+pub(crate) fn render_resource(
   resource: &ProtoResource, kind: ResourceKind, local_id: &str, compact: bool,
 ) {
   match kind {

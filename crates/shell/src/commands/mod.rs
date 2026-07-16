@@ -1,3 +1,3 @@
-pub mod cluster;
-pub mod daemon;
-pub mod setup;
+pub(crate) mod cluster;
+pub(crate) mod daemon;
+pub(crate) mod setup;

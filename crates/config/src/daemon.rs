@@ -1,11 +1,10 @@
 use std::{fs, path::Path};
 
-use lycoris_core::{
-  paths::{default_data_dir, ensure_dir},
-  validation::non_empty_string,
-};
+use lycoris_core::non_empty_string;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use crate::paths::default_data_dir;
 
 /// Node bootstrap configuration.
 ///
@@ -55,7 +54,7 @@ impl DaemonConfig {
   pub fn write_to_file<P: AsRef<Path>>(&self, path: P) -> Result<(), ConfigError> {
     let parent = path.as_ref().parent();
     if let Some(parent) = parent {
-      ensure_dir(parent)?;
+      std::fs::create_dir_all(parent)?;
     }
     fs::write(path.as_ref(), toml::to_string_pretty(self)?)?;
     Ok(())

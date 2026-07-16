@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
-use lycoris_core::{MemberRegister, MemberState, Membership};
+use crate::{
+  membership::Membership,
+  register::{MemberRegister, MemberState},
+};
 
 /// Configuration for the SWIM failure detector.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -111,9 +114,7 @@ impl Swim {
   ///
   /// This updates the CRDT register (if the node is already known).
   pub fn heartbeat(&mut self, node_id: &str, now_ms: i64) {
-    if let Some(register) = self.membership.get_mut(node_id) {
-      register.heartbeat(now_ms);
-    }
+    self.membership.heartbeat(node_id, now_ms);
   }
 
   /// Process an incoming SWIM message from `from`.
@@ -161,8 +162,8 @@ impl Swim {
       .membership
       .active()
       .into_iter()
-      .filter(|r| r.node_id != self.local_node_id)
-      .map(|r| r.node_id.clone())
+      .filter(|r| r.node_id() != self.local_node_id)
+      .map(|r| r.node_id().to_string())
       .collect();
 
     let mut candidate: Option<String> = None;
@@ -201,7 +202,7 @@ impl Swim {
 
     let mut actions = Vec::new();
     if let Some(register) = self.membership.get(&target)
-      && register.state == MemberState::Suspected
+      && register.state() == MemberState::Suspected
     {
       actions.push(SwimAction::Broadcast(SwimMessage::Alive {
         register: register.clone(),
@@ -214,8 +215,8 @@ impl Swim {
     &mut self, node_id: &str, incarnation: u64, now_ms: i64,
   ) -> Vec<SwimAction> {
     if node_id == self.local_node_id {
-      if let Some(register) = self.membership.get_mut(node_id) {
-        register.refute(now_ms);
+      self.membership.refute(node_id, now_ms);
+      if let Some(register) = self.membership.get(node_id) {
         return vec![SwimAction::Broadcast(SwimMessage::Alive {
           register: register.clone(),
         })];
@@ -224,11 +225,11 @@ impl Swim {
     }
 
     if let Some(existing) = self.membership.get(node_id) {
-      if existing.incarnation > incarnation {
+      if existing.incarnation() > incarnation {
         return Vec::new();
       }
       let mut register = existing.clone();
-      register.incarnation = incarnation;
+      register.set_incarnation(incarnation);
       register.suspect(now_ms);
       self.membership.merge_register(&register);
     }
@@ -236,7 +237,7 @@ impl Swim {
   }
 
   fn handle_alive_state(&mut self, register: &MemberRegister, now_ms: i64) {
-    if register.node_id == self.local_node_id {
+    if register.node_id() == self.local_node_id {
       return;
     }
     self.membership.merge_register(register);
@@ -251,18 +252,18 @@ impl Swim {
       return;
     };
 
-    if existing.incarnation > incarnation {
+    if existing.incarnation() > incarnation {
       return;
     }
 
     // A Leave rumor for the same incarnation must not revive a node that has
     // already been confirmed Offline.
-    if existing.incarnation == incarnation && existing.state == MemberState::Offline {
+    if existing.incarnation() == incarnation && existing.state() == MemberState::Offline {
       return;
     }
 
     let mut register = existing.clone();
-    register.incarnation = incarnation;
+    register.set_incarnation(incarnation);
     register.leave(now_ms);
     self.membership.merge_register(&register);
   }
@@ -292,17 +293,15 @@ impl Swim {
       .active()
       .into_iter()
       .filter(|register| {
-        register.node_id != self.local_node_id
-          && register.state == MemberState::Suspected
-          && now_ms.saturating_sub(register.updated_at_ms) >= timeout
+        register.node_id() != self.local_node_id
+          && register.state() == MemberState::Suspected
+          && now_ms.saturating_sub(register.updated_at_ms()) >= timeout
       })
-      .map(|register| register.node_id.clone())
+      .map(|register| register.node_id().to_string())
       .collect();
 
     for node_id in expired {
-      if let Some(register) = self.membership.get_mut(&node_id) {
-        register.offline(now_ms);
-      }
+      self.membership.offline(&node_id, now_ms);
     }
 
     Vec::new()
@@ -322,13 +321,10 @@ impl Swim {
 
     self.consecutive_failures.remove(target);
 
-    if let Some(register) = self.membership.get_mut(target)
-      && register.state == MemberState::Active
-    {
-      register.suspect(now_ms);
+    if let Some(incarnation) = self.membership.suspect(target, now_ms) {
       actions.push(SwimAction::Broadcast(SwimMessage::Suspect {
         node_id: target.to_string(),
-        incarnation: register.incarnation,
+        incarnation,
       }));
     }
     actions
@@ -362,15 +358,11 @@ mod tests {
   use super::*;
 
   fn local_register(id: &str) -> MemberRegister {
-    let mut r = MemberRegister::new(id, "127.0.0.1:1", 1, 0);
-    r.updated_at_ms = 0;
-    r
+    MemberRegister::new(id, "127.0.0.1:1", 1, 0).with_updated_at_ms(0)
   }
 
   fn peer_register(id: &str) -> MemberRegister {
-    let mut r = MemberRegister::new(id, "127.0.0.1:2", 1, 0);
-    r.updated_at_ms = 0;
-    r
+    MemberRegister::new(id, "127.0.0.1:2", 1, 0).with_updated_at_ms(0)
   }
 
   #[test]
@@ -397,7 +389,7 @@ mod tests {
     let ack_actions = swim.on_message("peer", SwimMessage::Ack { seq }, 1_100);
     assert!(ack_actions.is_empty());
     assert!(swim.pending_pings.is_empty());
-    assert!(swim.membership.get("peer").unwrap().heartbeat > 0);
+    assert!(swim.membership.get("peer").unwrap().heartbeat() > 0);
   }
 
   #[test]
@@ -422,7 +414,7 @@ mod tests {
     });
     assert!(has_suspect);
     assert_eq!(
-      swim.membership.get("peer").unwrap().state,
+      swim.membership.get("peer").unwrap().state(),
       MemberState::Suspected
     );
   }
@@ -446,7 +438,7 @@ mod tests {
         .any(|a| matches!(a, SwimAction::Broadcast(SwimMessage::Suspect { .. })))
     );
     assert_eq!(
-      swim.membership.get("peer").unwrap().state,
+      swim.membership.get("peer").unwrap().state(),
       MemberState::Active
     );
 
@@ -464,7 +456,7 @@ mod tests {
         .any(|a| matches!(a, SwimAction::Broadcast(SwimMessage::Suspect { .. })))
     );
     assert_eq!(
-      swim.membership.get("peer").unwrap().state,
+      swim.membership.get("peer").unwrap().state(),
       MemberState::Suspected
     );
   }
@@ -484,7 +476,7 @@ mod tests {
     );
 
     assert_eq!(
-      swim.membership.get("peer").unwrap().state,
+      swim.membership.get("peer").unwrap().state(),
       MemberState::Suspected
     );
   }
@@ -504,12 +496,12 @@ mod tests {
     );
 
     let local = swim.membership.get("local").unwrap();
-    assert_eq!(local.state, MemberState::Active);
-    assert!(local.incarnation > 1);
+    assert_eq!(local.state(), MemberState::Active);
+    assert!(local.incarnation() > 1);
     assert!(
       actions.iter().any(|a| matches!(
         a,
-        SwimAction::Broadcast(SwimMessage::Alive { register }) if register.node_id == "local"
+        SwimAction::Broadcast(SwimMessage::Alive { register }) if register.node_id() == "local"
       )),
       "expected an Alive broadcast for the local node"
     );
@@ -519,10 +511,10 @@ mod tests {
   fn alive_state_merges_register() {
     let mut swim = Swim::new("local", SwimConfig::default(), local_register("local"));
     let mut register = peer_register("peer");
-    register.heartbeat(2_000);
+    register.bump_heartbeat(2_000);
 
     swim.on_message("peer", SwimMessage::Alive { register }, 2_000);
-    assert_eq!(swim.membership.get("peer").unwrap().heartbeat, 1);
+    assert_eq!(swim.membership.get("peer").unwrap().heartbeat(), 1);
   }
 
   #[test]

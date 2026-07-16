@@ -1,12 +1,12 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
-pub mod agent;
-pub mod workspace;
-
-pub(crate) mod bytes;
-pub(crate) mod error;
-pub mod node;
+mod agent;
+mod bytes;
+mod error;
+mod node;
+mod versioned;
+mod workspace;
 
 use std::{path::Path, sync::Arc};
 
@@ -14,24 +14,24 @@ pub use agent::{
   AgentDomain, AgentStorageError, MemoryEntry, MemoryStorage, Session, SessionStorage,
 };
 pub use error::StorageError;
+pub use lycoris_core::ResourceScope;
 pub use node::{LocalStorage, NodeDomain, PeerRecord, PeerStorage};
 use redb::Database;
-use tokio::sync::Notify;
+pub use versioned::{VersionedRecord, should_apply_versioned};
 pub use workspace::{
-  RedbRuleStorage, RedbSkillStorage, RedbWorkspaceStorage, ResourceScope, RuleRecord, RuleStorage,
-  SkillRecord, SkillStorage, Workspace, WorkspaceDomain, WorkspaceMetadataStorage, WorkspaceRecord,
-  WorkspaceStorageError,
+  RedbRuleStorage, RedbSkillStorage, RedbWorkspaceStorage, RuleRecord, RuleStorage, SkillRecord,
+  SkillStorage, VersionedContentStore, VersionedResource, WorkspaceDomain,
+  WorkspaceMetadataStorage, WorkspaceRecord, WorkspaceStorageError,
 };
 
-/// Unified storage facade.
-///
 /// `Storage` is the top-level entry point for all persistent state. It owns a
 /// single `redb::Database` and hands out lightweight, cloneable domain handles
 /// for node-local state, agent orchestration state, and workspace state.
 #[derive(Debug, Clone)]
 pub struct Storage {
+  #[allow(dead_code)]
   db: Arc<Database>,
-  notify: Arc<Notify>,
+  node: NodeDomain,
   agent: AgentDomain,
   workspace: WorkspaceDomain,
 }
@@ -69,20 +69,20 @@ impl Storage {
 
     Ok(Self {
       db: db.clone(),
-      notify: Arc::new(Notify::new()),
+      node: NodeDomain::new(db.clone()),
       agent: AgentDomain::new(db.clone(), data_dir.clone()),
       workspace: WorkspaceDomain::new(db, data_dir)?,
     })
   }
 
   /// Access the node-local storage domain.
-  pub fn node(&self) -> NodeDomain {
-    NodeDomain::new(self.db.clone(), self.notify.clone())
+  pub fn node(&self) -> &NodeDomain {
+    &self.node
   }
 
   /// Access the agent orchestration storage domain.
-  pub fn agent(&self) -> AgentDomain {
-    self.agent.clone()
+  pub fn agent(&self) -> &AgentDomain {
+    &self.agent
   }
 
   /// Access the workspace storage domain.

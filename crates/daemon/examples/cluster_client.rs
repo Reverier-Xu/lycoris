@@ -1,8 +1,7 @@
 use std::{collections::HashMap, time::Duration};
 
-use lycoris_client::{ClientError, ClusterClient, install_crypto_provider};
-use lycoris_core::SimpleNode;
-use lycoris_tls::load_client_tls;
+use lycoris_client::{ClientError, ClusterClient};
+use lycoris_tls::{install_crypto_provider, load_tls_bundle};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -11,6 +10,8 @@ enum ExampleError {
   CryptoProvider(std::sync::Arc<rustls::crypto::CryptoProvider>),
   #[error("io error: {0}")]
   Io(#[from] std::io::Error),
+  #[error("tls error: {0}")]
+  Tls(#[from] lycoris_tls::TlsError),
   #[error("cluster client error: {0}")]
   Cluster(#[from] ClientError),
   #[error("{0} not visible on {1}")]
@@ -38,21 +39,20 @@ async fn main() -> Result<(), ExampleError> {
   let expected_id = &args[6];
   let cluster_key = &args[7];
 
-  let tls = load_client_tls(cert_path, key_path, ca_path)?;
+  let tls = load_tls_bundle(cert_path, key_path, ca_path)?;
 
-  let mut client = ClusterClient::connect_with_tls(register_addr, tls.clone()).await?;
-  let node = SimpleNode::new(
-    expected_id.clone(),
-    "127.0.0.1:59999".to_string(),
-    HashMap::new(),
-    HashMap::new(),
-  );
-  client.register(&node, cluster_key).await?;
+  let mut client = ClusterClient::connect(register_addr, &tls)
+    .await?
+    .with_cluster_key(cluster_key.to_string());
+  let node = proto_node_info(expected_id.clone(), "127.0.0.1:59999".to_string());
+  client.register(node, cluster_key).await?;
   println!("registered {expected_id} via {register_addr}");
 
   tokio::time::sleep(Duration::from_secs(2)).await;
 
-  let mut client = ClusterClient::connect_with_tls(query_addr, tls).await?;
+  let mut client = ClusterClient::connect(query_addr, &tls)
+    .await?
+    .with_cluster_key(cluster_key.to_string());
   let resources = client
     .list_resources(
       lycoris_proto::node::ResourceKind::Node,
@@ -79,5 +79,23 @@ async fn main() -> Result<(), ExampleError> {
       expected_id.clone(),
       query_addr.clone(),
     ))
+  }
+}
+
+fn proto_node_info(
+  id: impl Into<String>, address: impl Into<String>,
+) -> lycoris_proto::node::NodeInfo {
+  use lycoris_core::now_ms;
+  lycoris_proto::node::NodeInfo {
+    id: id.into(),
+    address: address.into(),
+    labels: HashMap::new(),
+    annotations: HashMap::new(),
+    last_heartbeat_unix_ms: now_ms(),
+    state: "active".to_string(),
+    incarnation: 1,
+    heartbeat: 0,
+    in_degree: Vec::new(),
+    out_degree: Vec::new(),
   }
 }

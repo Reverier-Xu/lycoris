@@ -1,14 +1,12 @@
 use std::collections::HashMap;
 
-use lycoris_core::{MemberRegister, MemberState, Membership, matches_selector, time::now_ms};
+use lycoris_core::{matches_selector, now_ms};
+use lycoris_membership::{
+  Hash as MerkleHash, MemberRegister, MemberState, MerkleTree, Swim, SwimAction, SwimConfig,
+  SwimMessage,
+};
 use lycoris_proto::node::NodeInfo as ProtoNodeInfo;
 use tokio::sync::Mutex;
-
-use crate::membership::{
-  MerkleTree,
-  merkle::Hash as MerkleHash,
-  swim::{Swim, SwimAction, SwimConfig, SwimMessage},
-};
 
 /// Bridge between the CRDT/SWIM membership layer and the rest of the daemon.
 ///
@@ -64,13 +62,11 @@ impl MembershipService {
       .swim
       .membership()
       .get(node_id)
-      .map(|register| register.incarnation)
+      .map(|register| register.incarnation())
       .unwrap_or(1);
 
     if node_id == self.local_node_id {
-      if let Some(register) = state.swim.membership_mut().get_mut(node_id) {
-        register.leave(now_ms);
-      }
+      state.swim.membership_mut().leave(node_id, now_ms);
     } else {
       state.swim.on_message(
         &self.local_node_id,
@@ -96,7 +92,7 @@ impl MembershipService {
       .membership()
       .active()
       .into_iter()
-      .filter(|register| matches_selector(&register.labels, selector))
+      .filter(|register| matches_selector(register.labels(), selector))
       .map(register_to_proto)
       .collect()
   }
@@ -124,18 +120,49 @@ impl MembershipService {
       .collect()
   }
 
-  /// Return the current Merkle root hash and all leaf hashes.
-  pub async fn merkle_root(&self) -> MerkleRoot {
+  /// Return the current Merkle root hash.
+  pub async fn merkle_root(&self) -> MerkleHash {
+    let state = self.state.lock().await;
+    MerkleTree::from_membership(state.swim.membership()).root_hash()
+  }
+
+  /// Return a snapshot of the current Merkle tree.
+  pub async fn merkle_tree_snapshot(&self) -> MerkleTree {
+    let state = self.state.lock().await;
+    MerkleTree::from_membership(state.swim.membership())
+  }
+
+  /// Return hashes and optional leaf contents for a batch of Merkle tree refs.
+  ///
+  /// Invalid refs (depth > `MERKLE_TREE_DEPTH` or index out of range) are
+  /// skipped silently.
+  pub async fn merkle_nodes(
+    &self, refs: Vec<(u8, u64)>,
+  ) -> Vec<(u8, u64, MerkleHash, bool, Vec<(String, MerkleHash)>)> {
     let state = self.state.lock().await;
     let tree = MerkleTree::from_membership(state.swim.membership());
-    MerkleRoot {
-      root_hash: tree.root_hash().to_vec(),
-      leaf_hashes: tree
-        .leaf_hashes()
-        .into_iter()
-        .map(|(id, hash)| (id, hash.to_vec()))
-        .collect(),
-    }
+    let empty = lycoris_membership::hash_empty();
+
+    refs
+      .into_iter()
+      .filter_map(|(depth, index)| {
+        if depth > lycoris_membership::MERKLE_TREE_DEPTH {
+          return None;
+        }
+        let max_index = 1u64 << depth;
+        if index >= max_index {
+          return None;
+        }
+        let hash = tree.node_hash(depth, index).unwrap_or(empty);
+        let is_leaf = depth == lycoris_membership::MERKLE_TREE_DEPTH;
+        let entries = if is_leaf {
+          tree.leaf_entries(index).unwrap_or_default().to_vec()
+        } else {
+          Vec::new()
+        };
+        Some((depth, index, hash, is_leaf, entries))
+      })
+      .collect()
   }
 
   /// Return registers for the requested node ids.
@@ -169,107 +196,33 @@ impl MembershipService {
       .swim
       .membership()
       .get(node_id)
-      .map(|register| register.address.clone())
+      .map(|register| register.address().to_string())
   }
-
-  /// Compute the symmetric Merkle diff against a remote leaf set.
-  ///
-  /// Returns the node ids missing or differing on each side:
-  /// `(need_from_remote, need_from_local)`.
-  pub async fn merkle_diff(
-    &self, remote_leaves: &[(String, MerkleHash)],
-  ) -> (Vec<String>, Vec<String>) {
-    let mut local_leaves: Vec<(String, MerkleHash)> = {
-      let state = self.state.lock().await;
-      state
-        .swim
-        .membership()
-        .all()
-        .into_iter()
-        .map(|register| (register.node_id.clone(), hash_register(register)))
-        .collect()
-    };
-    local_leaves.sort_by(|a, b| a.0.cmp(&b.0));
-
-    let mut remote_sorted = remote_leaves.to_vec();
-    remote_sorted.sort_by(|a, b| a.0.cmp(&b.0));
-
-    diff_leaf_sets(&local_leaves, &remote_sorted)
-  }
-}
-
-/// Result of a Merkle root query.
-#[derive(Debug, Clone)]
-pub struct MerkleRoot {
-  pub root_hash: Vec<u8>,
-  pub leaf_hashes: Vec<(String, Vec<u8>)>,
-}
-
-fn diff_leaf_sets(
-  local: &[(String, MerkleHash)], remote: &[(String, MerkleHash)],
-) -> (Vec<String>, Vec<String>) {
-  let mut need_from_remote = Vec::new();
-  let mut need_from_local = Vec::new();
-  let mut i = 0usize;
-  let mut j = 0usize;
-
-  while i < local.len() && j < remote.len() {
-    match local[i].0.cmp(&remote[j].0) {
-      std::cmp::Ordering::Less => {
-        need_from_local.push(local[i].0.clone());
-        i += 1;
-      }
-      std::cmp::Ordering::Greater => {
-        need_from_remote.push(remote[j].0.clone());
-        j += 1;
-      }
-      std::cmp::Ordering::Equal => {
-        if local[i].1 != remote[j].1 {
-          need_from_remote.push(local[i].0.clone());
-          need_from_local.push(local[i].0.clone());
-        }
-        i += 1;
-        j += 1;
-      }
-    }
-  }
-
-  while i < local.len() {
-    need_from_local.push(local[i].0.clone());
-    i += 1;
-  }
-  while j < remote.len() {
-    need_from_remote.push(remote[j].0.clone());
-    j += 1;
-  }
-
-  (need_from_remote, need_from_local)
 }
 
 fn proto_to_register(info: &ProtoNodeInfo, now_ms: i64) -> MemberRegister {
-  let mut register = MemberRegister::new(
+  MemberRegister::new(
     info.id.clone(),
     info.address.clone(),
     info.incarnation.max(1),
     info.heartbeat,
-  );
-  register.state = parse_state(&info.state);
-  register.labels = info.labels.clone();
-  register.annotations = info.annotations.clone();
-  register.updated_at_ms = now_ms;
-  register
+  )
+  .with_state(parse_state(&info.state))
+  .with_labels(info.labels.clone())
+  .with_annotations(info.annotations.clone())
+  .with_updated_at_ms(now_ms)
 }
 
 pub fn register_to_proto(register: &MemberRegister) -> ProtoNodeInfo {
   ProtoNodeInfo {
-    id: register.node_id.clone(),
-    address: register.address.clone(),
-    labels: register.labels.clone(),
-    annotations: register.annotations.clone(),
-    last_heartbeat_unix_ms: register.updated_at_ms,
-    state: state_to_string(register.state).to_string(),
-    incarnation: register.incarnation,
-    heartbeat: register.heartbeat,
+    id: register.node_id().to_string(),
+    address: register.address().to_string(),
+    labels: register.labels().clone(),
+    annotations: register.annotations().clone(),
+    last_heartbeat_unix_ms: register.updated_at_ms(),
+    state: state_to_string(register.state()).to_string(),
+    incarnation: register.incarnation(),
+    heartbeat: register.heartbeat(),
     in_degree: Vec::new(),
     out_degree: Vec::new(),
   }
@@ -294,23 +247,12 @@ fn parse_state(s: &str) -> MemberState {
   }
 }
 
-fn hash_register(register: &MemberRegister) -> MerkleHash {
-  MerkleTree::from_membership(&{
-    let mut m = Membership::new();
-    m.merge_register(register);
-    m
-  })
-  .root_hash()
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
 
   fn register(id: &str) -> MemberRegister {
-    let mut r = MemberRegister::new(id, "127.0.0.1:1", 1, 0);
-    r.updated_at_ms = 0;
-    r
+    MemberRegister::new(id, "127.0.0.1:1", 1, 0).with_updated_at_ms(0)
   }
 
   fn proto(id: &str) -> ProtoNodeInfo {
@@ -360,34 +302,42 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn merkle_diff_detects_missing_and_differing_nodes() {
-    let local = register("local");
-    let service = MembershipService::new("local", SwimConfig::default(), local.clone());
+  async fn merkle_root_is_stable() {
+    let service = MembershipService::new("local", SwimConfig::default(), register("local"));
     let _ = service.register(&proto("a")).await;
-    let _ = service.register(&proto("b")).await;
+    let root1 = service.merkle_root().await;
+    let root2 = service.merkle_root().await;
+    assert_eq!(root1, root2);
+  }
 
-    let mut remote_only = proto("c");
-    remote_only.address = "127.0.0.1:3".to_string();
+  #[tokio::test]
+  async fn merkle_nodes_returns_root_and_leaves() {
+    let service = MembershipService::new("local", SwimConfig::default(), register("local"));
+    let _ = service.register(&proto("a")).await;
 
-    let mut remote_b = proto("b");
-    remote_b.address = "127.0.0.1:9".to_string();
+    let root_result = service.merkle_nodes(vec![(0, 0)]).await;
+    assert_eq!(root_result.len(), 1);
+    assert!(!root_result[0].3);
 
-    let remote_leaves = vec![
-      (
-        "b".to_string(),
-        hash_register(&proto_to_register(&remote_b, 0)),
-      ),
-      (
-        "c".to_string(),
-        hash_register(&proto_to_register(&remote_only, 0)),
-      ),
-    ];
+    let leaf_count = 1u64 << lycoris_membership::MERKLE_TREE_DEPTH;
+    let leaf_refs: Vec<(u8, u64)> = (0..leaf_count)
+      .map(|i| (lycoris_membership::MERKLE_TREE_DEPTH, i))
+      .collect();
+    let leaf_results = service.merkle_nodes(leaf_refs).await;
+    assert_eq!(leaf_results.len(), leaf_count as usize);
+    assert!(leaf_results.iter().all(|r| r.3));
+  }
 
-    let (need_from_remote, need_from_local) = service.merkle_diff(&remote_leaves).await;
-    assert!(need_from_remote.contains(&"b".to_string()));
-    assert!(need_from_remote.contains(&"c".to_string()));
-    assert!(need_from_local.contains(&"a".to_string()));
-    assert!(need_from_local.contains(&"b".to_string()));
+  #[tokio::test]
+  async fn merkle_nodes_skips_invalid_refs() {
+    let service = MembershipService::new("local", SwimConfig::default(), register("local"));
+    let results = service
+      .merkle_nodes(vec![
+        (lycoris_membership::MERKLE_TREE_DEPTH + 1, 0),
+        (1, 10),
+      ])
+      .await;
+    assert!(results.is_empty());
   }
 
   #[test]
@@ -399,7 +349,7 @@ mod tests {
       (MemberState::Offline, "offline"),
     ] {
       let mut register = register("node");
-      register.state = state;
+      register.set_state(state);
       let proto = register_to_proto(&register);
       assert_eq!(proto.state, expected);
       assert_eq!(proto.id, "node");

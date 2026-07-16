@@ -10,7 +10,7 @@ const DEFAULT_CONFIG_NAME: &str = "lycoris.toml";
 /// The binary is expected to live in the same directory as the running
 /// `lycoris` executable. This matches the production layout where both the
 /// CLI and daemon code ship as a single binary.
-pub fn run() -> Result<(), ShellError> {
+pub(crate) fn run() -> Result<(), ShellError> {
   let current_exe = env::current_exe().map_err(|error| {
     ShellError::setup(format!(
       "failed to determine current executable path: {error}"
@@ -30,13 +30,13 @@ mod platform {
   use super::{DEFAULT_CONFIG_NAME, SERVICE_NAME};
   use crate::error::ShellError;
 
-  pub fn install(bin_dir: &Path) -> Result<(), ShellError> {
+  pub(crate) fn install(bin_dir: &Path) -> Result<(), ShellError> {
     let home = home_dir()?;
     let systemd_dir = home.join(".config/systemd/user");
     let config_dir =
-      lycoris_core::paths::user_config_dir().unwrap_or_else(|| home.join(".config/lycoris"));
+      lycoris_config::user_config_dir().unwrap_or_else(|| home.join(".config/lycoris"));
     let data_dir =
-      lycoris_core::paths::user_data_dir().unwrap_or_else(|| home.join(".local/share/lycoris"));
+      lycoris_config::user_data_dir().unwrap_or_else(|| home.join(".local/share/lycoris"));
 
     install_common(bin_dir, &systemd_dir, &config_dir, &data_dir)?;
     reload_and_enable_user_systemd()?;
@@ -259,12 +259,12 @@ mod platform {
   use super::{DEFAULT_CONFIG_NAME, SERVICE_NAME};
   use crate::error::ShellError;
 
-  pub fn install(bin_dir: &Path) -> Result<(), ShellError> {
+  pub(crate) fn install(bin_dir: &Path) -> Result<(), ShellError> {
     let home = home_dir()?;
     let launchd_dir = home.join("Library/LaunchAgents");
-    let config_dir = lycoris_core::paths::user_config_dir()
+    let config_dir = lycoris_config::user_config_dir()
       .unwrap_or_else(|| home.join("Library/Application Support/lycoris"));
-    let data_dir = lycoris_core::paths::user_data_dir()
+    let data_dir = lycoris_config::user_data_dir()
       .unwrap_or_else(|| home.join("Library/Application Support/lycoris"));
 
     install_common(bin_dir, &launchd_dir, &config_dir, &data_dir)?;
@@ -393,7 +393,7 @@ mod platform {
   use super::{DEFAULT_CONFIG_NAME, SERVICE_NAME};
   use crate::error::ShellError;
 
-  pub fn install(bin_dir: &Path) -> Result<(), ShellError> {
+  pub(crate) fn install(bin_dir: &Path) -> Result<(), ShellError> {
     let server_binary = bin_dir.join("lycoris");
 
     if !server_binary.is_file() {
@@ -403,9 +403,9 @@ mod platform {
       )));
     }
 
-    let config_dir = lycoris_core::paths::user_config_dir()
+    let config_dir = lycoris_config::user_config_dir()
       .ok_or_else(|| ShellError::setup("failed to determine user config directory"))?;
-    let data_dir = lycoris_core::paths::user_data_dir()
+    let data_dir = lycoris_config::user_data_dir()
       .ok_or_else(|| ShellError::setup("failed to determine user data directory"))?;
 
     fs::create_dir_all(&config_dir).map_err(|error| {

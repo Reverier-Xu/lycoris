@@ -2,14 +2,13 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use lycoris_core::matches_selector;
+use lycoris_core::{ResourceScope, matches_selector};
 use lycoris_proto::node::{
   MemoryBody, NodeBody, Resource, ResourceKind, ResourceMetadata, RuleBody, SessionBody, SkillBody,
   WorkspaceBody, resource::Body,
 };
 use lycoris_storage::{
-  MemoryEntry, ResourceScope, RuleRecord, Session, SkillRecord, Storage, WorkspaceRecord,
-  workspace::{VersionedContentStore, versioned::VersionedResource},
+  MemoryEntry, RuleRecord, Session, SkillRecord, Storage, VersionedContentStore, WorkspaceRecord,
 };
 use tonic::Status;
 
@@ -243,151 +242,45 @@ impl ResourceMapper {
       .as_ref()
       .ok_or_else(|| Status::invalid_argument("missing resource metadata"))?;
     let kind = parse_kind(metadata.kind)?;
-    let scope = parse_scope(&metadata.scope)?;
-
-    if scope != Some(ResourceScope::ClusterShared) {
-      return Ok(());
-    }
 
     match (kind, resource.body.as_ref()) {
       (ResourceKind::Memory, Some(Body::Memory(body))) => {
-        if body.content.is_empty() {
-          return Ok(());
-        }
         let record = resource_to_memory(metadata, body)?;
-        verify_content_hash_bytes(&body.content, &body.content_hash)?;
-        let local = self
-          .storage
-          .agent()
-          .memory()
-          .get(&record.id)
-          .await
-          .map_err(|error| Status::internal(format!("failed to read memory: {error}")))?;
-        if !should_apply_versioned(
-          local.as_ref().map(|local| local.version()),
-          local.as_ref().map(|local| local.updated_at_ms),
-          local.as_ref().map(|local| local.scope),
-          0,
-          record.updated_at_ms,
-          ResourceScope::ClusterShared,
-        ) {
-          return Ok(());
-        }
         self
           .storage
           .agent()
-          .memory()
-          .store(&record)
+          .apply_remote_memory(record, &body.content)
           .await
-          .map_err(|error| Status::internal(format!("failed to store memory: {error}")))?;
+          .map_err(|error| Status::internal(format!("failed to apply remote memory: {error}")))?;
       }
       (ResourceKind::Skill, Some(Body::Skill(body))) => {
-        if body.content.is_empty() {
-          return Ok(());
-        }
         let record = resource_to_skill(metadata, body)?;
-        verify_content_hash(&body.content, &body.content_hash)?;
-        let local = self
-          .storage
-          .workspace()
-          .skills()
-          .get(&record.id)
-          .map_err(|error| Status::internal(format!("failed to read skill: {error}")))?;
-        if !should_apply_versioned(
-          local.as_ref().map(|local| local.version),
-          local.as_ref().map(|local| local.updated_at_ms),
-          local.as_ref().map(|local| local.scope),
-          record.version,
-          record.updated_at_ms,
-          ResourceScope::ClusterShared,
-        ) {
-          return Ok(());
-        }
         self
           .storage
           .workspace()
-          .skills()
-          .upsert(&record)
-          .map_err(|error| Status::internal(format!("failed to upsert skill: {error}")))?;
-        if should_write_content(local.as_ref(), body.content.is_empty(), &body.content_hash) {
-          self
-            .storage
-            .workspace()
-            .skill_content()
-            .write(&record.id, &body.content, &record.content_hash)
-            .map_err(|error| Status::internal(format!("failed to write skill content: {error}")))?;
-        }
+          .apply_remote_skill(record, &body.content)
+          .await
+          .map_err(|error| Status::internal(format!("failed to apply remote skill: {error}")))?;
       }
       (ResourceKind::Rule, Some(Body::Rule(body))) => {
-        if body.content.is_empty() {
-          return Ok(());
-        }
         let record = resource_to_rule(metadata, body)?;
-        verify_content_hash(&body.content, &body.content_hash)?;
-        let local = self
-          .storage
-          .workspace()
-          .rules()
-          .get(&record.id)
-          .map_err(|error| Status::internal(format!("failed to read rule: {error}")))?;
-        if !should_apply_versioned(
-          local.as_ref().map(|local| local.version),
-          local.as_ref().map(|local| local.updated_at_ms),
-          local.as_ref().map(|local| local.scope),
-          record.version,
-          record.updated_at_ms,
-          ResourceScope::ClusterShared,
-        ) {
-          return Ok(());
-        }
         self
           .storage
           .workspace()
-          .rules()
-          .upsert(&record)
-          .map_err(|error| Status::internal(format!("failed to upsert rule: {error}")))?;
-        if should_write_content(local.as_ref(), body.content.is_empty(), &body.content_hash) {
-          self
-            .storage
-            .workspace()
-            .rule_content()
-            .write(&record.id, &body.content, &record.content_hash)
-            .map_err(|error| Status::internal(format!("failed to write rule content: {error}")))?;
-        }
+          .apply_remote_rule(record, &body.content)
+          .await
+          .map_err(|error| Status::internal(format!("failed to apply remote rule: {error}")))?;
       }
       (ResourceKind::Workspace, Some(Body::Workspace(body))) => {
         let record = resource_to_workspace(metadata, body)?;
-        let computed_hash = record.compute_content_hash().map_err(|error| {
-          Status::internal(format!("failed to compute workspace content hash: {error}"))
-        })?;
-        if computed_hash != body.content_hash {
-          return Err(Status::invalid_argument(format!(
-            "workspace content hash mismatch: expected {}, got {}",
-            body.content_hash, computed_hash
-          )));
-        }
-        let local = self
-          .storage
-          .workspace()
-          .workspaces()
-          .get(&record.id)
-          .map_err(|error| Status::internal(format!("failed to read workspace: {error}")))?;
-        if !should_apply_versioned(
-          local.as_ref().map(|local| local.version),
-          local.as_ref().map(|local| local.updated_at_ms),
-          local.as_ref().map(|local| local.scope),
-          record.version,
-          record.updated_at_ms,
-          ResourceScope::ClusterShared,
-        ) {
-          return Ok(());
-        }
         self
           .storage
           .workspace()
-          .workspaces()
-          .upsert(&record)
-          .map_err(|error| Status::internal(format!("failed to upsert workspace: {error}")))?;
+          .apply_remote_workspace(record)
+          .await
+          .map_err(|error| {
+            Status::internal(format!("failed to apply remote workspace: {error}"))
+          })?;
       }
       _ => {}
     }
@@ -533,6 +426,7 @@ fn memory_to_resource(entry: MemoryEntry, full: bool) -> Resource {
       updated_at_ms: entry.updated_at_ms,
       content_hash: entry.content_hash,
       embedding,
+      version: entry.version,
     })),
   }
 }
@@ -643,10 +537,11 @@ fn resource_to_memory(
     content: body.content.clone(),
     embedding: body.embedding.clone(),
     metadata: body.metadata.clone(),
-    scope: ResourceScope::ClusterShared,
+    scope: parse_scope(&metadata.scope)?.unwrap_or(ResourceScope::NodeLocal),
     source_node_id: Some(metadata.source_node_id.clone()).filter(|s| !s.is_empty()),
     updated_at_ms: metadata.updated_at_ms,
     content_hash: body.content_hash.clone(),
+    version: body.version,
   })
 }
 
@@ -656,7 +551,7 @@ fn resource_to_skill(metadata: &ResourceMetadata, body: &SkillBody) -> Result<Sk
     name: metadata.name.clone(),
     version: body.version,
     content_hash: body.content_hash.clone(),
-    scope: ResourceScope::ClusterShared,
+    scope: parse_scope(&metadata.scope)?.unwrap_or(ResourceScope::NodeLocal),
     source_node_id: Some(metadata.source_node_id.clone()).filter(|s| !s.is_empty()),
     updated_at_ms: metadata.updated_at_ms,
     metadata: metadata.labels.clone(),
@@ -669,7 +564,7 @@ fn resource_to_rule(metadata: &ResourceMetadata, body: &RuleBody) -> Result<Rule
     name: metadata.name.clone(),
     version: body.version,
     content_hash: body.content_hash.clone(),
-    scope: ResourceScope::ClusterShared,
+    scope: parse_scope(&metadata.scope)?.unwrap_or(ResourceScope::NodeLocal),
     source_node_id: Some(metadata.source_node_id.clone()).filter(|s| !s.is_empty()),
     updated_at_ms: metadata.updated_at_ms,
     metadata: metadata.labels.clone(),
@@ -684,64 +579,11 @@ fn resource_to_workspace(
     root: body.root.clone().into(),
     session_ids: body.session_ids.clone(),
     metadata: body.metadata.clone(),
-    scope: ResourceScope::ClusterShared,
+    scope: parse_scope(&metadata.scope)?.unwrap_or(ResourceScope::NodeLocal),
     source_node_id: Some(metadata.source_node_id.clone()).filter(|s| !s.is_empty()),
     version: body.version,
     content_hash: body.content_hash.clone(),
     created_at_ms: metadata.created_at_ms,
     updated_at_ms: metadata.updated_at_ms,
   })
-}
-
-fn verify_content_hash(content: &str, expected: &str) -> Result<(), Status> {
-  let actual = blake3::hash(content.as_bytes()).to_hex().to_string();
-  if actual != expected {
-    return Err(Status::invalid_argument(format!(
-      "content hash mismatch: expected {expected}, got {actual}"
-    )));
-  }
-  Ok(())
-}
-
-fn verify_content_hash_bytes(content: &[u8], expected: &str) -> Result<(), Status> {
-  let actual = blake3::hash(content).to_hex().to_string();
-  if actual != expected {
-    return Err(Status::invalid_argument(format!(
-      "content hash mismatch: expected {expected}, got {actual}"
-    )));
-  }
-  Ok(())
-}
-
-/// Determine whether a remote resource should overwrite a local one.
-///
-/// Local `NodeLocal` resources are never overwritten by remote shared
-/// resources. Otherwise, the higher version wins; if versions are equal, the
-/// more recent `updated_at_ms` wins.
-fn should_apply_versioned(
-  local_version: Option<u64>, local_updated_at_ms: Option<i64>, local_scope: Option<ResourceScope>,
-  remote_version: u64, remote_updated_at_ms: i64, remote_scope: ResourceScope,
-) -> bool {
-  if remote_scope != ResourceScope::ClusterShared {
-    return false;
-  }
-  match (local_version, local_updated_at_ms, local_scope) {
-    (None, ..) => true,
-    (_, _, Some(ResourceScope::NodeLocal)) => false,
-    (Some(local_version), ..) if remote_version != local_version => remote_version > local_version,
-    (Some(_), Some(local_updated_at_ms), _) => remote_updated_at_ms > local_updated_at_ms,
-    (Some(_), None, _) => true,
-  }
-}
-
-fn should_write_content(
-  local: Option<&VersionedResource>, remote_content_empty: bool, remote_content_hash: &str,
-) -> bool {
-  if remote_content_empty {
-    return false;
-  }
-  match local {
-    None => true,
-    Some(local) => local.content_hash != remote_content_hash,
-  }
 }

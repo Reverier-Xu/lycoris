@@ -5,7 +5,7 @@ use redb::{Database, TableDefinition};
 use crate::{
   bytes::Bytes,
   workspace::{
-    vcs::ContentStore,
+    vcs::GitContentStore,
     versioned::{RedbVersionedStorage, VersionedResource},
   },
 };
@@ -22,7 +22,7 @@ pub use super::versioned::VersionedStorage as SkillStorage;
 pub type RedbSkillStorage = RedbVersionedStorage;
 
 /// Git-backed content store for skill bodies.
-pub type SkillContentStore = ContentStore;
+pub type SkillContentStore = GitContentStore;
 
 /// Create a redb-backed skill metadata storage.
 pub(crate) fn new_skill_storage(db: Arc<Database>) -> RedbSkillStorage {

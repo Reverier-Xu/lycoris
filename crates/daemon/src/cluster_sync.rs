@@ -8,8 +8,8 @@ use std::{
   time::Duration,
 };
 
-use lycoris_client::{ClientError, PeerClient};
-use lycoris_core::time::now_ms;
+use lycoris_client::ClientError;
+use lycoris_core::now_ms;
 use lycoris_proto::node::{
   LeaveMessage as ProtoLeave, NodeInfo as ProtoNodeInfo, ProbeRequest, ProbeResponse,
   PushNodeRequest, PushNodeResponse, StateMessage, SuspectMessage as ProtoSuspect,
@@ -17,19 +17,16 @@ use lycoris_proto::node::{
   membership_server::{Membership, MembershipServer},
   sync_server::{Sync, SyncServer},
 };
-use lycoris_storage::NodeDomain;
-use lycoris_tls::TlsBundle;
 use tokio::{
   sync::Mutex,
   time::{self, MissedTickBehavior, timeout},
 };
-use tonic::{Request, Response, Status, transport::ClientTlsConfig};
+use tonic::{Request, Response, Status};
 
 use crate::{
-  membership::{
-    MembershipService, SwimAction, SwimMessage, merkle::Hash as MerkleHash, register_to_proto,
-  },
-  rpc::resource::ResourceMapper,
+  membership::{MembershipService, SwimAction, SwimMessage, register_to_proto},
+  resource_sync::ResourceSync,
+  transport::PeerPool,
 };
 
 /// A fixed-capacity deduplication set with FIFO eviction.
@@ -70,15 +67,14 @@ impl<T: Clone + Eq + Hash> DedupSet<T> {
 ///
 /// `ClusterSync` combines backward-compatible `Sync` RPCs, the new `Membership`
 /// RPCs (Merkle anti-entropy, SWIM probes), and a background loop that drives
-/// the SWIM failure detector.
+/// the SWIM failure detector. Peer channels and shared-resource sync have been
+/// extracted into `PeerPool` and `ResourceSync` respectively.
 #[derive(Debug, Clone)]
 pub struct ClusterSync {
   local_node_id: String,
   service: Arc<MembershipService>,
-  storage: NodeDomain,
-  mapper: ResourceMapper,
-  tls: ClientTlsConfig,
-  clients: Arc<Mutex<HashMap<String, PeerClient>>>,
+  pool: PeerPool,
+  resources: ResourceSync,
   seen_pushes: Arc<Mutex<DedupSet<(String, u64)>>>,
   seen_states: Arc<Mutex<DedupSet<(String, u64, u8)>>>,
   sequence: Arc<AtomicU64>,
@@ -90,20 +86,13 @@ const MAX_SEEN_STATES: usize = 10_000;
 
 impl ClusterSync {
   pub fn new(
-    local_node_id: String, service: Arc<MembershipService>, storage: NodeDomain,
-    mapper: ResourceMapper, tls_bundle: &TlsBundle,
+    local_node_id: String, service: Arc<MembershipService>, pool: PeerPool, resources: ResourceSync,
   ) -> Self {
-    let tls = ClientTlsConfig::new()
-      .identity(tls_bundle.identity.clone())
-      .ca_certificate(tls_bundle.ca.clone());
-
     Self {
       local_node_id,
       service,
-      storage,
-      mapper,
-      tls,
-      clients: Arc::new(Mutex::new(HashMap::new())),
+      pool,
+      resources,
       seen_pushes: Arc::new(Mutex::new(DedupSet::new(MAX_SEEN_PUSHES))),
       seen_states: Arc::new(Mutex::new(DedupSet::new(MAX_SEEN_STATES))),
       sequence: Arc::new(AtomicU64::new(1)),
@@ -114,12 +103,8 @@ impl ClusterSync {
   pub async fn run(&self, interval: Duration) {
     let mut ticker = time::interval(interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let notify = self.storage.change_notify();
     loop {
-      tokio::select! {
-        _ = ticker.tick() => {}
-        _ = notify.notified() => {}
-      }
+      ticker.tick().await;
       self.sync_with_peers().await;
     }
   }
@@ -224,10 +209,10 @@ impl ClusterSync {
       None => return false,
     };
 
-    let mut client = match self.connect_peer(&address).await {
+    let mut client = match self.pool.connect(&address).await {
       Ok(client) => client,
       Err(_) => {
-        self.remove_client(&address).await;
+        self.pool.remove(&address).await;
         return false;
       }
     };
@@ -244,12 +229,12 @@ impl ClusterSync {
       }
       Ok(Err(error)) => {
         tracing::warn!(%target_id, %error, "probe failed");
-        self.remove_client(&address).await;
+        self.pool.remove(&address).await;
         false
       }
       Err(_) => {
         tracing::warn!(%target_id, "probe timed out");
-        self.remove_client(&address).await;
+        self.pool.remove(&address).await;
         false
       }
     }
@@ -261,23 +246,28 @@ impl ClusterSync {
 
   async fn sync_with_peers(&self) {
     let snapshot = self.service.list_nodes(&HashMap::new()).await;
-    let local_address = self.local_address().await;
+    let local_address = self.local_address().await.unwrap_or_default();
 
-    if let Some(primary) = self.storage.peers.get_primary().unwrap_or(None) {
+    if let Some(primary) = self.pool.node().peers().get_primary().unwrap_or(None) {
       match timeout(RPC_TIMEOUT, self.sync_with_peer(&primary, snapshot.clone())).await {
         Ok(Ok(())) => return,
         Ok(Err(error)) => {
           tracing::warn!(%primary, %error, "primary endpoint unreachable, trying fallbacks");
-          self.remove_client(&primary).await;
+          self.pool.remove(&primary).await;
         }
         Err(_) => {
           tracing::warn!(%primary, "primary endpoint timed out, trying fallbacks");
-          self.remove_client(&primary).await;
+          self.pool.remove(&primary).await;
         }
       }
     }
 
-    let fallbacks = self.storage.peers.fallback_addresses().unwrap_or_default();
+    let fallbacks = self
+      .pool
+      .node()
+      .peers()
+      .fallback_addresses()
+      .unwrap_or_default();
     let mut join_set = tokio::task::JoinSet::new();
     for peer in fallbacks {
       let sync = self.clone();
@@ -292,8 +282,8 @@ impl ClusterSync {
     while let Some(result) = join_set.join_next().await {
       match result {
         Ok((peer, Ok(Ok(())))) => {
-          if !promoted && local_address.as_deref() != Some(peer.as_str()) {
-            if let Err(error) = self.storage.peers.set_primary(&peer) {
+          if !promoted && local_address != peer {
+            if let Err(error) = self.pool.node().peers().set_primary(&peer) {
               tracing::warn!(%peer, %error, "failed to promote fallback to primary");
             }
             promoted = true;
@@ -301,11 +291,11 @@ impl ClusterSync {
         }
         Ok((peer, Ok(Err(error)))) => {
           tracing::warn!(%peer, %error, "fallback peer sync failed");
-          self.remove_client(&peer).await;
+          self.pool.remove(&peer).await;
         }
         Ok((peer, Err(_))) => {
           tracing::warn!(%peer, "fallback peer sync timed out");
-          self.remove_client(&peer).await;
+          self.pool.remove(&peer).await;
         }
         Err(error) => {
           tracing::warn!(%error, "sync task panicked");
@@ -317,44 +307,47 @@ impl ClusterSync {
   async fn sync_with_peer(
     &self, peer: &str, _snapshot: Vec<ProtoNodeInfo>,
   ) -> Result<(), ClientError> {
-    let mut client = self.connect_peer(peer).await?;
+    let mut client = self.pool.connect(peer).await?;
     let local_address = self.local_address().await.unwrap_or_default();
 
-    let (remote_root, remote_leaves) =
-      match timeout(RPC_TIMEOUT, client.membership.merkle_root()).await {
-        Ok(Ok(root)) => root,
-        Ok(Err(error)) => {
-          tracing::warn!(%peer, %error, "merkle root failed, falling back to full sync");
-          return timeout(RPC_TIMEOUT, self.full_sync_with_peer(peer))
-            .await
-            .map_err(|_| ClientError::Timeout)
-            .and_then(|result| result);
-        }
-        Err(_) => {
-          tracing::warn!(%peer, "merkle root timed out, falling back to full sync");
-          return timeout(RPC_TIMEOUT, self.full_sync_with_peer(peer))
-            .await
-            .map_err(|_| ClientError::Timeout)
-            .and_then(|result| result);
-        }
-      };
+    let remote_root = match timeout(RPC_TIMEOUT, client.membership.merkle_root()).await {
+      Ok(Ok(root)) => root,
+      Ok(Err(error)) => {
+        tracing::warn!(%peer, %error, "merkle root failed, falling back to full sync");
+        return timeout(RPC_TIMEOUT, self.full_sync_with_peer(peer))
+          .await
+          .map_err(|_| {
+            ClientError::Io(std::io::Error::new(
+              std::io::ErrorKind::TimedOut,
+              "peer connection timed out",
+            ))
+          })
+          .and_then(|result| result);
+      }
+      Err(_) => {
+        tracing::warn!(%peer, "merkle root timed out, falling back to full sync");
+        return timeout(RPC_TIMEOUT, self.full_sync_with_peer(peer))
+          .await
+          .map_err(|_| {
+            ClientError::Io(std::io::Error::new(
+              std::io::ErrorKind::TimedOut,
+              "peer connection timed out",
+            ))
+          })
+          .and_then(|result| result);
+      }
+    };
 
     let local_root = self.service.merkle_root().await;
-    if remote_root == local_root.root_hash {
+    if remote_root == local_root.to_vec() {
       let now = now_ms();
-      let _ = self.storage.peers.mark_seen(peer, now);
+      let _ = self.pool.node().peers().mark_seen(peer, now);
       return Ok(());
     }
 
-    let remote_leaves_parsed: Vec<(String, MerkleHash)> = remote_leaves
-      .into_iter()
-      .filter_map(|leaf| {
-        let hash = leaf.hash.try_into().ok()?;
-        Some((leaf.node_id, hash))
-      })
-      .collect();
-
-    let (need_from_remote, need_from_local) = self.service.merkle_diff(&remote_leaves_parsed).await;
+    let (need_from_remote, need_from_local) = self
+      .merkle_diff_with_peer(&mut client, peer, remote_root)
+      .await?;
 
     let fetched = if need_from_remote.is_empty() {
       Vec::new()
@@ -384,17 +377,258 @@ impl ClusterSync {
 
     for info in self.service.list_nodes(&HashMap::new()).await {
       if info.address != local_address {
-        let _ = self.storage.peers.seed(&info.address);
+        let _ = self.pool.node().peers().seed(&info.address);
       }
     }
 
-    let _ = self.storage.peers.mark_seen(peer, now_ms());
-    let _ = self.sync_resources_with_peer(peer).await;
+    let _ = self.pool.node().peers().mark_seen(peer, now_ms());
+    let _ = self.resources.sync_with_peer(peer).await;
     Ok(())
   }
 
+  async fn merkle_diff_with_peer(
+    &self, client: &mut lycoris_client::PeerClient, peer: &str, _remote_root: Vec<u8>,
+  ) -> Result<(Vec<String>, Vec<String>), ClientError> {
+    use lycoris_membership::{MERKLE_TREE_DEPTH, hash_empty};
+
+    const SPLIT_DEPTH: u8 = 8;
+
+    let mut need_from_remote = Vec::new();
+    let mut need_from_local = Vec::new();
+
+    let tree = self.service.merkle_tree_snapshot().await;
+
+    // First RPC: fetch the top half of the tree (down to SPLIT_DEPTH).
+    let top_refs = subtree_refs(0, 0, SPLIT_DEPTH);
+    let top_response = self.request_merkle_nodes(client, peer, top_refs).await?;
+    let top_remote = build_remote_map(top_response);
+
+    // Find bottom-half subtrees that differ.
+    let mut bottom_refs = Vec::new();
+    for index in 0..(1u64 << SPLIT_DEPTH) {
+      let local_hash = tree
+        .node_hash(SPLIT_DEPTH, index)
+        .unwrap_or_else(|| tree.empty_subtree_hash(SPLIT_DEPTH).unwrap_or(hash_empty()));
+      let remote_hash = top_remote
+        .get(&(SPLIT_DEPTH, index))
+        .unwrap_or_else(|| tree.empty_subtree_hash(SPLIT_DEPTH).unwrap_or(hash_empty()));
+
+      if local_hash == remote_hash {
+        continue;
+      }
+
+      // Optimization: if the remote side is empty under this subtree, all local
+      // IDs need to be pushed.
+      let remote_empty = tree
+        .empty_subtree_hash(SPLIT_DEPTH)
+        .map(|empty| remote_hash == empty)
+        .unwrap_or(false);
+      if remote_empty {
+        need_from_local.extend(tree.collect_node_ids(SPLIT_DEPTH, index));
+        continue;
+      }
+
+      bottom_refs.extend(subtree_refs(SPLIT_DEPTH, index, MERKLE_TREE_DEPTH));
+    }
+
+    // Second RPC: fetch all differing bottom subtrees.
+    let bottom_response = if bottom_refs.is_empty() {
+      lycoris_proto::node::MerkleNodesResponse {
+        results: Vec::new(),
+      }
+    } else {
+      self.request_merkle_nodes(client, peer, bottom_refs).await?
+    };
+    let bottom_remote = build_remote_map(bottom_response);
+
+    // Diff leaves in the bottom subtrees.
+    for index in 0..(1u64 << SPLIT_DEPTH) {
+      let local_hash = tree
+        .node_hash(SPLIT_DEPTH, index)
+        .unwrap_or_else(|| tree.empty_subtree_hash(SPLIT_DEPTH).unwrap_or(hash_empty()));
+      let remote_hash = top_remote
+        .get(&(SPLIT_DEPTH, index))
+        .unwrap_or_else(|| tree.empty_subtree_hash(SPLIT_DEPTH).unwrap_or(hash_empty()));
+
+      if local_hash == remote_hash {
+        continue;
+      }
+
+      let remote_empty = tree
+        .empty_subtree_hash(SPLIT_DEPTH)
+        .map(|empty| remote_hash == empty)
+        .unwrap_or(false);
+      if remote_empty {
+        continue;
+      }
+
+      for leaf in 0..(1u64 << (MERKLE_TREE_DEPTH - SPLIT_DEPTH)) {
+        let leaf_index = (index << (MERKLE_TREE_DEPTH - SPLIT_DEPTH)) | leaf;
+        let local_leaf_hash = tree
+          .node_hash(MERKLE_TREE_DEPTH, leaf_index)
+          .unwrap_or_else(hash_empty);
+        let remote_leaf_hash = bottom_remote
+          .get(&(MERKLE_TREE_DEPTH, leaf_index))
+          .unwrap_or_else(hash_empty);
+        if local_leaf_hash == remote_leaf_hash {
+          continue;
+        }
+        if let Some(entries) = bottom_remote.entries.get(&(MERKLE_TREE_DEPTH, leaf_index)) {
+          self.diff_leaf_entries(
+            &tree,
+            leaf_index,
+            entries,
+            &mut need_from_remote,
+            &mut need_from_local,
+          );
+        } else {
+          // Remote leaf is empty; all local IDs need to be pushed.
+          need_from_local.extend(
+            tree
+              .leaf_entries(leaf_index)
+              .unwrap_or_default()
+              .iter()
+              .map(|(id, _)| id.clone()),
+          );
+        }
+      }
+    }
+
+    need_from_remote.sort();
+    need_from_remote.dedup();
+    need_from_local.sort();
+    need_from_local.dedup();
+
+    Ok((need_from_remote, need_from_local))
+  }
+
+  async fn request_merkle_nodes(
+    &self, client: &mut lycoris_client::PeerClient, peer: &str,
+    refs: Vec<lycoris_proto::node::MerkleNodeRef>,
+  ) -> Result<lycoris_proto::node::MerkleNodesResponse, ClientError> {
+    let request = lycoris_proto::node::MerkleNodesRequest { nodes: refs };
+    match timeout(RPC_TIMEOUT, client.membership.merkle_nodes(request)).await {
+      Ok(Ok(response)) => Ok(response),
+      Ok(Err(error)) => {
+        tracing::warn!(%peer, %error, "merkle nodes failed");
+        Err(error)
+      }
+      Err(_) => {
+        tracing::warn!(%peer, "merkle nodes timed out");
+        Err(ClientError::Io(std::io::Error::new(
+          std::io::ErrorKind::TimedOut,
+          "merkle nodes request timed out",
+        )))
+      }
+    }
+  }
+}
+
+fn subtree_refs(depth: u8, index: u64, max_depth: u8) -> Vec<lycoris_proto::node::MerkleNodeRef> {
+  let mut refs = Vec::new();
+  let mut stack = vec![(depth, index)];
+  while let Some((d, i)) = stack.pop() {
+    refs.push(lycoris_proto::node::MerkleNodeRef {
+      depth: d as u32,
+      index: i,
+    });
+    if d < max_depth {
+      stack.push((d + 1, 2 * i + 1));
+      stack.push((d + 1, 2 * i));
+    }
+  }
+  refs
+}
+
+struct RemoteNodes {
+  hashes: std::collections::HashMap<(u8, u64), lycoris_membership::Hash>,
+  entries: std::collections::HashMap<(u8, u64), Vec<lycoris_proto::node::MerkleLeafEntry>>,
+}
+
+impl RemoteNodes {
+  fn get(&self, key: &(u8, u64)) -> Option<lycoris_membership::Hash> {
+    self.hashes.get(key).copied()
+  }
+}
+
+fn build_remote_map(response: lycoris_proto::node::MerkleNodesResponse) -> RemoteNodes {
+  use lycoris_membership::{MERKLE_TREE_DEPTH, hash_empty};
+
+  let mut hashes = std::collections::HashMap::new();
+  let mut entries = std::collections::HashMap::new();
+  for result in response.results {
+    let depth = result
+      .node
+      .as_ref()
+      .map(|n| n.depth as u8)
+      .unwrap_or(MERKLE_TREE_DEPTH);
+    let index = result.node.as_ref().map(|n| n.index).unwrap_or(0);
+    let hash = match result.hash.try_into() {
+      Ok(hash) => hash,
+      Err(_) => hash_empty(),
+    };
+    hashes.insert((depth, index), hash);
+    if result.is_leaf || depth == MERKLE_TREE_DEPTH {
+      entries.insert((depth, index), result.entries);
+    }
+  }
+  RemoteNodes { hashes, entries }
+}
+
+impl ClusterSync {
+  fn diff_leaf_entries(
+    &self, tree: &lycoris_membership::MerkleTree, index: u64,
+    remote_entries: &[lycoris_proto::node::MerkleLeafEntry], need_from_remote: &mut Vec<String>,
+    need_from_local: &mut Vec<String>,
+  ) {
+    use lycoris_membership::hash_empty;
+
+    let local_entries = tree.leaf_entries(index).unwrap_or_default();
+    let mut remote_sorted: Vec<(String, lycoris_membership::Hash)> = remote_entries
+      .iter()
+      .map(|entry| {
+        let hash = entry.hash.clone().try_into().unwrap_or(hash_empty());
+        (entry.node_id.clone(), hash)
+      })
+      .collect();
+    remote_sorted.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut i = 0usize;
+    let mut j = 0usize;
+
+    while i < local_entries.len() && j < remote_sorted.len() {
+      match local_entries[i].0.cmp(&remote_sorted[j].0) {
+        std::cmp::Ordering::Less => {
+          need_from_local.push(local_entries[i].0.clone());
+          i += 1;
+        }
+        std::cmp::Ordering::Greater => {
+          need_from_remote.push(remote_sorted[j].0.clone());
+          j += 1;
+        }
+        std::cmp::Ordering::Equal => {
+          if local_entries[i].1 != remote_sorted[j].1 {
+            need_from_remote.push(local_entries[i].0.clone());
+            need_from_local.push(local_entries[i].0.clone());
+          }
+          i += 1;
+          j += 1;
+        }
+      }
+    }
+
+    while i < local_entries.len() {
+      need_from_local.push(local_entries[i].0.clone());
+      i += 1;
+    }
+    while j < remote_sorted.len() {
+      need_from_remote.push(remote_sorted[j].0.clone());
+      j += 1;
+    }
+  }
+
   async fn full_sync_with_peer(&self, peer: &str) -> Result<(), ClientError> {
-    let mut client = self.connect_peer(peer).await?;
+    let mut client = self.pool.connect(peer).await?;
     let snapshot = self.service.list_nodes(&HashMap::new()).await;
     let response = client.sync.sync_nodes(snapshot).await?;
     let _ = self.service.sync_nodes(response.nodes).await;
@@ -402,78 +636,18 @@ impl ClusterSync {
 
     for info in self.service.list_nodes(&HashMap::new()).await {
       if info.address != local_address {
-        let _ = self.storage.peers.seed(&info.address);
+        let _ = self.pool.node().peers().seed(&info.address);
       }
     }
 
-    let _ = self.storage.peers.mark_seen(peer, now_ms());
-    let _ = self.sync_resources_with_peer(peer).await;
+    let _ = self.pool.node().peers().mark_seen(peer, now_ms());
+    let _ = self.resources.sync_with_peer(peer).await;
     Ok(())
-  }
-
-  /// Exchange cluster-shared skills and rules with a peer.
-  ///
-  /// This is a simple full-set anti-entropy: each side sends its shared
-  /// resources and merges the remote set by version. It runs opportunistically
-  /// after membership sync so it does not block convergence.
-  async fn sync_resources_with_peer(&self, peer: &str) -> Result<(), ClientError> {
-    let mut client = self.connect_peer(peer).await?;
-
-    let local_resources = match self.mapper.local_shared_resources().await {
-      Ok(resources) => resources,
-      Err(error) => {
-        tracing::warn!(%peer, %error, "failed to read local shared resources");
-        return Ok(());
-      }
-    };
-
-    let remote_resources =
-      match timeout(RPC_TIMEOUT, client.sync.sync_resources(local_resources)).await {
-        Ok(Ok(resources)) => resources,
-        Ok(Err(error)) => {
-          tracing::warn!(%peer, %error, "resource sync rpc failed");
-          return Ok(());
-        }
-        Err(_) => {
-          tracing::warn!(%peer, "resource sync rpc timed out");
-          return Ok(());
-        }
-      };
-
-    for resource in remote_resources {
-      if let Err(error) = self.mapper.apply_resource(&resource).await {
-        tracing::warn!(%peer, %error, "failed to apply remote resource");
-      }
-    }
-
-    Ok(())
-  }
-
-  /// Handle an incoming `SyncResources` RPC: merge remote resources and return
-  /// the local shared set.
-  #[allow(clippy::result_large_err)]
-  pub async fn handle_sync_resources(
-    &self, request: Request<lycoris_proto::node::SyncResourcesRequest>,
-  ) -> Result<Response<lycoris_proto::node::SyncResourcesResponse>, Status> {
-    let remote_resources = request.into_inner().resources;
-    for resource in &remote_resources {
-      if let Err(error) = self.mapper.apply_resource(resource).await {
-        tracing::warn!(%error, "failed to apply resource during sync");
-      }
-    }
-
-    let local_resources = self
-      .mapper
-      .local_shared_resources()
-      .await
-      .unwrap_or_default();
-    Ok(Response::new(lycoris_proto::node::SyncResourcesResponse {
-      resources: local_resources,
-    }))
   }
 
   async fn broadcast_push(&self, info: ProtoNodeInfo, origin: String, sequence: u64) {
-    let targets = self.current_targets().await;
+    let local_address = self.local_address().await.unwrap_or_default();
+    let targets = self.pool.targets(&local_address);
     for peer in targets {
       let info = info.clone();
       let origin = origin.clone();
@@ -484,17 +658,17 @@ impl ClusterSync {
       .await
       {
         Ok(Ok(())) => {
-          let _ = self.storage.peers.mark_seen(&peer, now_ms());
+          let _ = self.pool.node().peers().mark_seen(&peer, now_ms());
         }
         Ok(Err(error)) => {
           tracing::warn!(%peer, %error, "push to peer failed");
-          let _ = self.storage.peers.mark_attempt(&peer, false);
-          self.remove_client(&peer).await;
+          let _ = self.pool.node().peers().mark_attempt(&peer, false);
+          self.pool.remove(&peer).await;
         }
         Err(_) => {
           tracing::warn!(%peer, "push to peer timed out");
-          let _ = self.storage.peers.mark_attempt(&peer, false);
-          self.remove_client(&peer).await;
+          let _ = self.pool.node().peers().mark_attempt(&peer, false);
+          self.pool.remove(&peer).await;
         }
       }
     }
@@ -503,28 +677,29 @@ impl ClusterSync {
   async fn push_to_peer(
     &self, peer: &str, info: ProtoNodeInfo, origin: String, sequence: u64,
   ) -> Result<(), ClientError> {
-    let mut client = self.connect_peer(peer).await?;
+    let mut client = self.pool.connect(peer).await?;
     client.sync.push_node(info, origin, sequence).await?;
     Ok(())
   }
 
   async fn broadcast_state_message(&self, message: StateMessage) {
-    let targets = self.current_targets().await;
+    let local_address = self.local_address().await.unwrap_or_default();
+    let targets = self.pool.targets(&local_address);
     for peer in targets {
       let message = message.clone();
       match timeout(RPC_TIMEOUT, self.send_state_message_to_peer(&peer, message)).await {
         Ok(Ok(())) => {
-          let _ = self.storage.peers.mark_seen(&peer, now_ms());
+          let _ = self.pool.node().peers().mark_seen(&peer, now_ms());
         }
         Ok(Err(error)) => {
           tracing::warn!(%peer, %error, "state message to peer failed");
-          let _ = self.storage.peers.mark_attempt(&peer, false);
-          self.remove_client(&peer).await;
+          let _ = self.pool.node().peers().mark_attempt(&peer, false);
+          self.pool.remove(&peer).await;
         }
         Err(_) => {
           tracing::warn!(%peer, "state message to peer timed out");
-          let _ = self.storage.peers.mark_attempt(&peer, false);
-          self.remove_client(&peer).await;
+          let _ = self.pool.node().peers().mark_attempt(&peer, false);
+          self.pool.remove(&peer).await;
         }
       }
     }
@@ -533,58 +708,13 @@ impl ClusterSync {
   async fn send_state_message_to_peer(
     &self, peer: &str, message: StateMessage,
   ) -> Result<(), ClientError> {
-    let mut client = self.connect_peer(peer).await?;
+    let mut client = self.pool.connect(peer).await?;
     client.membership.state(message).await?;
     Ok(())
   }
 
-  async fn current_targets(&self) -> Vec<String> {
-    let local_address = self.local_address().await.unwrap_or_default();
-    let mut seen = HashSet::new();
-    let mut targets = Vec::new();
-    if let Ok(Some(primary)) = self.storage.peers.get_primary()
-      && primary != local_address
-    {
-      seen.insert(primary.clone());
-      targets.push(primary);
-    }
-    if let Ok(fallbacks) = self.storage.peers.fallback_addresses() {
-      for peer in fallbacks {
-        if peer != local_address && seen.insert(peer.clone()) {
-          targets.push(peer);
-        }
-      }
-    }
-    targets
-  }
-
   async fn local_address(&self) -> Option<String> {
     self.service.member_address(&self.local_node_id).await
-  }
-
-  async fn connect_peer(&self, address: &str) -> Result<PeerClient, ClientError> {
-    {
-      let clients = self.clients.lock().await;
-      if let Some(client) = clients.get(address) {
-        return Ok(client.clone());
-      }
-    }
-
-    let connect = PeerClient::connect(address, self.tls.clone());
-    let client = match timeout(Duration::from_secs(3), connect).await {
-      Ok(Ok(client)) => client,
-      Ok(Err(error)) => return Err(error),
-      Err(_) => return Err(ClientError::Timeout),
-    };
-
-    let mut clients = self.clients.lock().await;
-    clients.insert(address.to_string(), client.clone());
-    Ok(client)
-  }
-
-  async fn remove_client(&self, address: &str) {
-    let mut clients = self.clients.lock().await;
-    clients.remove(address);
   }
 
   /// Handle an incoming `SyncNodes` RPC: merge remote state and return our
@@ -597,7 +727,7 @@ impl ClusterSync {
     let local_address = self.local_address().await.unwrap_or_default();
     for info in &nodes {
       if info.address != local_address {
-        let _ = self.storage.peers.seed(&info.address);
+        let _ = self.pool.node().peers().seed(&info.address);
       }
     }
     let snapshot = self.service.sync_nodes(nodes).await;
@@ -622,7 +752,7 @@ impl ClusterSync {
 
     let local_address = self.local_address().await.unwrap_or_default();
     if info.address != local_address {
-      let _ = self.storage.peers.seed(&info.address);
+      let _ = self.pool.node().peers().seed(&info.address);
     }
     let actions = self.service.register(&info).await;
 
@@ -754,14 +884,6 @@ pub type SyncServerHandle = SyncServer<ClusterSync>;
 pub type MembershipServerHandle = MembershipServer<ClusterSync>;
 
 impl ClusterSync {
-  pub fn into_sync_server(self) -> SyncServerHandle {
-    SyncServer::new(self.clone())
-  }
-
-  pub fn into_membership_server(self) -> MembershipServerHandle {
-    MembershipServer::new(self)
-  }
-
   pub fn into_servers(self) -> (SyncServerHandle, MembershipServerHandle) {
     (SyncServer::new(self.clone()), MembershipServer::new(self))
   }
@@ -785,7 +907,7 @@ impl Sync for ClusterSync {
   async fn sync_resources(
     &self, request: Request<lycoris_proto::node::SyncResourcesRequest>,
   ) -> Result<Response<lycoris_proto::node::SyncResourcesResponse>, Status> {
-    self.handle_sync_resources(request).await
+    self.resources.handle_sync_resources(request).await
   }
 }
 
@@ -797,11 +919,40 @@ impl Membership for ClusterSync {
   ) -> Result<Response<lycoris_proto::node::MerkleRootResponse>, Status> {
     let root = self.service.merkle_root().await;
     Ok(Response::new(lycoris_proto::node::MerkleRootResponse {
-      root_hash: root.root_hash,
-      leaf_hashes: root
-        .leaf_hashes
+      root_hash: root.to_vec(),
+    }))
+  }
+
+  async fn merkle_nodes(
+    &self, request: Request<lycoris_proto::node::MerkleNodesRequest>,
+  ) -> Result<Response<lycoris_proto::node::MerkleNodesResponse>, Status> {
+    let refs = request
+      .into_inner()
+      .nodes
+      .into_iter()
+      .map(|node| (node.depth as u8, node.index))
+      .collect();
+    let results = self.service.merkle_nodes(refs).await;
+    Ok(Response::new(lycoris_proto::node::MerkleNodesResponse {
+      results: results
         .into_iter()
-        .map(|(node_id, hash)| lycoris_proto::node::LeafHash { node_id, hash })
+        .map(
+          |(depth, index, hash, is_leaf, entries)| lycoris_proto::node::MerkleNodeResult {
+            node: Some(lycoris_proto::node::MerkleNodeRef {
+              depth: depth as u32,
+              index,
+            }),
+            hash: hash.to_vec(),
+            is_leaf,
+            entries: entries
+              .into_iter()
+              .map(|(node_id, hash)| lycoris_proto::node::MerkleLeafEntry {
+                node_id,
+                hash: hash.to_vec(),
+              })
+              .collect(),
+          },
+        )
         .collect(),
     }))
   }

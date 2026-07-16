@@ -1,9 +1,9 @@
+use std::path::PathBuf;
+
 use lycoris_client::ClusterClient;
-use lycoris_config::{ClientConfig, DaemonConfig};
-use lycoris_core::{
-  ClusterKey, SimpleNode, default_cluster_key_path, paths::default_daemon_config_path,
-};
-use lycoris_tls::load_client_tls;
+use lycoris_config::{ClientConfig, DaemonConfig, default_daemon_config_path};
+use lycoris_core::{ClusterKey, default_cluster_key_path};
+use lycoris_tls::TlsBundle;
 use owo_colors::OwoColorize;
 
 use crate::error::ShellError;
@@ -11,7 +11,7 @@ use crate::error::ShellError;
 mod parse;
 mod render;
 
-pub async fn get_resources(
+pub(crate) async fn get_resources(
   client_config: &ClientConfig, resource: &str, name: Option<String>, selectors: &[String],
   scope: Option<String>,
 ) -> Result<(), ShellError> {
@@ -52,7 +52,7 @@ pub async fn get_resources(
   Ok(())
 }
 
-pub async fn describe_resource(
+pub(crate) async fn describe_resource(
   client_config: &ClientConfig, resource: &str, name: &str,
 ) -> Result<(), ShellError> {
   let mut client = connect_cluster(client_config).await?;
@@ -76,26 +76,26 @@ pub async fn describe_resource(
   Ok(())
 }
 
-pub async fn register(
+pub(crate) async fn register(
   client_config: &ClientConfig, id: String, address: String, key: String,
 ) -> Result<(), ShellError> {
   let key = key.trim().to_string();
   let mut client = connect_cluster(client_config).await?;
-  let node = SimpleNode::new(
+  let node = proto_node_info(
     id.clone(),
     address,
     std::collections::HashMap::new(),
     std::collections::HashMap::new(),
   );
   client
-    .register(&node, &key)
+    .register(node, &key)
     .await
     .map_err(ShellError::Register)?;
   println!("registered node {}", id.cyan());
   Ok(())
 }
 
-pub fn init_cluster(key: Option<String>) -> Result<(), ShellError> {
+pub(crate) fn init_cluster(key: Option<String>) -> Result<(), ShellError> {
   let cluster_key = match key {
     Some(hex) => ClusterKey::from_hex(hex.trim()).map_err(ShellError::ClusterKey)?,
     None => ClusterKey::generate().map_err(ShellError::ClusterKey)?,
@@ -111,32 +111,28 @@ pub fn init_cluster(key: Option<String>) -> Result<(), ShellError> {
   Ok(())
 }
 
-pub async fn join_cluster(
+pub(crate) async fn join_cluster(
   client_config: &ClientConfig, peer: String, key: String,
 ) -> Result<(), ShellError> {
   let key = key.trim().to_string();
   let daemon_config = load_daemon_config()?;
-  let tls = load_client_tls(
-    &client_config.cert,
-    &client_config.key,
-    &client_config.ca_cert,
-  )
-  .map_err(ShellError::TlsLoad)?;
-  let mut client = ClusterClient::connect_with_tls(&peer, tls)
+  let tls = load_tls_bundle(client_config)?;
+  let mut client = ClusterClient::connect(&peer, &tls)
     .await
     .map_err(|source| ShellError::Connect {
       address: peer.clone(),
       source,
-    })?;
+    })?
+    .with_cluster_key(key.clone());
 
-  let node = SimpleNode::new(
+  let node = proto_node_info(
     daemon_config.node.id.clone(),
     daemon_config.node.address.clone(),
     std::collections::HashMap::new(),
     std::collections::HashMap::new(),
   );
 
-  client.join(&node, &key).await.map_err(ShellError::Join)?;
+  client.join(node, &key).await.map_err(ShellError::Join)?;
 
   let mut local_client = connect_cluster(client_config).await?;
   local_client
@@ -152,7 +148,7 @@ pub async fn join_cluster(
   Ok(())
 }
 
-pub async fn leave_cluster(client_config: &ClientConfig) -> Result<(), ShellError> {
+pub(crate) async fn leave_cluster(client_config: &ClientConfig) -> Result<(), ShellError> {
   let daemon_config = load_daemon_config()?;
   let mut client = connect_cluster(client_config).await?;
   client
@@ -166,7 +162,7 @@ pub async fn leave_cluster(client_config: &ClientConfig) -> Result<(), ShellErro
   Ok(())
 }
 
-pub fn show_key() -> Result<(), ShellError> {
+pub(crate) fn show_key() -> Result<(), ShellError> {
   let path = default_cluster_key_path();
   if !path.is_file() {
     return Err(ShellError::ClusterKeyNotFound);
@@ -178,18 +174,40 @@ pub fn show_key() -> Result<(), ShellError> {
 }
 
 async fn connect_cluster(client_config: &ClientConfig) -> Result<ClusterClient, ShellError> {
-  let tls = load_client_tls(
-    &client_config.cert,
-    &client_config.key,
-    &client_config.ca_cert,
-  )
-  .map_err(ShellError::TlsLoad)?;
-  ClusterClient::connect_with_tls(&client_config.api_address, tls)
+  let key = load_cluster_key(client_config).ok();
+  let tls = load_tls_bundle(client_config)?;
+  let client = ClusterClient::connect(&client_config.api_address, &tls)
     .await
     .map_err(|source| ShellError::Connect {
       address: client_config.api_address.clone(),
       source,
-    })
+    })?;
+  Ok(match key {
+    Some(key) => client.with_cluster_key(key),
+    None => client,
+  })
+}
+
+fn load_cluster_key(client_config: &ClientConfig) -> Result<String, ShellError> {
+  let path = client_config
+    .cluster_key_path
+    .as_ref()
+    .map(PathBuf::from)
+    .filter(|p| p.is_file())
+    .or_else(|| Some(default_cluster_key_path()).filter(|p| p.is_file()))
+    .ok_or(ShellError::ClusterKeyNotFound)?;
+  ClusterKey::load(&path)
+    .map(|key| key.to_hex())
+    .map_err(ShellError::ClusterKey)
+}
+
+fn load_tls_bundle(client_config: &ClientConfig) -> Result<TlsBundle, ShellError> {
+  lycoris_tls::load_tls_bundle(
+    &client_config.cert,
+    &client_config.key,
+    &client_config.ca_cert,
+  )
+  .map_err(ShellError::TlsLoad)
 }
 
 fn load_daemon_config() -> Result<DaemonConfig, ShellError> {
@@ -199,4 +217,23 @@ fn load_daemon_config() -> Result<DaemonConfig, ShellError> {
 
 fn local_node_id() -> Option<String> {
   load_daemon_config().map(|config| config.node.id).ok()
+}
+
+fn proto_node_info(
+  id: String, address: String, labels: std::collections::HashMap<String, String>,
+  annotations: std::collections::HashMap<String, String>,
+) -> lycoris_proto::node::NodeInfo {
+  use lycoris_core::now_ms;
+  lycoris_proto::node::NodeInfo {
+    id,
+    address,
+    labels,
+    annotations,
+    last_heartbeat_unix_ms: now_ms(),
+    state: "active".to_string(),
+    incarnation: 1,
+    heartbeat: 0,
+    in_degree: Vec::new(),
+    out_degree: Vec::new(),
+  }
 }

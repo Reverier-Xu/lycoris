@@ -5,7 +5,7 @@ use redb::{Database, TableDefinition};
 use crate::{
   bytes::Bytes,
   workspace::{
-    vcs::ContentStore,
+    vcs::GitContentStore,
     versioned::{RedbVersionedStorage, VersionedResource},
   },
 };
@@ -22,7 +22,7 @@ pub use super::versioned::VersionedStorage as RuleStorage;
 pub type RedbRuleStorage = RedbVersionedStorage;
 
 /// Git-backed content store for rule bodies.
-pub type RuleContentStore = ContentStore;
+pub type RuleContentStore = GitContentStore;
 
 /// Create a redb-backed rule metadata storage.
 pub(crate) fn new_rule_storage(db: Arc<Database>) -> RedbRuleStorage {

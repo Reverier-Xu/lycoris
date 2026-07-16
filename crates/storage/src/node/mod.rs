@@ -6,7 +6,6 @@ use std::sync::Arc;
 pub use local::LocalStorage;
 pub use peers::{PeerRecord, PeerStorage};
 use redb::Database;
-use tokio::sync::Notify;
 
 /// Node-local storage domain.
 ///
@@ -15,22 +14,25 @@ use tokio::sync::Notify;
 /// `redb::Database` is shared with the other domains through an `Arc`.
 #[derive(Debug, Clone)]
 pub struct NodeDomain {
-  pub local: LocalStorage,
-  pub peers: PeerStorage,
-  notify: Arc<Notify>,
+  local: LocalStorage,
+  peers: PeerStorage,
 }
 
 impl NodeDomain {
-  pub(crate) fn new(db: Arc<Database>, notify: Arc<Notify>) -> Self {
+  pub(crate) fn new(db: Arc<Database>) -> Self {
     Self {
       local: LocalStorage::new(db.clone()),
       peers: PeerStorage::new(db),
-      notify,
     }
   }
 
-  /// Subscribe to changes that should trigger an immediate sync.
-  pub fn change_notify(&self) -> Arc<Notify> {
-    self.notify.clone()
+  /// Access local node attribute storage.
+  pub fn local(&self) -> &LocalStorage {
+    &self.local
+  }
+
+  /// Access peer endpoint storage.
+  pub fn peers(&self) -> &PeerStorage {
+    &self.peers
   }
 }

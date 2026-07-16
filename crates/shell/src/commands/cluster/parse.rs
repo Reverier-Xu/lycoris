@@ -4,7 +4,7 @@ use lycoris_proto::node::ResourceKind;
 
 use crate::error::ShellError;
 
-pub fn parse_resource_kind(raw: &str) -> Result<ResourceKind, ShellError> {
+pub(crate) fn parse_resource_kind(raw: &str) -> Result<ResourceKind, ShellError> {
   match raw.to_ascii_lowercase().as_str() {
     "node" | "nodes" | "no" => Ok(ResourceKind::Node),
     "session" | "sessions" | "sess" => Ok(ResourceKind::Session),
@@ -16,7 +16,7 @@ pub fn parse_resource_kind(raw: &str) -> Result<ResourceKind, ShellError> {
   }
 }
 
-pub fn resource_name(kind: ResourceKind) -> String {
+pub(crate) fn resource_name(kind: ResourceKind) -> String {
   match kind {
     ResourceKind::Node => "node",
     ResourceKind::Session => "session",
@@ -28,7 +28,7 @@ pub fn resource_name(kind: ResourceKind) -> String {
   .to_string()
 }
 
-pub fn parse_selectors(raw: &[String]) -> Result<HashMap<String, String>, ShellError> {
+pub(crate) fn parse_selectors(raw: &[String]) -> Result<HashMap<String, String>, ShellError> {
   let mut selector = HashMap::new();
   for item in raw {
     let (key, value) = item

@@ -3786,13 +3786,9 @@ dependencies = [
  "lycoris-tls",
  "owo-colors",
  "rustls",
- "serde",
  "tempfile",
  "thiserror",
  "tokio",
- "toml",
- "tonic",
- "tracing",
  "tracing-subscriber",
 ]
 
@@ -3800,8 +3796,6 @@ dependencies = [
 name = "lycoris-client"
 version = "0.1.0"
 dependencies = [
- "lycoris-config",
- "lycoris-core",
  "lycoris-proto",
  "lycoris-tls",
  "prost 0.13.5",
@@ -3815,6 +3809,7 @@ dependencies = [
 name = "lycoris-config"
 version = "0.1.0"
 dependencies = [
+ "directories",
  "lycoris-core",
  "serde",
  "tempfile",
@@ -3844,10 +3839,10 @@ dependencies = [
  "lycoris-client",
  "lycoris-config",
  "lycoris-core",
+ "lycoris-membership",
  "lycoris-proto",
  "lycoris-storage",
  "lycoris-tls",
- "prost 0.13.5",
  "rcgen",
  "rustls",
  "tempfile",
@@ -3858,11 +3853,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "lycoris-membership"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "lycoris-core",
+ "thiserror",
+]
+
+[[package]]
 name = "lycoris-proto"
 version = "0.1.0"
 dependencies = [
  "prost 0.13.5",
- "serde",
  "tonic",
  "tonic-build",
 ]
@@ -3876,9 +3879,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "futures-util",
- "jiff",
  "lancedb",
- "lycoris-config",
  "lycoris-core",
  "postcard",
  "redb",
@@ -3894,6 +3895,7 @@ name = "lycoris-tls"
 version = "0.1.0"
 dependencies = [
  "rcgen",
+ "rustls",
  "tempfile",
  "thiserror",
  "tonic",

@@ -7,11 +7,10 @@ use std::{
 
 use lycoris_client::{ClusterClient, PeerClient};
 use lycoris_config::{ClusterConfig, DaemonConfig, NodeConfig, TlsConfig};
-use lycoris_core::{ClusterKey, DEFAULT_EMBEDDING_DIM, SimpleNode, time::now_ms};
+use lycoris_core::{ClusterKey, DEFAULT_EMBEDDING_DIM, now_ms};
 use lycoris_proto::node::ResourceKind;
 use lycoris_storage::{
-  MemoryEntry, ResourceScope, SkillRecord, Storage, WorkspaceRecord,
-  workspace::VersionedContentStore,
+  MemoryEntry, ResourceScope, SkillRecord, Storage, VersionedContentStore, WorkspaceRecord,
 };
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
 use tempfile::TempDir;
@@ -92,13 +91,35 @@ fn generate_test_certs(
 fn client_tls_config(
   cert_path: &std::path::Path, key_path: &std::path::Path, ca_path: &std::path::Path,
 ) -> tonic::transport::ClientTlsConfig {
-  lycoris_tls::load_client_tls(cert_path, key_path, ca_path).unwrap()
+  lycoris_tls::load_tls_bundle(cert_path, key_path, ca_path)
+    .unwrap()
+    .client_config()
 }
 
-#[allow(clippy::too_many_arguments)]
+fn proto_node_info(
+  id: impl Into<String>, address: impl Into<String>,
+) -> lycoris_proto::node::NodeInfo {
+  use lycoris_core::now_ms;
+  lycoris_proto::node::NodeInfo {
+    id: id.into(),
+    address: address.into(),
+    labels: HashMap::new(),
+    annotations: HashMap::new(),
+    last_heartbeat_unix_ms: now_ms(),
+    state: "active".to_string(),
+    incarnation: 1,
+    heartbeat: 0,
+    in_degree: Vec::new(),
+    out_degree: Vec::new(),
+  }
+}
+
 fn spawn_runtime(config: DaemonConfig, key: ClusterKey) {
   tokio::spawn(async move {
-    if let Err(e) = lycoris_daemon::runtime::run(config, Some(key)).await {
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    if let Err(e) =
+      lycoris_daemon::runtime::run_with_shutdown(config, shutdown_tx, shutdown_rx, Some(key)).await
+    {
       eprintln!("runtime error: {e:?}");
     }
   });
@@ -131,7 +152,7 @@ fn build_config(
 
 #[tokio::test]
 async fn registry_converges_across_three_node_chain() {
-  let _ = lycoris_client::install_crypto_provider();
+  let _ = lycoris_tls::install_crypto_provider();
 
   let (node_count, base_port) = (3, alloc_base_port());
   let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
@@ -178,19 +199,18 @@ async fn registry_converges_across_three_node_chain() {
   let node0_url = format!("https://127.0.0.1:{base_port}");
   let mut client = ClusterClient::connect_with_tls(&node0_url, client_tls)
     .await
-    .expect("failed to connect to node-0");
+    .expect("failed to connect to node-0")
+    .with_cluster_key(key_hex.clone());
 
   let external_dir = TempDir::new().unwrap();
   let _external_storage =
     Storage::open(external_dir.path().join("external.redb")).expect("open external storage");
-  let external = SimpleNode::new(
+  let external = proto_node_info(
     "external-node".to_string(),
     format!("127.0.0.1:{}", base_port + 99),
-    HashMap::new(),
-    HashMap::new(),
   );
   client
-    .register(&external, &key_hex)
+    .register(external, &key_hex)
     .await
     .expect("register failed");
 
@@ -202,7 +222,8 @@ async fn registry_converges_across_three_node_chain() {
   let node2_url = format!("https://127.0.0.1:{}", base_port + 2);
   let mut client = ClusterClient::connect_with_tls(&node2_url, client_tls)
     .await
-    .expect("failed to connect to node-2");
+    .expect("failed to connect to node-2")
+    .with_cluster_key(key_hex.clone());
 
   let ids = list_node_ids(&mut client).await;
 
@@ -214,7 +235,7 @@ async fn registry_converges_across_three_node_chain() {
 
 #[tokio::test]
 async fn primary_failure_falls_back_and_promotes() {
-  let _ = lycoris_client::install_crypto_provider();
+  let _ = lycoris_tls::install_crypto_provider();
 
   let (node_count, base_port) = (2, alloc_base_port());
   let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
@@ -259,7 +280,11 @@ async fn primary_failure_falls_back_and_promotes() {
     } else {
       let key = cluster_key.clone();
       handles.push(tokio::spawn(async move {
-        if let Err(e) = lycoris_daemon::runtime::run(config, Some(key)).await {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        if let Err(e) =
+          lycoris_daemon::runtime::run_with_shutdown(config, shutdown_tx, shutdown_rx, Some(key))
+            .await
+        {
           eprintln!("runtime error: {e:?}");
         }
       }));
@@ -273,7 +298,8 @@ async fn primary_failure_falls_back_and_promotes() {
   let client_tls = client_tls_config(&cert_paths[0], &key_paths[0], &ca_cert_path);
   let mut client = ClusterClient::connect_with_tls(&node0_url, client_tls.clone())
     .await
-    .expect("failed to connect to node-0");
+    .expect("failed to connect to node-0")
+    .with_cluster_key(key_hex.clone());
   client
     .set_primary_endpoint("https://127.0.0.1:1")
     .await
@@ -284,14 +310,12 @@ async fn primary_failure_falls_back_and_promotes() {
   let external_dir = TempDir::new().unwrap();
   let _external_storage =
     Storage::open(external_dir.path().join("external.redb")).expect("open external storage");
-  let external = SimpleNode::new(
+  let external = proto_node_info(
     "fallback-external-node".to_string(),
     format!("127.0.0.1:{}", base_port + 99),
-    HashMap::new(),
-    HashMap::new(),
   );
   client
-    .register(&external, &key_hex)
+    .register(external, &key_hex)
     .await
     .expect("register failed");
 
@@ -301,7 +325,8 @@ async fn primary_failure_falls_back_and_promotes() {
   let node1_url = format!("https://127.0.0.1:{}", base_port + 1);
   let mut client = ClusterClient::connect_with_tls(&node1_url, client_tls)
     .await
-    .expect("failed to connect to node-1");
+    .expect("failed to connect to node-1")
+    .with_cluster_key(key_hex.clone());
   let ids = list_node_ids(&mut client).await;
   assert!(ids.contains(&"fallback-external-node".to_string()));
 
@@ -317,7 +342,7 @@ async fn primary_failure_falls_back_and_promotes() {
     Storage::open(data_dirs[0].path().join("lycoris.redb")).expect("reopen node-0 storage");
   let primary = node0_storage
     .node()
-    .peers
+    .peers()
     .get_primary()
     .expect("read primary")
     .expect("primary should be set after successful fallback sync");
@@ -326,7 +351,7 @@ async fn primary_failure_falls_back_and_promotes() {
 
 #[tokio::test]
 async fn partition_merge_reconciles_bidirectional_membership() {
-  let _ = lycoris_client::install_crypto_provider();
+  let _ = lycoris_tls::install_crypto_provider();
 
   let (node_count, base_port) = (2, alloc_base_port());
   let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
@@ -363,36 +388,28 @@ async fn partition_merge_reconciles_bidirectional_membership() {
   let client_tls = client_tls_config(&cert_paths[0], &key_paths[0], &ca_cert_path);
   let mut client = ClusterClient::connect_with_tls(&node0_url, client_tls.clone())
     .await
-    .expect("failed to connect to node-0");
+    .expect("failed to connect to node-0")
+    .with_cluster_key(key_hex.clone());
 
   let alpha_dir = TempDir::new().unwrap();
   let _alpha_storage =
     Storage::open(alpha_dir.path().join("alpha.redb")).expect("open alpha storage");
-  let alpha = SimpleNode::new(
-    "alpha".to_string(),
-    format!("127.0.0.1:{}", base_port + 98),
-    HashMap::new(),
-    HashMap::new(),
-  );
+  let alpha = proto_node_info("alpha".to_string(), format!("127.0.0.1:{}", base_port + 98));
   client
-    .register(&alpha, &key_hex)
+    .register(alpha, &key_hex)
     .await
     .expect("register alpha failed");
 
   let mut client = ClusterClient::connect_with_tls(&node1_url, client_tls.clone())
     .await
-    .expect("failed to connect to node-1");
+    .expect("failed to connect to node-1")
+    .with_cluster_key(key_hex.clone());
 
   let beta_dir = TempDir::new().unwrap();
   let _beta_storage = Storage::open(beta_dir.path().join("beta.redb")).expect("open beta storage");
-  let beta = SimpleNode::new(
-    "beta".to_string(),
-    format!("127.0.0.1:{}", base_port + 97),
-    HashMap::new(),
-    HashMap::new(),
-  );
+  let beta = proto_node_info("beta".to_string(), format!("127.0.0.1:{}", base_port + 97));
   client
-    .register(&beta, &key_hex)
+    .register(beta, &key_hex)
     .await
     .expect("register beta failed");
 
@@ -401,7 +418,8 @@ async fn partition_merge_reconciles_bidirectional_membership() {
   for url in [&node0_url, &node1_url] {
     let mut client = ClusterClient::connect_with_tls(url, client_tls.clone())
       .await
-      .expect("failed to connect");
+      .expect("failed to connect")
+      .with_cluster_key(key_hex.clone());
     let ids = list_node_ids(&mut client).await;
     assert!(ids.contains(&"alpha".to_string()));
     assert!(ids.contains(&"beta".to_string()));
@@ -412,13 +430,14 @@ async fn partition_merge_reconciles_bidirectional_membership() {
 
 #[tokio::test]
 async fn failure_detector_marks_unresponsive_peer() {
-  let _ = lycoris_client::install_crypto_provider();
+  let _ = lycoris_tls::install_crypto_provider();
 
   let (node_count, base_port) = (2, alloc_base_port());
   let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
   let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
 
   let cluster_key = ClusterKey::generate().expect("generate cluster key");
+  let key_hex = cluster_key.to_hex();
 
   let configs: Vec<DaemonConfig> = (0..node_count)
     .map(|i| {
@@ -441,7 +460,11 @@ async fn failure_detector_marks_unresponsive_peer() {
   for config in configs.clone() {
     let key = cluster_key.clone();
     handles.push(tokio::spawn(async move {
-      if let Err(e) = lycoris_daemon::runtime::run(config, Some(key)).await {
+      let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+      if let Err(e) =
+        lycoris_daemon::runtime::run_with_shutdown(config, shutdown_tx, shutdown_rx, Some(key))
+          .await
+      {
         eprintln!("runtime error: {e:?}");
       }
     }));
@@ -454,7 +477,8 @@ async fn failure_detector_marks_unresponsive_peer() {
   let client_tls = client_tls_config(&cert_paths[0], &key_paths[0], &ca_cert_path);
   let mut client = ClusterClient::connect_with_tls(&node0_url, client_tls.clone())
     .await
-    .expect("failed to connect to node-0");
+    .expect("failed to connect to node-0")
+    .with_cluster_key(key_hex.clone());
 
   wait_for_node(&mut client, "node-1", Duration::from_millis(2000)).await;
 
@@ -465,7 +489,9 @@ async fn failure_detector_marks_unresponsive_peer() {
   // (1s interval + 3s timeout per failure = ~11s).
   time::sleep(Duration::from_secs(12)).await;
 
-  let mut peer = PeerClient::connect(&node0_url, client_tls.clone())
+  let tls_bundle = lycoris_tls::load_tls_bundle(&cert_paths[0], &key_paths[0], &ca_cert_path)
+    .expect("load tls bundle");
+  let mut peer = PeerClient::connect(&node0_url, &tls_bundle)
     .await
     .expect("failed to connect membership client");
   let registers = peer
@@ -482,13 +508,14 @@ async fn failure_detector_marks_unresponsive_peer() {
 
 #[tokio::test]
 async fn shared_skills_replicate_via_anti_entropy() {
-  let _ = lycoris_client::install_crypto_provider();
+  let _ = lycoris_tls::install_crypto_provider();
 
   let (node_count, base_port) = (3, alloc_base_port());
   let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
   let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
 
   let cluster_key = ClusterKey::generate().expect("generate cluster key");
+  let key_hex = cluster_key.to_hex();
 
   {
     let storage =
@@ -552,7 +579,8 @@ async fn shared_skills_replicate_via_anti_entropy() {
   let client_tls = client_tls_config(&cert_paths[2], &key_paths[2], &ca_cert_path);
   let mut client = ClusterClient::connect_with_tls(&node2_url, client_tls)
     .await
-    .expect("failed to connect to node-2");
+    .expect("failed to connect to node-2")
+    .with_cluster_key(key_hex.clone());
 
   let start = std::time::Instant::now();
   loop {
@@ -618,6 +646,7 @@ fn memory_entry(
     source_node_id: Some("node-0".to_string()),
     updated_at_ms,
     content_hash,
+    version: updated_at_ms as u64,
   }
 }
 
@@ -640,13 +669,14 @@ fn workspace_record(id: &str, scope: ResourceScope, updated_at_ms: i64) -> Works
 
 #[tokio::test]
 async fn shared_memories_replicate_via_anti_entropy() {
-  let _ = lycoris_client::install_crypto_provider();
+  let _ = lycoris_tls::install_crypto_provider();
 
   let (node_count, base_port) = (3, alloc_base_port());
   let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
   let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
 
   let cluster_key = ClusterKey::generate().expect("generate cluster key");
+  let key_hex = cluster_key.to_hex();
 
   {
     let storage =
@@ -702,7 +732,8 @@ async fn shared_memories_replicate_via_anti_entropy() {
   let client_tls = client_tls_config(&cert_paths[2], &key_paths[2], &ca_cert_path);
   let mut client = ClusterClient::connect_with_tls(&node2_url, client_tls)
     .await
-    .expect("failed to connect to node-2");
+    .expect("failed to connect to node-2")
+    .with_cluster_key(key_hex.clone());
 
   wait_for_resource(
     &mut client,
@@ -715,13 +746,14 @@ async fn shared_memories_replicate_via_anti_entropy() {
 
 #[tokio::test]
 async fn shared_workspaces_replicate_via_anti_entropy() {
-  let _ = lycoris_client::install_crypto_provider();
+  let _ = lycoris_tls::install_crypto_provider();
 
   let (node_count, base_port) = (3, alloc_base_port());
   let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
   let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
 
   let cluster_key = ClusterKey::generate().expect("generate cluster key");
+  let key_hex = cluster_key.to_hex();
 
   {
     let storage =
@@ -769,7 +801,8 @@ async fn shared_workspaces_replicate_via_anti_entropy() {
   let client_tls = client_tls_config(&cert_paths[2], &key_paths[2], &ca_cert_path);
   let mut client = ClusterClient::connect_with_tls(&node2_url, client_tls)
     .await
-    .expect("failed to connect to node-2");
+    .expect("failed to connect to node-2")
+    .with_cluster_key(key_hex.clone());
 
   wait_for_resource(
     &mut client,
@@ -782,13 +815,14 @@ async fn shared_workspaces_replicate_via_anti_entropy() {
 
 #[tokio::test]
 async fn local_resources_do_not_replicate() {
-  let _ = lycoris_client::install_crypto_provider();
+  let _ = lycoris_tls::install_crypto_provider();
 
   let (node_count, base_port) = (2, alloc_base_port());
   let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
   let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
 
   let cluster_key = ClusterKey::generate().expect("generate cluster key");
+  let key_hex = cluster_key.to_hex();
 
   {
     let storage =
@@ -843,7 +877,8 @@ async fn local_resources_do_not_replicate() {
   let client_tls = client_tls_config(&cert_paths[1], &key_paths[1], &ca_cert_path);
   let mut client = ClusterClient::connect_with_tls(&node1_url, client_tls)
     .await
-    .expect("failed to connect to node-1");
+    .expect("failed to connect to node-1")
+    .with_cluster_key(key_hex.clone());
 
   time::sleep(Duration::from_secs(2)).await;
 
@@ -880,13 +915,14 @@ async fn local_resources_do_not_replicate() {
 
 #[tokio::test]
 async fn partition_merge_reconciles_shared_resources() {
-  let _ = lycoris_client::install_crypto_provider();
+  let _ = lycoris_tls::install_crypto_provider();
 
   let (node_count, base_port) = (2, alloc_base_port());
   let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
   let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
 
   let cluster_key = ClusterKey::generate().expect("generate cluster key");
+  let key_hex = cluster_key.to_hex();
 
   {
     let storage_a =
@@ -973,7 +1009,8 @@ async fn partition_merge_reconciles_shared_resources() {
   let client_tls = client_tls_config(&cert_paths[1], &key_paths[1], &ca_cert_path);
   let mut client = ClusterClient::connect_with_tls(&node1_url, client_tls)
     .await
-    .expect("failed to connect to node-1");
+    .expect("failed to connect to node-1")
+    .with_cluster_key(key_hex.clone());
 
   wait_for_resource(
     &mut client,
@@ -1007,13 +1044,14 @@ async fn partition_merge_reconciles_shared_resources() {
 
 #[tokio::test]
 async fn workspace_content_hash_verifies_on_apply() {
-  let _ = lycoris_client::install_crypto_provider();
+  let _ = lycoris_tls::install_crypto_provider();
 
   let (node_count, base_port) = (2, alloc_base_port());
   let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
   let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
 
   let cluster_key = ClusterKey::generate().expect("generate cluster key");
+  let key_hex = cluster_key.to_hex();
 
   {
     let storage =
@@ -1060,7 +1098,8 @@ async fn workspace_content_hash_verifies_on_apply() {
   let client_tls = client_tls_config(&cert_paths[1], &key_paths[1], &ca_cert_path);
   let mut client = ClusterClient::connect_with_tls(&node1_url, client_tls)
     .await
-    .expect("failed to connect to node-1");
+    .expect("failed to connect to node-1")
+    .with_cluster_key(key_hex.clone());
 
   wait_for_resource(
     &mut client,
@@ -1073,13 +1112,14 @@ async fn workspace_content_hash_verifies_on_apply() {
 
 #[tokio::test]
 async fn memory_content_hash_verifies_on_apply() {
-  let _ = lycoris_client::install_crypto_provider();
+  let _ = lycoris_tls::install_crypto_provider();
 
   let (node_count, base_port) = (2, alloc_base_port());
   let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
   let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
 
   let cluster_key = ClusterKey::generate().expect("generate cluster key");
+  let key_hex = cluster_key.to_hex();
 
   {
     let storage =
@@ -1126,7 +1166,8 @@ async fn memory_content_hash_verifies_on_apply() {
   let client_tls = client_tls_config(&cert_paths[1], &key_paths[1], &ca_cert_path);
   let mut client = ClusterClient::connect_with_tls(&node1_url, client_tls)
     .await
-    .expect("failed to connect to node-1");
+    .expect("failed to connect to node-1")
+    .with_cluster_key(key_hex.clone());
 
   wait_for_resource(
     &mut client,
@@ -1139,13 +1180,14 @@ async fn memory_content_hash_verifies_on_apply() {
 
 #[tokio::test]
 async fn memory_recall_works_after_replication() {
-  let _ = lycoris_client::install_crypto_provider();
+  let _ = lycoris_tls::install_crypto_provider();
 
   let (node_count, base_port) = (2, alloc_base_port());
   let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
   let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
 
   let cluster_key = ClusterKey::generate().expect("generate cluster key");
+  let key_hex = cluster_key.to_hex();
 
   {
     let storage =
@@ -1194,7 +1236,8 @@ async fn memory_recall_works_after_replication() {
   let client_tls = client_tls_config(&cert_paths[1], &key_paths[1], &ca_cert_path);
   let mut client = ClusterClient::connect_with_tls(&node1_url, client_tls)
     .await
-    .expect("failed to connect to node-1");
+    .expect("failed to connect to node-1")
+    .with_cluster_key(key_hex.clone());
 
   wait_for_resource(
     &mut client,

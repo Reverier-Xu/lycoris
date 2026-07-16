@@ -186,8 +186,6 @@ impl VersionedContentStore for GitContentStore {
   }
 }
 
-pub type ContentStore = GitContentStore;
-
 #[cfg(test)]
 mod tests {
   use tempfile::TempDir;

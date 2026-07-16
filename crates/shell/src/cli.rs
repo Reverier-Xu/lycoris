@@ -6,13 +6,13 @@ use clap::{Parser, Subcommand};
   version,
   about = "lycoris cluster command-line interface"
 )]
-pub struct Cli {
+pub(crate) struct Cli {
   #[command(subcommand)]
-  pub command: Command,
+  pub(crate) command: Command,
 }
 
 #[derive(Subcommand, Debug)]
-pub enum Command {
+pub(crate) enum Command {
   /// Query cluster information.
   #[command(subcommand)]
   Cluster(ClusterCommand),
@@ -36,7 +36,7 @@ pub enum Command {
 }
 
 #[derive(Subcommand, Debug)]
-pub enum ClusterCommand {
+pub(crate) enum ClusterCommand {
   /// List or get cluster resources.
   Get {
     /// Resource kind, e.g. `nodes`, `skills`, `sessions`.

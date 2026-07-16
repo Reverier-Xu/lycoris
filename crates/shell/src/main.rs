@@ -3,17 +3,17 @@
 
 use clap::Parser;
 
-mod cli;
-mod commands;
-mod config;
-mod error;
+pub(crate) mod cli;
+pub(crate) mod commands;
+pub(crate) mod config;
+pub(crate) mod error;
 
 use cli::{Cli, ClusterCommand, Command};
 use config::load_client_config;
 use error::ShellError;
 
 fn main() -> Result<(), ShellError> {
-  lycoris_client::install_crypto_provider().map_err(ShellError::CryptoProvider)?;
+  lycoris_tls::install_crypto_provider().map_err(ShellError::CryptoProvider)?;
   tracing_subscriber::fmt::init();
 
   let cli = Cli::parse();

@@ -1,10 +1,17 @@
 use std::{fs, path::Path};
 
-use lycoris_core::validation::non_empty_string;
+use lycoris_core::non_empty_string;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::daemon::DaemonConfig;
+
+fn daemon_cluster_key_path(daemon: &DaemonConfig) -> String {
+  Path::new(&daemon.data_dir)
+    .join("cluster.key")
+    .to_string_lossy()
+    .to_string()
+}
 
 /// Client configuration used by the `lycoris` CLI to talk to a daemon node.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -22,6 +29,11 @@ pub struct ClientConfig {
   /// Path to the client private key used for mutual TLS.
   #[serde(deserialize_with = "non_empty_string")]
   pub key: String,
+  /// Path to the cluster key file used to authenticate `Cluster` RPCs.
+  ///
+  /// When present, the CLI loads the key from this path and attaches it as
+  /// metadata on every `Cluster` request.
+  pub cluster_key_path: Option<String>,
 }
 
 impl ClientConfig {
@@ -37,6 +49,7 @@ impl ClientConfig {
       ca_cert: daemon.tls.ca_cert.clone(),
       cert: daemon.tls.cert.clone(),
       key: daemon.tls.key.clone(),
+      cluster_key_path: Some(daemon_cluster_key_path(daemon)),
     }
   }
 
@@ -97,6 +110,10 @@ mod tests {
     let loaded = ClientConfig::from_file(&path).unwrap();
     assert_eq!(loaded.api_address, original.api_address);
     assert_eq!(loaded.ca_cert, original.ca_cert);
+    assert_eq!(
+      loaded.cluster_key_path,
+      Some("/var/lib/lycoris/cluster.key".to_string())
+    );
   }
 
   #[test]

@@ -34,16 +34,16 @@ clap          = "4.6"
 directories   = "6.0"
 futures-util  = "0.3"
 hex           = "0.4"
-jiff          = "0.2"
 is-root       = "0.1"
 lancedb       = "0.31"
-lycoris-client  = { path = "crates/client" }
-lycoris-config  = { path = "crates/config" }
-lycoris-core    = { path = "crates/core" }
-lycoris-daemon  = { path = "crates/daemon" }
-lycoris-proto   = { path = "crates/proto" }
-lycoris-storage = { path = "crates/storage" }
-lycoris-tls     = { path = "crates/tls" }
+lycoris-client    = { path = "crates/client" }
+lycoris-config    = { path = "crates/config" }
+lycoris-core      = { path = "crates/core" }
+lycoris-daemon    = { path = "crates/daemon" }
+lycoris-membership = { path = "crates/membership" }
+lycoris-proto     = { path = "crates/proto" }
+lycoris-storage   = { path = "crates/storage" }
+lycoris-tls       = { path = "crates/tls" }
 blake3        = "1.8"
 owo-colors    = "4.3"
 postcard      = { version = "1.0", features = ["use-std"] }
@@ -52,12 +52,10 @@ rcgen         = "0.13"
 ring          = "0.17"
 redb          = "3.0"
 rustls        = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rustls-pemfile = "2.2"
 serde         = { version = "1.0", features = ["derive"] }
 tempfile      = "3"
 thiserror     = "2.0"
 tokio         = { version = "1.52", features = ["full"] }
-tokio-rustls  = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 toml          = "0.8"
 tonic         = { version = "0.13", features = ["tls-ring"] }
 tonic-build   = "0.13"

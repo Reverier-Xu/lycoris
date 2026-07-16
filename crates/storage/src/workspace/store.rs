@@ -43,6 +43,20 @@ impl WorkspaceRecord {
   }
 }
 
+impl crate::versioned::VersionedRecord for WorkspaceRecord {
+  fn version(&self) -> u64 {
+    self.version
+  }
+
+  fn updated_at_ms(&self) -> i64 {
+    self.updated_at_ms
+  }
+
+  fn scope(&self) -> ResourceScope {
+    self.scope
+  }
+}
+
 /// Storage for workspace metadata.
 ///
 /// Workspaces may reference large files on disk; this store only persists the

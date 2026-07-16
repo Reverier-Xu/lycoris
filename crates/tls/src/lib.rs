@@ -1,13 +1,22 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
-pub mod generate;
+mod generate;
 
 use std::path::Path;
 
 pub use generate::ensure_tls_bundle;
 use thiserror::Error;
 use tonic::transport::{Certificate, ClientTlsConfig, Identity, ServerTlsConfig};
+
+/// Install the rustls ring crypto provider as the process default.
+///
+/// This must be called before any TLS connection is established. Subsequent
+/// calls return the already-installed provider and can be ignored by callers
+/// that only need to ensure the provider is present.
+pub fn install_crypto_provider() -> Result<(), std::sync::Arc<rustls::crypto::CryptoProvider>> {
+  rustls::crypto::ring::default_provider().install_default()
+}
 
 #[derive(Debug, Clone)]
 pub struct TlsBundle {
@@ -45,30 +54,6 @@ where
   })
 }
 
-/// Load a client TLS config from PEM files.
-pub fn load_client_tls<P>(
-  cert_path: P, key_path: P, ca_path: P,
-) -> Result<ClientTlsConfig, std::io::Error>
-where
-  P: AsRef<Path>, {
-  let cert = std::fs::read_to_string(cert_path.as_ref())?;
-  let key = std::fs::read_to_string(key_path.as_ref())?;
-  let ca = std::fs::read_to_string(ca_path.as_ref())?;
-
-  Ok(
-    ClientTlsConfig::new()
-      .identity(Identity::from_pem(cert, key))
-      .ca_certificate(Certificate::from_pem(ca)),
-  )
-}
-
-/// Load a client TLS config from PEM file contents.
-pub fn client_tls_from_pems(cert_pem: String, key_pem: String, ca_pem: String) -> ClientTlsConfig {
-  ClientTlsConfig::new()
-    .identity(Identity::from_pem(cert_pem, key_pem))
-    .ca_certificate(Certificate::from_pem(ca_pem))
-}
-
 #[derive(Debug, Error)]
 pub enum TlsError {
   #[error("io error: {0}")]
@@ -87,7 +72,7 @@ mod tests {
   use crate::generate::ensure_tls_bundle;
 
   #[test]
-  fn load_client_tls_round_trip() {
+  fn load_tls_bundle_round_trip() {
     let dir = TempDir::new().unwrap();
     let ca_cert = dir.path().join("ca.crt");
     let ca_key = dir.path().join("ca.key");
@@ -95,8 +80,9 @@ mod tests {
     let key = dir.path().join("node.key");
 
     let bundle = ensure_tls_bundle(&ca_cert, &ca_key, &cert, &key, "test-node").unwrap();
-    let _client = load_client_tls(&cert, &key, &ca_cert).unwrap();
+    let _client = load_tls_bundle(&cert, &key, &ca_cert)
+      .unwrap()
+      .client_config();
     let _server = bundle.server_config();
-    let _client = bundle.client_config();
   }
 }

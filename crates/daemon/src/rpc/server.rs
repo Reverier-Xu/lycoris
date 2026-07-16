@@ -2,13 +2,11 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use lycoris_core::ClusterKey;
 use lycoris_proto::node::{
   DescribeResourceRequest, GetOutDegreeRequest, GetOutDegreeResponse, GetResourceRequest,
   JoinRequest, JoinResponse, LeaveRequest, LeaveResponse, ListResourcesRequest,
   ListResourcesResponse, NodeInfo as ProtoNodeInfo, RegisterRequest, RegisterResponse, Resource,
-  SetPrimaryEndpointRequest, SetPrimaryEndpointResponse,
-  cluster_server::{Cluster, ClusterServer},
+  SetPrimaryEndpointRequest, SetPrimaryEndpointResponse, cluster_server::Cluster,
 };
 use lycoris_storage::Storage;
 use tokio::sync::watch;
@@ -18,15 +16,12 @@ use crate::{
   cluster_sync::ClusterSync, membership::MembershipService, rpc::resource::ResourceMapper,
 };
 
-pub type ClusterServerHandle = ClusterServer<ClusterService>;
-
 #[derive(Debug, Clone)]
 pub struct ClusterService {
   service: Arc<MembershipService>,
   storage: Storage,
   mapper: ResourceMapper,
   cluster_sync: Option<ClusterSync>,
-  cluster_key: Option<ClusterKey>,
   shutdown: Option<watch::Sender<bool>>,
 }
 
@@ -37,7 +32,6 @@ impl ClusterService {
       storage,
       mapper,
       cluster_sync: None,
-      cluster_key: None,
       shutdown: None,
     }
   }
@@ -47,18 +41,9 @@ impl ClusterService {
     self
   }
 
-  pub fn with_cluster_key(mut self, cluster_key: Option<ClusterKey>) -> Self {
-    self.cluster_key = cluster_key;
-    self
-  }
-
   pub fn with_shutdown(mut self, shutdown: watch::Sender<bool>) -> Self {
     self.shutdown = Some(shutdown);
     self
-  }
-
-  pub fn into_server(self) -> ClusterServerHandle {
-    ClusterServer::new(self)
   }
 
   fn local_node_id(&self) -> &str {
@@ -70,7 +55,7 @@ impl ClusterService {
     let primary = self
       .storage
       .node()
-      .peers
+      .peers()
       .get_primary()
       .map_err(|error| Status::internal(format!("failed to read primary peer: {error}")))?;
 
@@ -98,23 +83,6 @@ impl Cluster for ClusterService {
       return Ok(Response::new(RegisterResponse {
         accepted: false,
         reason: "node id must not be empty".to_string(),
-      }));
-    }
-
-    if let Some(expected) = &self.cluster_key {
-      let provided = ClusterKey::from_hex(&request.cluster_key)
-        .map_err(|_| Status::permission_denied("invalid cluster key format"))?;
-      if provided != *expected {
-        return Ok(Response::new(RegisterResponse {
-          accepted: false,
-          reason: "cluster key mismatch".to_string(),
-        }));
-      }
-    } else {
-      return Ok(Response::new(RegisterResponse {
-        accepted: false,
-        reason: "this node has not initialized a cluster key; run 'lycoris cluster init' first"
-          .to_string(),
       }));
     }
 
@@ -171,7 +139,7 @@ impl Cluster for ClusterService {
     self
       .storage
       .node()
-      .peers
+      .peers()
       .set_primary(&address)
       .map_err(|error| Status::internal(format!("failed to set primary endpoint: {error}")))?;
 
@@ -194,24 +162,7 @@ impl Cluster for ClusterService {
       }));
     }
 
-    if let Some(expected) = &self.cluster_key {
-      let provided = ClusterKey::from_hex(&join.cluster_key)
-        .map_err(|_| Status::permission_denied("invalid cluster key format"))?;
-      if provided != *expected {
-        return Ok(Response::new(JoinResponse {
-          accepted: false,
-          reason: "cluster key mismatch".to_string(),
-        }));
-      }
-    } else {
-      return Ok(Response::new(JoinResponse {
-        accepted: false,
-        reason: "this node has not initialized a cluster key; run 'lycoris cluster init' first"
-          .to_string(),
-      }));
-    }
-
-    let _ = self.storage.node().peers.seed(&info.address);
+    let _ = self.storage.node().peers().seed(&info.address);
     let actions = self.service.register(&info).await;
     if let Some(cluster_sync) = &self.cluster_sync {
       cluster_sync.dispatch(actions).await;
@@ -228,10 +179,7 @@ impl Cluster for ClusterService {
     let node_id = request.into_inner().node_id;
     let local_id = self.local_node_id().to_string();
 
-    let actions = self
-      .service
-      .leave(&node_id, lycoris_core::time::now_ms())
-      .await;
+    let actions = self.service.leave(&node_id, lycoris_core::now_ms()).await;
     if let Some(cluster_sync) = &self.cluster_sync {
       cluster_sync.dispatch(actions).await;
     }

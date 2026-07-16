@@ -1,5 +1,5 @@
 [package]
-name = "lycoris-client"
+name = "lycoris-membership"
 
 authors.workspace      = true
 description.workspace  = true
@@ -12,13 +12,9 @@ rust-version.workspace = true
 version.workspace      = true
 
 [dependencies]
-lycoris-proto  = { workspace = true }
-lycoris-tls    = { workspace = true }
-prost.workspace     = true
-rustls.workspace    = true
-thiserror.workspace = true
-tokio.workspace     = true
-tonic.workspace     = true
+blake3      = { workspace = true }
+lycoris-core = { workspace = true }
+thiserror   = { workspace = true }
 
 [lints]
 workspace = true

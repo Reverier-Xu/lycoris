@@ -30,9 +30,23 @@ pub struct VersionedResource {
   pub metadata: HashMap<String, String>,
 }
 
+impl crate::versioned::VersionedRecord for VersionedResource {
+  fn version(&self) -> u64 {
+    self.version
+  }
+
+  fn updated_at_ms(&self) -> i64 {
+    self.updated_at_ms
+  }
+
+  fn scope(&self) -> super::ResourceScope {
+    self.scope
+  }
+}
+
 /// Storage for versioned resource metadata.
 ///
-/// Content is versioned as immutable snapshots in a [`ContentStore`]; this
+/// Content is versioned as immutable snapshots in a [`GitContentStore`]; this
 /// trait only persists the metadata and content hash needed for
 /// synchronization and lookup.
 pub trait VersionedStorage: std::fmt::Debug + Send + Sync {

@@ -5,7 +5,7 @@ use lycoris_config::ConfigError;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
-pub enum ShellError {
+pub(crate) enum ShellError {
   #[error("failed to install rustls crypto provider: {0:?}")]
   CryptoProvider(std::sync::Arc<rustls::crypto::CryptoProvider>),
   #[error("failed to create tokio runtime: {0}")]
@@ -17,7 +17,7 @@ pub enum ShellError {
   #[error("no daemon configuration found")]
   ConfigNotFound,
   #[error("failed to load client TLS material: {0}")]
-  TlsLoad(std::io::Error),
+  TlsLoad(lycoris_tls::TlsError),
   #[error("failed to connect to {address}: {source}")]
   Connect {
     address: String,
@@ -67,7 +67,7 @@ pub enum ShellError {
 }
 
 impl ShellError {
-  pub fn setup(message: impl Into<String>) -> Self {
+  pub(crate) fn setup(message: impl Into<String>) -> Self {
     Self::Setup(message.into())
   }
 }
