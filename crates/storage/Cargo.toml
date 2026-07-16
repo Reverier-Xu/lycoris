@@ -15,6 +15,7 @@ version.workspace      = true
 arrow-array    = { workspace = true }
 arrow-schema   = { workspace = true }
 async-trait    = { workspace = true }
+blake3         = { workspace = true }
 futures-util   = { workspace = true }
 jiff           = { workspace = true }
 lycoris-config = { workspace = true }

@@ -3,7 +3,7 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
-use super::WorkspaceStorageError;
+use super::{ResourceScope, WorkspaceStorageError};
 use crate::{
   bytes::{Bytes, decode, encode},
   error::{is_missing_table, redb_err},
@@ -20,8 +20,27 @@ pub struct WorkspaceRecord {
   /// Sessions currently associated with this workspace.
   pub session_ids: Vec<String>,
   pub metadata: HashMap<String, String>,
+  pub scope: ResourceScope,
+  /// `None` means this workspace originated on the local node.
+  pub source_node_id: Option<String>,
+  pub version: u64,
+  pub content_hash: String,
   pub created_at_ms: i64,
   pub updated_at_ms: i64,
+}
+
+impl WorkspaceRecord {
+  /// Compute a stable content hash from the meaningful fields of the record.
+  ///
+  /// `updated_at_ms` and `content_hash` are excluded so the hash does not
+  /// change when only synchronization metadata is updated.
+  pub fn compute_content_hash(&self) -> Result<String, WorkspaceStorageError> {
+    let mut canonical = self.clone();
+    canonical.updated_at_ms = 0;
+    canonical.content_hash = String::new();
+    let bytes = encode(&canonical)?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
+  }
 }
 
 /// Storage for workspace metadata.
@@ -37,6 +56,12 @@ pub trait WorkspaceMetadataStorage: std::fmt::Debug + Send + Sync {
 
   /// Return all workspace records.
   fn list(&self) -> Result<Vec<WorkspaceRecord>, WorkspaceStorageError>;
+
+  /// Return workspace records whose scope is `ClusterShared`.
+  fn list_shared(&self) -> Result<Vec<WorkspaceRecord>, WorkspaceStorageError>;
+
+  /// Return workspace records whose scope is `NodeLocal`.
+  fn list_local(&self) -> Result<Vec<WorkspaceRecord>, WorkspaceStorageError>;
 
   /// Delete a workspace record.
   fn delete(&self, id: &str) -> Result<(), WorkspaceStorageError>;
@@ -56,11 +81,14 @@ impl RedbWorkspaceStorage {
 
 impl WorkspaceMetadataStorage for RedbWorkspaceStorage {
   fn upsert(&self, workspace: &WorkspaceRecord) -> Result<(), WorkspaceStorageError> {
+    let mut workspace = workspace.clone();
+    workspace.content_hash = workspace.compute_content_hash()?;
+
     let write_txn = self.db.begin_write().map_err(redb_err)?;
     {
       let mut table = write_txn.open_table(WORKSPACES).map_err(redb_err)?;
       table
-        .insert(workspace.id.as_str(), Bytes(encode(workspace)?))
+        .insert(workspace.id.as_str(), Bytes(encode(&workspace)?))
         .map_err(redb_err)?;
     }
     write_txn.commit().map_err(redb_err)?;
@@ -100,6 +128,26 @@ impl WorkspaceMetadataStorage for RedbWorkspaceStorage {
       })
       .collect::<Result<Vec<_>, _>>()
       .map_err(Into::into)
+  }
+
+  fn list_shared(&self) -> Result<Vec<WorkspaceRecord>, WorkspaceStorageError> {
+    Ok(
+      self
+        .list()?
+        .into_iter()
+        .filter(|workspace| workspace.scope == ResourceScope::ClusterShared)
+        .collect(),
+    )
+  }
+
+  fn list_local(&self) -> Result<Vec<WorkspaceRecord>, WorkspaceStorageError> {
+    Ok(
+      self
+        .list()?
+        .into_iter()
+        .filter(|workspace| workspace.scope == ResourceScope::NodeLocal)
+        .collect(),
+    )
   }
 
   fn delete(&self, id: &str) -> Result<(), WorkspaceStorageError> {

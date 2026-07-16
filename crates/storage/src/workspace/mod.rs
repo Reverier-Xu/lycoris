@@ -123,7 +123,7 @@ mod tests {
     (dir, storage.workspace().clone())
   }
 
-  fn workspace_record(id: &str) -> WorkspaceRecord {
+  fn workspace_record(id: &str, scope: ResourceScope) -> WorkspaceRecord {
     WorkspaceRecord {
       id: id.to_string(),
       root: PathBuf::from(format!("/tmp/{id}")),
@@ -131,6 +131,10 @@ mod tests {
       metadata: [("project".to_string(), "lycoris".to_string())]
         .into_iter()
         .collect(),
+      scope,
+      source_node_id: None,
+      version: 1,
+      content_hash: String::new(),
       created_at_ms: now_ms(),
       updated_at_ms: now_ms(),
     }
@@ -169,7 +173,7 @@ mod tests {
   #[test]
   fn workspace_round_trip() {
     let (_dir, domain) = test_domain();
-    let record = workspace_record("ws-1");
+    let record = workspace_record("ws-1", ResourceScope::NodeLocal);
 
     domain.workspaces().upsert(&record).unwrap();
     let loaded = domain.workspaces().get("ws-1").unwrap().unwrap();
@@ -177,6 +181,8 @@ mod tests {
     assert_eq!(loaded.id, "ws-1");
     assert_eq!(loaded.root, PathBuf::from("/tmp/ws-1"));
     assert_eq!(loaded.metadata.get("project"), Some(&"lycoris".to_string()));
+    assert_eq!(loaded.scope, ResourceScope::NodeLocal);
+    assert!(!loaded.content_hash.is_empty());
   }
 
   #[test]
@@ -184,11 +190,11 @@ mod tests {
     let (_dir, domain) = test_domain();
     domain
       .workspaces()
-      .upsert(&workspace_record("ws-a"))
+      .upsert(&workspace_record("ws-a", ResourceScope::NodeLocal))
       .unwrap();
     domain
       .workspaces()
-      .upsert(&workspace_record("ws-b"))
+      .upsert(&workspace_record("ws-b", ResourceScope::ClusterShared))
       .unwrap();
 
     let list = domain.workspaces().list().unwrap();
@@ -198,6 +204,27 @@ mod tests {
     let list = domain.workspaces().list().unwrap();
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].id, "ws-b");
+  }
+
+  #[test]
+  fn workspace_scope_filtering() {
+    let (_dir, domain) = test_domain();
+    domain
+      .workspaces()
+      .upsert(&workspace_record("shared-ws", ResourceScope::ClusterShared))
+      .unwrap();
+    domain
+      .workspaces()
+      .upsert(&workspace_record("local-ws", ResourceScope::NodeLocal))
+      .unwrap();
+
+    let shared = domain.workspaces().list_shared().unwrap();
+    assert_eq!(shared.len(), 1);
+    assert_eq!(shared[0].id, "shared-ws");
+
+    let local = domain.workspaces().list_local().unwrap();
+    assert_eq!(local.len(), 1);
+    assert_eq!(local[0].id, "local-ws");
   }
 
   #[test]

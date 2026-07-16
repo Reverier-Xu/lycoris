@@ -6,11 +6,13 @@
 //!   `RedbSessionStorage`.
 //! - `MemoryEntry` records (including their embeddings) are stored in an
 //!   embedded LanceDB table for fast vector similarity search.
+//! - Memories can be scoped as `NodeLocal` or `ClusterShared`; only shared
+//!   memories participate in cluster anti-entropy synchronization.
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use arrow_array::{
-  Array, BinaryArray, FixedSizeListArray, Float32Array, RecordBatch, StringArray,
+  Array, BinaryArray, FixedSizeListArray, Float32Array, Int64Array, RecordBatch, StringArray,
   types::Float32Type,
 };
 use arrow_schema::{DataType, Field, Schema};
@@ -25,6 +27,7 @@ use crate::{
   StorageError,
   bytes::{Bytes, decode, encode},
   error::{is_missing_table, redb_err},
+  workspace::ResourceScope,
 };
 
 const SESSIONS: TableDefinition<&str, Bytes> = TableDefinition::new("agent_sessions");
@@ -44,6 +47,26 @@ pub struct MemoryEntry {
   pub content: Vec<u8>,
   pub embedding: Vec<f32>,
   pub metadata: HashMap<String, String>,
+  pub scope: ResourceScope,
+  /// `None` means this memory originated on the local node.
+  pub source_node_id: Option<String>,
+  pub updated_at_ms: i64,
+  pub content_hash: String,
+}
+
+impl MemoryEntry {
+  /// Compute the content hash for the entry body.
+  pub fn compute_content_hash(content: &[u8]) -> String {
+    blake3::hash(content).to_hex().to_string()
+  }
+
+  /// Return the logical version used for conflict resolution.
+  ///
+  /// Memories use a monotonic timestamp as their version so that embedding
+  /// model changes do not invalidate version vectors.
+  pub fn version(&self) -> u64 {
+    self.updated_at_ms as u64
+  }
 }
 
 /// Storage for active agent sessions.
@@ -62,6 +85,14 @@ pub trait MemoryStorage: std::fmt::Debug + Send + Sync {
   async fn recall(
     &self, query: Vec<f32>, limit: usize,
   ) -> Result<Vec<MemoryEntry>, AgentStorageError>;
+  /// Return the memory with the given id, if any.
+  async fn get(&self, id: &str) -> Result<Option<MemoryEntry>, AgentStorageError>;
+  /// Return all memories.
+  async fn list(&self) -> Result<Vec<MemoryEntry>, AgentStorageError>;
+  /// Return memories whose scope is `ClusterShared`.
+  async fn list_shared(&self) -> Result<Vec<MemoryEntry>, AgentStorageError>;
+  /// Return memories whose scope is `NodeLocal`.
+  async fn list_local(&self) -> Result<Vec<MemoryEntry>, AgentStorageError>;
 }
 
 /// Errors that can occur in agent storage backends.
@@ -224,6 +255,10 @@ impl LanceDbMemoryStorage {
         ),
         true,
       ),
+      Field::new("scope", DataType::Utf8, false),
+      Field::new("source_node_id", DataType::Utf8, true),
+      Field::new("updated_at_ms", DataType::Int64, false),
+      Field::new("content_hash", DataType::Utf8, false),
     ]))
   }
 
@@ -266,6 +301,20 @@ impl LanceDbMemoryStorage {
       embedding_values.into_iter().map(Some),
       self.embedding_dim as i32,
     );
+    let scopes = StringArray::from_iter_values(entries.iter().map(|entry| match entry.scope {
+      ResourceScope::ClusterShared => "shared",
+      ResourceScope::NodeLocal => "local",
+    }));
+    let source_node_ids = StringArray::from(
+      entries
+        .iter()
+        .map(|entry| entry.source_node_id.as_deref())
+        .collect::<Vec<_>>(),
+    );
+    let updated_at_ms =
+      Int64Array::from_iter_values(entries.iter().map(|entry| entry.updated_at_ms));
+    let content_hashes =
+      StringArray::from_iter_values(entries.iter().map(|entry| entry.content_hash.as_str()));
 
     RecordBatch::try_new(
       schema,
@@ -274,6 +323,10 @@ impl LanceDbMemoryStorage {
         Arc::new(contents),
         Arc::new(metadata),
         Arc::new(embeddings),
+        Arc::new(scopes),
+        Arc::new(source_node_ids),
+        Arc::new(updated_at_ms),
+        Arc::new(content_hashes),
       ],
     )
     .map_err(|error| AgentStorageError::Backend(error.to_string()))
@@ -337,6 +390,59 @@ impl MemoryStorage for LanceDbMemoryStorage {
     }
     Ok(entries)
   }
+
+  async fn get(&self, id: &str) -> Result<Option<MemoryEntry>, AgentStorageError> {
+    let entries = self.list().await?;
+    Ok(entries.into_iter().find(|entry| entry.id == id))
+  }
+
+  async fn list(&self) -> Result<Vec<MemoryEntry>, AgentStorageError> {
+    let conn = self.connection().await?;
+
+    let table = match conn.open_table(MEMORY_TABLE).execute().await {
+      Ok(table) => table,
+      Err(_) => return Ok(Vec::new()),
+    };
+
+    let stream = table
+      .query()
+      .execute()
+      .await
+      .map_err(|error| AgentStorageError::Backend(error.to_string()))?;
+
+    let batches = stream
+      .try_collect::<Vec<_>>()
+      .await
+      .map_err(|error| AgentStorageError::Backend(error.to_string()))?;
+
+    let mut entries = Vec::new();
+    for batch in batches {
+      entries.extend(parse_memory_batch(&batch)?);
+    }
+    Ok(entries)
+  }
+
+  async fn list_shared(&self) -> Result<Vec<MemoryEntry>, AgentStorageError> {
+    Ok(
+      self
+        .list()
+        .await?
+        .into_iter()
+        .filter(|entry| entry.scope == ResourceScope::ClusterShared)
+        .collect(),
+    )
+  }
+
+  async fn list_local(&self) -> Result<Vec<MemoryEntry>, AgentStorageError> {
+    Ok(
+      self
+        .list()
+        .await?
+        .into_iter()
+        .filter(|entry| entry.scope == ResourceScope::NodeLocal)
+        .collect(),
+    )
+  }
 }
 
 fn parse_memory_batch(batch: &RecordBatch) -> Result<Vec<MemoryEntry>, AgentStorageError> {
@@ -352,6 +458,18 @@ fn parse_memory_batch(batch: &RecordBatch) -> Result<Vec<MemoryEntry>, AgentStor
   let embedding_col = batch
     .column_by_name("embedding")
     .ok_or_else(|| AgentStorageError::Backend("missing embedding column".to_string()))?;
+  let scope_col = batch
+    .column_by_name("scope")
+    .ok_or_else(|| AgentStorageError::Backend("missing scope column".to_string()))?;
+  let source_node_id_col = batch
+    .column_by_name("source_node_id")
+    .ok_or_else(|| AgentStorageError::Backend("missing source_node_id column".to_string()))?;
+  let updated_at_ms_col = batch
+    .column_by_name("updated_at_ms")
+    .ok_or_else(|| AgentStorageError::Backend("missing updated_at_ms column".to_string()))?;
+  let content_hash_col = batch
+    .column_by_name("content_hash")
+    .ok_or_else(|| AgentStorageError::Backend("missing content_hash column".to_string()))?;
 
   let ids = id_col
     .as_any()
@@ -369,6 +487,24 @@ fn parse_memory_batch(batch: &RecordBatch) -> Result<Vec<MemoryEntry>, AgentStor
     .as_any()
     .downcast_ref::<FixedSizeListArray>()
     .ok_or_else(|| AgentStorageError::Backend("embedding column has wrong type".to_string()))?;
+  let scopes = scope_col
+    .as_any()
+    .downcast_ref::<StringArray>()
+    .ok_or_else(|| AgentStorageError::Backend("scope column has wrong type".to_string()))?;
+  let source_node_ids = source_node_id_col
+    .as_any()
+    .downcast_ref::<StringArray>()
+    .ok_or_else(|| {
+      AgentStorageError::Backend("source_node_id column has wrong type".to_string())
+    })?;
+  let updated_at_ms = updated_at_ms_col
+    .as_any()
+    .downcast_ref::<Int64Array>()
+    .ok_or_else(|| AgentStorageError::Backend("updated_at_ms column has wrong type".to_string()))?;
+  let content_hashes = content_hash_col
+    .as_any()
+    .downcast_ref::<StringArray>()
+    .ok_or_else(|| AgentStorageError::Backend("content_hash column has wrong type".to_string()))?;
 
   let mut entries = Vec::new();
   for i in 0..batch.num_rows() {
@@ -381,12 +517,28 @@ fn parse_memory_batch(batch: &RecordBatch) -> Result<Vec<MemoryEntry>, AgentStor
       .to_vec();
     let metadata_str = metadata.value(i);
     let metadata = toml::from_str(metadata_str).unwrap_or_default();
+    let scope = match scopes.value(i) {
+      "shared" => ResourceScope::ClusterShared,
+      _ => ResourceScope::NodeLocal,
+    };
+    let source_node_id = {
+      let value = source_node_ids.value(i);
+      if value.is_empty() {
+        None
+      } else {
+        Some(value.to_string())
+      }
+    };
 
     entries.push(MemoryEntry {
       id: ids.value(i).to_string(),
       content: contents.value(i).to_vec(),
       embedding,
       metadata,
+      scope,
+      source_node_id,
+      updated_at_ms: updated_at_ms.value(i),
+      content_hash: content_hashes.value(i).to_string(),
     });
   }
   Ok(entries)
@@ -430,6 +582,7 @@ impl AgentDomain {
 
 #[cfg(test)]
 mod tests {
+  use lycoris_core::time::now_ms;
   use tempfile::TempDir;
 
   use super::*;
@@ -441,14 +594,22 @@ mod tests {
     (dir, storage.agent())
   }
 
-  fn memory_entry(id: &str, embedding: Vec<f32>) -> MemoryEntry {
+  fn memory_entry(
+    id: &str, embedding: Vec<f32>, scope: ResourceScope, updated_at_ms: i64,
+  ) -> MemoryEntry {
+    let content = id.as_bytes().to_vec();
+    let content_hash = MemoryEntry::compute_content_hash(&content);
     MemoryEntry {
       id: id.to_string(),
-      content: id.as_bytes().to_vec(),
+      content,
       embedding,
       metadata: [("source".to_string(), "test".to_string())]
         .into_iter()
         .collect(),
+      scope,
+      source_node_id: None,
+      updated_at_ms,
+      content_hash,
     }
   }
 
@@ -509,11 +670,21 @@ mod tests {
     far[0] = -1.0;
 
     memory
-      .store(&memory_entry("near", near.clone()))
+      .store(&memory_entry(
+        "near",
+        near.clone(),
+        ResourceScope::NodeLocal,
+        now_ms(),
+      ))
       .await
       .unwrap();
     memory
-      .store(&memory_entry("far", far.clone()))
+      .store(&memory_entry(
+        "far",
+        far.clone(),
+        ResourceScope::NodeLocal,
+        now_ms(),
+      ))
       .await
       .unwrap();
 
@@ -522,5 +693,64 @@ mod tests {
     let results = memory.recall(query, 1).await.unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].id, "near");
+  }
+
+  #[tokio::test]
+  async fn memory_scope_filtering() {
+    let dir = TempDir::new().unwrap();
+    let storage = Storage::open(dir.path().join("agent.redb")).unwrap();
+    let agent = storage.agent();
+    let memory = agent.memory();
+    let dim = DEFAULT_EMBEDDING_DIM;
+
+    memory
+      .store(&memory_entry(
+        "shared",
+        vec![1.0_f32; dim],
+        ResourceScope::ClusterShared,
+        now_ms(),
+      ))
+      .await
+      .unwrap();
+    memory
+      .store(&memory_entry(
+        "local",
+        vec![-1.0_f32; dim],
+        ResourceScope::NodeLocal,
+        now_ms(),
+      ))
+      .await
+      .unwrap();
+
+    let shared = memory.list_shared().await.unwrap();
+    assert_eq!(shared.len(), 1);
+    assert_eq!(shared[0].id, "shared");
+
+    let local = memory.list_local().await.unwrap();
+    assert_eq!(local.len(), 1);
+    assert_eq!(local[0].id, "local");
+  }
+
+  #[tokio::test]
+  async fn memory_get_round_trip() {
+    let dir = TempDir::new().unwrap();
+    let storage = Storage::open(dir.path().join("agent.redb")).unwrap();
+    let agent = storage.agent();
+    let memory = agent.memory();
+    let dim = DEFAULT_EMBEDDING_DIM;
+
+    let entry = memory_entry(
+      "entry-1",
+      vec![0.5_f32; dim],
+      ResourceScope::ClusterShared,
+      42,
+    );
+    memory.store(&entry).await.unwrap();
+
+    let loaded = memory.get("entry-1").await.unwrap().unwrap();
+    assert_eq!(loaded.id, "entry-1");
+    assert_eq!(loaded.scope, ResourceScope::ClusterShared);
+    assert_eq!(loaded.updated_at_ms, 42);
+    assert_eq!(loaded.content_hash, entry.content_hash);
   }
 }
