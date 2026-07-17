@@ -59,3 +59,43 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace --lib --tests --locked
+
+  musl-e2e:
+    name: musl build & e2e (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v6
+
+      - name: install stable rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "23.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: build static musl binary
+        run: cargo build --release --target x86_64-unknown-linux-musl -p lycoris --locked
+
+      - name: smoke-run static binary
+        run: |
+          BIN=target/x86_64-unknown-linux-musl/release/lycoris
+          file "$BIN"
+          "$BIN" --help
+          "$BIN" daemon --help
+          "$BIN" cluster --help
+
+      - name: run docker e2e suite
+        run: ./e2e/run.sh
