@@ -151,7 +151,12 @@ mod tests {
     assert_eq!(loaded.ca_cert, original.ca_cert);
     assert_eq!(
       loaded.cluster_key_path,
-      Some("/var/lib/lycoris/cluster.key".to_string())
+      Some(
+        std::path::Path::new("/var/lib/lycoris")
+          .join("cluster.key")
+          .to_string_lossy()
+          .into_owned()
+      )
     );
   }
 
