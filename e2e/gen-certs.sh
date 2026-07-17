@@ -27,4 +27,5 @@ for node in "${NODES[@]}"; do
 done
 
 rm -f ca.srl
+chmod 600 ca.key node-*.key
 echo "generated certificates in ${CERTS_DIR}"

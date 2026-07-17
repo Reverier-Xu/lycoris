@@ -177,26 +177,26 @@ fi
 echo "ok: all nodes present and current node highlighted"
 
 echo ""
-echo "=== verifying lycoris cluster describe on node-0 ==="
-DESCRIBE_OUTPUT="$(run_in_node 0 lycoris cluster describe node node-1)"
-echo "${DESCRIBE_OUTPUT}"
-if ! echo "${DESCRIBE_OUTPUT}" | grep -q "address:"; then
-  echo "error: describe output missing address field" >&2
+echo "=== verifying lycoris cluster get node on node-0 ==="
+GET_OUTPUT="$(run_in_node 0 lycoris cluster get node node-1)"
+echo "${GET_OUTPUT}"
+if ! echo "${GET_OUTPUT}" | grep -q "address:"; then
+  echo "error: get output missing address field" >&2
   exit 1
 fi
-if ! echo "${DESCRIBE_OUTPUT}" | grep -q "state:"; then
-  echo "error: describe output missing state field" >&2
+if ! echo "${GET_OUTPUT}" | grep -q "state:"; then
+  echo "error: get output missing state field" >&2
   exit 1
 fi
-if ! echo "${DESCRIBE_OUTPUT}" | grep -q "incarnation:"; then
-  echo "error: describe output missing incarnation field" >&2
+if ! echo "${GET_OUTPUT}" | grep -q "incarnation:"; then
+  echo "error: get output missing incarnation field" >&2
   exit 1
 fi
-if ! echo "${DESCRIBE_OUTPUT}" | grep -q "heartbeat:"; then
-  echo "error: describe output missing heartbeat field" >&2
+if ! echo "${GET_OUTPUT}" | grep -q "heartbeat:"; then
+  echo "error: get output missing heartbeat field" >&2
   exit 1
 fi
-echo "ok: describe output looks correct"
+echo "ok: get output looks correct"
 
 echo ""
 echo "=== verifying resource smoke tests on node-0 ==="
