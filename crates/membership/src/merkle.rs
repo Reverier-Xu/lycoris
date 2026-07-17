@@ -8,10 +8,15 @@ const EMPTY_PREFIX: &[u8] = b"E";
 
 /// Depth of the fixed-depth Merkle tree.
 ///
-/// A depth of 16 yields 2^16 leaf buckets. With 32-byte hashes, the flat vector
-/// has 1 + 2 + 4 + ... + 2^16 = 2^(16+1) - 1 usable entries (index 0 unused),
-/// which is small enough to allocate once (~130 KiB) while keeping leaf buckets
-/// sparse for typical cluster sizes.
+/// A depth of 16 yields 2^16 leaf buckets, sparse enough that members of
+/// typical clusters rarely share a bucket. One tree instance holds a flat
+/// node vector of 2^17 32-byte hashes (4 MiB, index 0 unused) plus 2^16
+/// bucket `Vec` headers (~1.5 MiB), so it costs ~5.5 MiB of memory. That is
+/// affordable only because the tree is not rebuilt per query: consumers cache
+/// it keyed by `Membership::version` and rebuild only when a hash-relevant
+/// mutation advanced the version. The build itself hashes only non-empty
+/// subtrees, so its CPU cost scales with the number of members, not with the
+/// fixed 2^17 node count.
 pub const MERKLE_TREE_DEPTH: u8 = 16;
 
 /// Number of bytes used for a Merkle hash. 32 bytes is the blake3 output size.
@@ -32,14 +37,37 @@ pub struct MerkleTree {
 
 impl MerkleTree {
   /// Build a Merkle tree from a membership snapshot.
+  ///
+  /// Fully empty subtrees are never hashed: every level of the flat node
+  /// vector is pre-filled with the canonical empty-subtree hash for that
+  /// depth, and the bottom-up pass skips nodes whose children are both
+  /// empty. The result is byte-for-byte identical to hashing all 2^17 nodes,
+  /// but the work scales with the number of members instead of the tree size.
   pub fn from_membership(membership: &Membership) -> Self {
     let leaf_count = 1usize << MERKLE_TREE_DEPTH;
     let total_nodes = 1usize << (MERKLE_TREE_DEPTH + 1);
 
-    let empty = hash_empty();
-    let mut nodes = vec![empty; total_nodes];
-    let mut buckets: Vec<Vec<(String, Hash)>> = (0..leaf_count).map(|_| Vec::new()).collect();
+    // Canonical hash of a fully empty subtree per depth, from the root
+    // (`empty_hashes[0]`) down to an empty leaf (`empty_hashes[DEPTH]`).
+    let mut empty_hashes = Vec::with_capacity((MERKLE_TREE_DEPTH + 1) as usize);
+    let mut current = hash_empty();
+    empty_hashes.push(current);
+    for _ in 0..MERKLE_TREE_DEPTH {
+      current = hash_inner(current, current);
+      empty_hashes.push(current);
+    }
+    empty_hashes.reverse();
 
+    // Pre-fill every level with its empty-subtree hash (the leaf level keeps
+    // `hash_empty()`; index 0 is unused). Subtrees never touched below are
+    // empty and therefore already hold the correct hash.
+    let mut nodes = vec![hash_empty(); total_nodes];
+    for depth in 0..MERKLE_TREE_DEPTH {
+      let start = 1usize << depth;
+      nodes[start..(start << 1)].fill(empty_hashes[depth as usize]);
+    }
+
+    let mut buckets: Vec<Vec<(String, Hash)>> = (0..leaf_count).map(|_| Vec::new()).collect();
     for register in membership.all() {
       let idx = leaf_index(register.node_id());
       let register_hash = hash_register(register);
@@ -47,27 +75,25 @@ impl MerkleTree {
     }
 
     for (i, bucket) in buckets.iter_mut().enumerate() {
+      if bucket.is_empty() {
+        continue;
+      }
       bucket.sort_by(|a, b| a.0.cmp(&b.0));
-      let leaf_hash = hash_leaf_bucket(bucket);
-      nodes[flat_index(MERKLE_TREE_DEPTH, i as u64)] = leaf_hash;
+      nodes[flat_index(MERKLE_TREE_DEPTH, i as u64)] = hash_leaf_bucket(bucket);
     }
 
     for depth in (0..MERKLE_TREE_DEPTH).rev() {
+      let empty_child = empty_hashes[(depth + 1) as usize];
       let width = 1usize << depth;
       for i in 0..width {
         let left = nodes[flat_index(depth + 1, 2 * i as u64)];
         let right = nodes[flat_index(depth + 1, (2 * i + 1) as u64)];
+        if left == empty_child && right == empty_child {
+          continue;
+        }
         nodes[flat_index(depth, i as u64)] = hash_inner(left, right);
       }
     }
-
-    let mut empty_hashes = Vec::with_capacity((MERKLE_TREE_DEPTH + 1) as usize);
-    empty_hashes.push(empty);
-    for _ in 0..MERKLE_TREE_DEPTH {
-      let child = *empty_hashes.last().unwrap_or(&empty);
-      empty_hashes.push(hash_inner(child, child));
-    }
-    empty_hashes.reverse();
 
     Self {
       nodes,
@@ -79,15 +105,6 @@ impl MerkleTree {
   /// Return the hash of an empty subtree at the given depth.
   pub fn empty_subtree_hash(&self, depth: u8) -> Option<Hash> {
     self.empty_hashes.get(depth as usize).copied()
-  }
-
-  /// Return true if the subtree rooted at `(depth, index)` contains no
-  /// registers.
-  pub fn is_empty_subtree(&self, depth: u8, index: u64) -> bool {
-    self
-      .node_hash(depth, index)
-      .and_then(|hash| self.empty_subtree_hash(depth).map(|empty| hash == empty))
-      .unwrap_or(true)
   }
 
   /// Return the root hash.
@@ -173,8 +190,12 @@ pub fn leaf_index(node_id: &str) -> u64 {
 ///
 /// Labels and annotations are sorted by key to ensure that equivalent registers
 /// always hash to the same value regardless of HashMap iteration order.
-/// Volatile fields such as `updated_at_ms` are intentionally excluded so that
-/// heartbeats do not rewrite the whole Merkle tree on every tick.
+/// Volatile fields are intentionally excluded so that background churn does not
+/// rewrite the whole Merkle tree and trigger pointless anti-entropy exchanges:
+/// `updated_at_ms` is wall-clock time, and `heartbeat` is only the final
+/// tiebreak of the merge order (D3) — state transitions that matter
+/// (`incarnation`, `state`, `address`, labels, annotations) still change the
+/// hash, and a stale heartbeat rides along with the next real change.
 pub fn hash_register(register: &MemberRegister) -> Hash {
   let mut hasher = Hasher::new();
   hasher.update(LEAF_PREFIX);
@@ -184,7 +205,6 @@ pub fn hash_register(register: &MemberRegister) -> Hash {
   hasher.update(b"\0");
   hasher.update(&[register.state().as_u8()]);
   hasher.update(&register.incarnation().to_be_bytes());
-  hasher.update(&register.heartbeat().to_be_bytes());
 
   let mut labels: Vec<(&String, &String)> = register.labels().iter().collect();
   labels.sort_by(|a, b| a.0.cmp(b.0));
@@ -247,10 +267,13 @@ mod tests {
   use super::*;
   use crate::register::MemberState;
 
-  fn register(id: &str, heartbeat: u64) -> MemberRegister {
-    MemberRegister::new(id, "127.0.0.1:1", 1, heartbeat)
+  /// Build a register whose Merkle hash differs per `incarnation`. Heartbeat
+  /// is fixed at 0 because it is excluded from the hash (D3) and would not
+  /// distinguish test registers anyway.
+  fn register(id: &str, incarnation: u64) -> MemberRegister {
+    MemberRegister::new(id, "127.0.0.1:1", incarnation, 0)
       .with_state(MemberState::Active)
-      .with_updated_at_ms(i64::try_from(heartbeat).unwrap_or(i64::MAX))
+      .with_updated_at_ms(0)
   }
 
   #[test]
@@ -287,6 +310,37 @@ mod tests {
   }
 
   #[test]
+  fn heartbeat_bump_does_not_change_root() {
+    let mut m = Membership::new();
+    m.merge_register(&register("a", 1));
+    let root_before = MerkleTree::from_membership(&m).root_hash();
+
+    // A pure heartbeat bump must not perturb the tree (D3).
+    assert!(m.heartbeat("a", 1_000));
+    assert_eq!(MerkleTree::from_membership(&m).root_hash(), root_before);
+  }
+
+  #[test]
+  fn state_change_changes_root() {
+    let mut m = Membership::new();
+    m.merge_register(&register("a", 1));
+    let root_before = MerkleTree::from_membership(&m).root_hash();
+
+    assert!(m.suspect("a", 1_000).is_some());
+    assert_ne!(MerkleTree::from_membership(&m).root_hash(), root_before);
+  }
+
+  #[test]
+  fn incarnation_change_changes_root() {
+    let mut m = Membership::new();
+    m.merge_register(&register("a", 1));
+    let root_before = MerkleTree::from_membership(&m).root_hash();
+
+    assert!(m.refute("a", 1_000));
+    assert_ne!(MerkleTree::from_membership(&m).root_hash(), root_before);
+  }
+
+  #[test]
   fn node_hash_matches_at_every_level() {
     let mut m = Membership::new();
     m.merge_register(&register("a", 1));
@@ -306,85 +360,6 @@ mod tests {
     let left = tree.node_hash(1, 0).unwrap();
     let right = tree.node_hash(1, 1).unwrap();
     assert_eq!(tree.root_hash(), hash_inner(left, right));
-  }
-
-  #[test]
-  fn diff_empty_vs_populated() {
-    let mut m = Membership::new();
-    m.merge_register(&register("a", 1));
-
-    let empty = MerkleTree::from_membership(&Membership::new());
-    let populated = MerkleTree::from_membership(&m);
-
-    let diff = merkle_diff(&empty, &populated);
-    assert_eq!(diff.need_from_remote, vec!["a".to_string()]);
-    assert!(diff.need_from_local.is_empty());
-  }
-
-  #[test]
-  fn diff_single_changed_node() {
-    let mut m1 = Membership::new();
-    m1.merge_register(&register("a", 1));
-    m1.merge_register(&register("b", 1));
-    m1.merge_register(&register("c", 1));
-
-    let mut m2 = m1.clone();
-    m2.merge_register(&register("b", 2));
-
-    let diff = merkle_diff(
-      &MerkleTree::from_membership(&m1),
-      &MerkleTree::from_membership(&m2),
-    );
-    assert_eq!(diff.need_from_remote, vec!["b".to_string()]);
-    assert_eq!(diff.need_from_local, vec!["b".to_string()]);
-  }
-
-  #[test]
-  fn diff_single_added_node() {
-    let mut m1 = Membership::new();
-    m1.merge_register(&register("a", 1));
-
-    let mut m2 = Membership::new();
-    m2.merge_register(&register("a", 1));
-    m2.merge_register(&register("b", 1));
-
-    let diff = merkle_diff(
-      &MerkleTree::from_membership(&m1),
-      &MerkleTree::from_membership(&m2),
-    );
-    assert_eq!(diff.need_from_remote, vec!["b".to_string()]);
-    assert!(diff.need_from_local.is_empty());
-  }
-
-  #[test]
-  fn diff_symmetric() {
-    let mut m1 = Membership::new();
-    m1.merge_register(&register("a", 1));
-    m1.merge_register(&register("b", 1));
-
-    let mut m2 = Membership::new();
-    m2.merge_register(&register("b", 2));
-    m2.merge_register(&register("c", 1));
-
-    let diff_ab = merkle_diff(
-      &MerkleTree::from_membership(&m1),
-      &MerkleTree::from_membership(&m2),
-    );
-    let diff_ba = merkle_diff(
-      &MerkleTree::from_membership(&m2),
-      &MerkleTree::from_membership(&m1),
-    );
-
-    assert_eq!(diff_ab.need_from_remote, diff_ba.need_from_local);
-    assert_eq!(diff_ab.need_from_local, diff_ba.need_from_remote);
-
-    let mut expected_remote: Vec<String> = vec!["b".to_string(), "c".to_string()];
-    expected_remote.sort();
-    assert_eq!(diff_ab.need_from_remote, expected_remote);
-
-    let mut expected_local: Vec<String> = vec!["a".to_string(), "b".to_string()];
-    expected_local.sort();
-    assert_eq!(diff_ab.need_from_local, expected_local);
   }
 
   #[test]
@@ -408,108 +383,5 @@ mod tests {
       MerkleTree::from_membership(&m1).root_hash(),
       MerkleTree::from_membership(&m2).root_hash()
     );
-  }
-
-  #[derive(Debug, PartialEq, Eq)]
-  struct DiffResult {
-    need_from_remote: Vec<String>,
-    need_from_local: Vec<String>,
-  }
-
-  fn merkle_diff(local: &MerkleTree, remote: &MerkleTree) -> DiffResult {
-    let mut need_from_remote = Vec::new();
-    let mut need_from_local = Vec::new();
-    let mut queue = vec![(0u8, 0u64)];
-
-    while !queue.is_empty() {
-      let mut next_queue = Vec::new();
-      for (depth, index) in queue {
-        let local_hash = local.node_hash(depth, index).unwrap_or_else(hash_empty);
-        let remote_hash = remote.node_hash(depth, index).unwrap_or_else(hash_empty);
-        if local_hash == remote_hash {
-          continue;
-        }
-
-        if depth == MERKLE_TREE_DEPTH {
-          let local_entries = local.leaf_entries(index).unwrap_or_default();
-          let remote_entries = remote.leaf_entries(index).unwrap_or_default();
-          diff_leaf_bucket(
-            local_entries,
-            remote_entries,
-            &mut need_from_remote,
-            &mut need_from_local,
-          );
-        } else {
-          let left_local = local
-            .node_hash(depth + 1, 2 * index)
-            .unwrap_or_else(hash_empty);
-          let left_remote = remote
-            .node_hash(depth + 1, 2 * index)
-            .unwrap_or_else(hash_empty);
-          if left_local != left_remote {
-            next_queue.push((depth + 1, 2 * index));
-          }
-
-          let right_local = local
-            .node_hash(depth + 1, 2 * index + 1)
-            .unwrap_or_else(hash_empty);
-          let right_remote = remote
-            .node_hash(depth + 1, 2 * index + 1)
-            .unwrap_or_else(hash_empty);
-          if right_local != right_remote {
-            next_queue.push((depth + 1, 2 * index + 1));
-          }
-        }
-      }
-      queue = next_queue;
-    }
-
-    need_from_remote.sort();
-    need_from_remote.dedup();
-    need_from_local.sort();
-    need_from_local.dedup();
-
-    DiffResult {
-      need_from_remote,
-      need_from_local,
-    }
-  }
-
-  fn diff_leaf_bucket(
-    local: &[(String, Hash)], remote: &[(String, Hash)], need_from_remote: &mut Vec<String>,
-    need_from_local: &mut Vec<String>,
-  ) {
-    let mut i = 0usize;
-    let mut j = 0usize;
-
-    while i < local.len() && j < remote.len() {
-      match local[i].0.cmp(&remote[j].0) {
-        std::cmp::Ordering::Less => {
-          need_from_local.push(local[i].0.clone());
-          i += 1;
-        }
-        std::cmp::Ordering::Greater => {
-          need_from_remote.push(remote[j].0.clone());
-          j += 1;
-        }
-        std::cmp::Ordering::Equal => {
-          if local[i].1 != remote[j].1 {
-            need_from_remote.push(local[i].0.clone());
-            need_from_local.push(local[i].0.clone());
-          }
-          i += 1;
-          j += 1;
-        }
-      }
-    }
-
-    while i < local.len() {
-      need_from_local.push(local[i].0.clone());
-      i += 1;
-    }
-    while j < remote.len() {
-      need_from_remote.push(remote[j].0.clone());
-      j += 1;
-    }
   }
 }

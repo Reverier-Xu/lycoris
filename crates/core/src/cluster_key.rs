@@ -6,7 +6,7 @@ use std::{
 
 use thiserror::Error;
 
-use crate::paths::default_data_dir;
+use crate::paths::{cluster_key_path_in, default_data_dir};
 
 const KEY_LENGTH: usize = 32;
 
@@ -100,7 +100,7 @@ pub enum ClusterKeyError {
 
 /// Return the default path to the cluster key file.
 pub fn default_cluster_key_path() -> std::path::PathBuf {
-  default_data_dir().join("cluster.key")
+  cluster_key_path_in(&default_data_dir())
 }
 
 #[cfg(test)]

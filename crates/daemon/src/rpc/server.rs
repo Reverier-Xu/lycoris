@@ -1,10 +1,9 @@
 #![allow(clippy::result_large_err)]
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use lycoris_proto::node::{
-  DescribeResourceRequest, GetOutDegreeRequest, GetOutDegreeResponse, GetResourceRequest,
-  JoinRequest, JoinResponse, LeaveRequest, LeaveResponse, ListResourcesRequest,
+  GetResourceRequest, JoinRequest, JoinResponse, LeaveRequest, LeaveResponse, ListResourcesRequest,
   ListResourcesResponse, NodeInfo as ProtoNodeInfo, RegisterRequest, RegisterResponse, Resource,
   SetPrimaryEndpointRequest, SetPrimaryEndpointResponse, cluster_server::Cluster,
 };
@@ -13,7 +12,9 @@ use tokio::sync::watch;
 use tonic::{Request, Response, Status};
 
 use crate::{
-  cluster_sync::ClusterSync, membership::MembershipService, rpc::resource::ResourceMapper,
+  membership::{MembershipService, convert::proto_to_register},
+  resource::ResourceMapper,
+  sync::ClusterSync,
 };
 
 #[derive(Debug, Clone)]
@@ -50,21 +51,25 @@ impl ClusterService {
     self.service.local_node_id()
   }
 
-  /// Return the node id and address of this node's primary peer, if any.
-  fn local_out_degree(&self, nodes: &[ProtoNodeInfo]) -> Result<Option<(String, String)>, Status> {
-    let primary = self
-      .storage
-      .node()
-      .peers()
-      .get_primary()
-      .map_err(|error| Status::internal(format!("failed to read primary peer: {error}")))?;
+  /// Shared admission path for `register` and `join`: validate the payload,
+  /// merge the register into membership, then dispatch and gossip the
+  /// resulting actions. An empty node id is an application-level rejection
+  /// (`Ok(Err(reason))`); a missing payload is a protocol error.
+  async fn admit(
+    &self, info: Option<ProtoNodeInfo>,
+  ) -> Result<Result<ProtoNodeInfo, String>, Status> {
+    let info = info.ok_or_else(|| Status::invalid_argument("missing node info"))?;
+    if info.id.is_empty() {
+      return Ok(Err("node id must not be empty".to_string()));
+    }
 
-    Ok(primary.and_then(|address| {
-      nodes
-        .iter()
-        .find(|node| node.address == address)
-        .map(|node| (node.id.clone(), node.address.clone()))
-    }))
+    let actions = self.service.register(proto_to_register(&info)).await;
+    if let Some(cluster_sync) = &self.cluster_sync {
+      cluster_sync.dispatch(actions).await;
+      cluster_sync.push_change(info.clone()).await;
+    }
+
+    Ok(Ok(info))
   }
 }
 
@@ -74,43 +79,16 @@ impl Cluster for ClusterService {
   async fn register(
     &self, request: Request<RegisterRequest>,
   ) -> Result<Response<RegisterResponse>, Status> {
-    let request = request.into_inner();
-    let info = request
-      .info
-      .ok_or_else(|| Status::invalid_argument("missing node info"))?;
-
-    if info.id.is_empty() {
-      return Ok(Response::new(RegisterResponse {
+    match self.admit(request.into_inner().info).await? {
+      Ok(_) => Ok(Response::new(RegisterResponse {
+        accepted: true,
+        reason: String::new(),
+      })),
+      Err(reason) => Ok(Response::new(RegisterResponse {
         accepted: false,
-        reason: "node id must not be empty".to_string(),
-      }));
+        reason,
+      })),
     }
-
-    let actions = self.service.register(&info).await;
-    if let Some(cluster_sync) = &self.cluster_sync {
-      cluster_sync.dispatch(actions).await;
-      cluster_sync.push_change(info.clone()).await;
-    }
-
-    Ok(Response::new(RegisterResponse {
-      accepted: true,
-      reason: String::new(),
-    }))
-  }
-
-  async fn get_out_degree(
-    &self, _request: Request<GetOutDegreeRequest>,
-  ) -> Result<Response<GetOutDegreeResponse>, Status> {
-    let nodes = self.service.list_nodes(&HashMap::new()).await;
-    let target = self.local_out_degree(&nodes)?;
-
-    Ok(Response::new(GetOutDegreeResponse {
-      node_id: target
-        .as_ref()
-        .map(|(id, _)| id.clone())
-        .unwrap_or_default(),
-      address: target.map(|(_, address)| address).unwrap_or_default(),
-    }))
   }
 
   async fn set_primary_endpoint(
@@ -124,49 +102,51 @@ impl Cluster for ClusterService {
       }));
     }
 
+    // The self-primary rule is enforced by the storage node domain (D8); the
+    // rpc layer only translates the domain error into the response reason.
     let local_address = self
       .service
       .member_address(self.local_node_id())
       .await
       .unwrap_or_default();
-    if address == local_address {
-      return Ok(Response::new(SetPrimaryEndpointResponse {
-        accepted: false,
-        reason: "cannot set the local node's own address as primary".to_string(),
-      }));
-    }
-
-    self
+    match self
       .storage
       .node()
       .peers()
-      .set_primary(&address)
-      .map_err(|error| Status::internal(format!("failed to set primary endpoint: {error}")))?;
-
-    Ok(Response::new(SetPrimaryEndpointResponse {
-      accepted: true,
-      reason: String::new(),
-    }))
+      .set_primary(&address, &local_address)
+    {
+      Ok(()) => Ok(Response::new(SetPrimaryEndpointResponse {
+        accepted: true,
+        reason: String::new(),
+      })),
+      Err(error @ lycoris_storage::StorageError::SelfPrimary) => {
+        Ok(Response::new(SetPrimaryEndpointResponse {
+          accepted: false,
+          reason: error.to_string(),
+        }))
+      }
+      Err(error) => Err(crate::rpc::storage_status(
+        "failed to set primary endpoint",
+        error,
+      )),
+    }
   }
 
   async fn join(&self, request: Request<JoinRequest>) -> Result<Response<JoinResponse>, Status> {
-    let join = request.into_inner();
-    let info = join
-      .info
-      .ok_or_else(|| Status::invalid_argument("missing node info"))?;
+    let info = match self.admit(request.into_inner().info).await? {
+      Ok(info) => info,
+      Err(reason) => {
+        return Ok(Response::new(JoinResponse {
+          accepted: false,
+          reason,
+        }));
+      }
+    };
 
-    if info.id.is_empty() {
-      return Ok(Response::new(JoinResponse {
-        accepted: false,
-        reason: "node id must not be empty".to_string(),
-      }));
-    }
-
-    let _ = self.storage.node().peers().seed(&info.address);
-    let actions = self.service.register(&info).await;
-    if let Some(cluster_sync) = &self.cluster_sync {
-      cluster_sync.dispatch(actions).await;
-      cluster_sync.push_change(info.clone()).await;
+    // Seeding is bookkeeping for future outbound sync; a failure must not
+    // reject a join that membership already accepted, but it is never silent.
+    if let Err(error) = self.storage.node().peers().seed(&info.address) {
+      tracing::warn!(%error, address = %info.address, "failed to seed joined peer");
     }
 
     Ok(Response::new(JoinResponse {
@@ -201,7 +181,7 @@ impl Cluster for ClusterService {
   ) -> Result<Response<ListResourcesResponse>, Status> {
     let request = request.into_inner();
     let kind = crate::rpc::resource::parse_kind(request.kind)?;
-    let scope = crate::rpc::resource::parse_scope(&request.scope)?;
+    let scope = crate::rpc::resource::parse_scope_filter(request.scope)?;
     let resources = self.mapper.list(kind, request.selector, scope).await?;
     Ok(Response::new(ListResourcesResponse { resources }))
   }
@@ -213,17 +193,5 @@ impl Cluster for ClusterService {
     let kind = crate::rpc::resource::parse_kind(request.kind)?;
     let resource = self.mapper.get(kind, &request.id).await?;
     Ok(Response::new(resource))
-  }
-
-  async fn describe_resource(
-    &self, request: Request<DescribeResourceRequest>,
-  ) -> Result<Response<Resource>, Status> {
-    let inner = request.into_inner();
-    self
-      .get_resource(Request::new(GetResourceRequest {
-        kind: inner.kind,
-        id: inner.id,
-      }))
-      .await
   }
 }

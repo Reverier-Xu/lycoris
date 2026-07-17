@@ -1,14 +1,15 @@
 use std::sync::Arc;
 
 use lycoris_core::ClusterKey;
+use lycoris_proto::CLUSTER_KEY_HEADER;
 use tonic::{Request, Status};
-
-const CLUSTER_KEY_HEADER: &str = "x-lycoris-cluster-key";
 
 /// Build a tonic interceptor that validates the `x-lycoris-cluster-key` header.
 ///
 /// The interceptor rejects requests when:
-/// - this node has not initialized a cluster key, or
+/// - this node has not initialized a cluster key (`failed_precondition`: the
+///   server-side precondition is unmet, unlike the caller-side auth failures
+///   below), or
 /// - the caller did not supply a cluster key, or
 /// - the supplied key is malformed, or
 /// - the supplied key does not match the expected key.
@@ -28,7 +29,7 @@ pub fn cluster_key_interceptor(
       (Some(_), Some(Ok(_))) => Err(Status::permission_denied("cluster key mismatch")),
       (Some(_), Some(Err(_))) => Err(Status::permission_denied("invalid cluster key format")),
       (Some(_), None) => Err(Status::unauthenticated("missing cluster key")),
-      (None, _) => Err(Status::permission_denied(
+      (None, _) => Err(Status::failed_precondition(
         "this node has not initialized a cluster key; run 'lycoris cluster init' first",
       )),
     }

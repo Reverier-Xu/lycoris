@@ -9,10 +9,7 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-pub use lycoris_core::ResourceScope;
 use redb::Database;
-
-use crate::StorageError;
 
 pub mod rule;
 pub mod skill;
@@ -23,8 +20,31 @@ pub mod versioned;
 pub use rule::{RedbRuleStorage, RuleContentStore, RuleRecord, RuleStorage};
 pub use skill::{RedbSkillStorage, SkillContentStore, SkillRecord, SkillStorage};
 pub use store::{RedbWorkspaceStorage, WorkspaceMetadataStorage, WorkspaceRecord};
-pub use vcs::{VersionedContentStore, WorkspaceStorageError};
+pub use vcs::VersionedContentStore;
 pub use versioned::VersionedResource;
+
+/// Errors that can occur in workspace storage backends.
+#[derive(Debug, thiserror::Error)]
+pub enum WorkspaceStorageError {
+  #[error("storage error: {0}")]
+  Storage(#[from] crate::StorageError),
+  #[error("content hash mismatch")]
+  HashMismatch(#[from] crate::versioned::ContentHashMismatch),
+  #[error("git command failed: {0}")]
+  GitCommandFailed(String),
+}
+
+impl From<std::io::Error> for WorkspaceStorageError {
+  fn from(error: std::io::Error) -> Self {
+    Self::Storage(crate::StorageError::Io(error))
+  }
+}
+
+impl From<std::string::FromUtf8Error> for WorkspaceStorageError {
+  fn from(error: std::string::FromUtf8Error) -> Self {
+    Self::GitCommandFailed(format!("invalid utf-8 in git output: {error}"))
+  }
+}
 
 /// Workspace storage facade.
 ///
@@ -40,16 +60,14 @@ pub struct WorkspaceDomain {
 }
 
 impl WorkspaceDomain {
-  pub(crate) fn new(db: Arc<Database>, data_dir: PathBuf) -> Result<Self, StorageError> {
-    std::fs::create_dir_all(&data_dir)?;
-
-    Ok(Self {
-      workspaces: Arc::new(RedbWorkspaceStorage::new(db.clone())),
-      skills: Arc::new(skill::new_skill_storage(db.clone())),
-      rules: Arc::new(rule::new_rule_storage(db)),
+  pub(crate) fn new(db: Arc<Database>, data_dir: PathBuf) -> Self {
+    Self {
+      workspaces: Arc::new(RedbWorkspaceStorage::new(db.clone(), store::WORKSPACES)),
+      skills: Arc::new(RedbSkillStorage::new(db.clone(), skill::SKILLS)),
+      rules: Arc::new(RedbRuleStorage::new(db, rule::RULES)),
       skill_content: SkillContentStore::new(data_dir.join("skills")),
       rule_content: RuleContentStore::new(data_dir.join("rules")),
-    })
+    }
   }
 
   /// Access workspace metadata storage.
@@ -80,88 +98,30 @@ impl WorkspaceDomain {
   /// Apply a remote skill if it wins the version/scope conflict check.
   ///
   /// Returns `true` when the skill was stored, `false` when it was skipped.
-  pub async fn apply_remote_skill(
+  pub fn apply_remote_skill(
     &self, record: VersionedResource, content: &str,
   ) -> Result<bool, WorkspaceStorageError> {
-    if content.is_empty() {
-      return Ok(false);
-    }
-    let actual_hash = blake3::hash(content.as_bytes()).to_hex().to_string();
-    if actual_hash != record.content_hash {
-      return Err(crate::StorageError::Workspace("content hash mismatch".to_string()).into());
-    }
-    let local = self.skills().get(&record.id)?;
-    if !crate::versioned::should_apply_versioned(
-      local
-        .as_ref()
-        .map(|local| local as &dyn crate::versioned::VersionedRecord),
-      &record,
-    ) {
-      return Ok(false);
-    }
-    self.skills().upsert(&record)?;
-    if local
-      .as_ref()
-      .is_none_or(|local| local.content_hash != record.content_hash)
-    {
-      self
-        .skill_content()
-        .write(&record.id, content, &record.content_hash)?;
-    }
-    Ok(true)
+    apply_remote_resource(&record, content, self.skills(), self.skill_content())
   }
 
   /// Apply a remote rule if it wins the version/scope conflict check.
   ///
   /// Returns `true` when the rule was stored, `false` when it was skipped.
-  pub async fn apply_remote_rule(
+  pub fn apply_remote_rule(
     &self, record: VersionedResource, content: &str,
   ) -> Result<bool, WorkspaceStorageError> {
-    if content.is_empty() {
-      return Ok(false);
-    }
-    let actual_hash = blake3::hash(content.as_bytes()).to_hex().to_string();
-    if actual_hash != record.content_hash {
-      return Err(crate::StorageError::Workspace("content hash mismatch".to_string()).into());
-    }
-    let local = self.rules().get(&record.id)?;
-    if !crate::versioned::should_apply_versioned(
-      local
-        .as_ref()
-        .map(|local| local as &dyn crate::versioned::VersionedRecord),
-      &record,
-    ) {
-      return Ok(false);
-    }
-    self.rules().upsert(&record)?;
-    if local
-      .as_ref()
-      .is_none_or(|local| local.content_hash != record.content_hash)
-    {
-      self
-        .rule_content()
-        .write(&record.id, content, &record.content_hash)?;
-    }
-    Ok(true)
+    apply_remote_resource(&record, content, self.rules(), self.rule_content())
   }
 
   /// Apply a remote workspace if it wins the version/scope conflict check.
   ///
   /// Returns `true` when the workspace was stored, `false` when it was skipped.
-  pub async fn apply_remote_workspace(
+  pub fn apply_remote_workspace(
     &self, record: WorkspaceRecord,
   ) -> Result<bool, WorkspaceStorageError> {
-    let computed_hash = record.compute_content_hash()?;
-    if computed_hash != record.content_hash {
-      return Err(crate::StorageError::Workspace("content hash mismatch".to_string()).into());
-    }
+    crate::versioned::verify_content_hash(&record.compute_content_hash()?, &record.content_hash)?;
     let local = self.workspaces().get(&record.id)?;
-    if !crate::versioned::should_apply_versioned(
-      local
-        .as_ref()
-        .map(|local| local as &dyn crate::versioned::VersionedRecord),
-      &record,
-    ) {
+    if !crate::versioned::should_apply_versioned(local.as_ref(), &record) {
       return Ok(false);
     }
     self.workspaces().upsert(&record)?;
@@ -169,9 +129,38 @@ impl WorkspaceDomain {
   }
 }
 
+/// Shared apply pipeline for content-backed versioned resources (skills and
+/// rules): verify content integrity, win the version/scope conflict check,
+/// then persist the metadata record and rewrite the content only when it
+/// actually changed.
+fn apply_remote_resource(
+  record: &VersionedResource, content: &str, storage: &dyn versioned::VersionedStorage,
+  content_store: &dyn VersionedContentStore,
+) -> Result<bool, WorkspaceStorageError> {
+  if content.is_empty() {
+    return Ok(false);
+  }
+  crate::versioned::verify_content_hash(
+    &crate::hash_content(content.as_bytes()),
+    &record.content_hash,
+  )?;
+  let local = storage.get(&record.id)?;
+  if !crate::versioned::should_apply_versioned(local.as_ref(), record) {
+    return Ok(false);
+  }
+  storage.upsert(record)?;
+  if local
+    .as_ref()
+    .is_none_or(|local| local.content_hash != record.content_hash)
+  {
+    content_store.write(&record.id, content, &record.content_hash)?;
+  }
+  Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
-  use lycoris_core::now_ms;
+  use lycoris_core::{ResourceScope, now_ms};
   use tempfile::TempDir;
 
   use super::*;
@@ -355,25 +344,25 @@ mod tests {
 
   fn shared_skill(id: &str, content: &str, version: u64) -> VersionedResource {
     let mut record = skill_record(id, ResourceScope::ClusterShared);
-    record.content_hash = blake3::hash(content.as_bytes()).to_hex().to_string();
+    record.content_hash = crate::hash_content(content.as_bytes());
     record.version = version;
     record
   }
 
   fn shared_rule(id: &str, content: &str, version: u64) -> VersionedResource {
     let mut record = rule_record(id, ResourceScope::ClusterShared);
-    record.content_hash = blake3::hash(content.as_bytes()).to_hex().to_string();
+    record.content_hash = crate::hash_content(content.as_bytes());
     record.version = version;
     record
   }
 
-  #[tokio::test]
-  async fn apply_remote_skill_stores_new_skill_and_content() {
+  #[test]
+  fn apply_remote_skill_stores_new_skill_and_content() {
     let (_dir, domain) = test_domain();
     let content = "name = 'remote-skill'";
     let record = shared_skill("remote-skill", content, 1);
 
-    let applied = domain.apply_remote_skill(record, content).await.unwrap();
+    let applied = domain.apply_remote_skill(record, content).unwrap();
     assert!(applied);
 
     let loaded = domain.skills().get("remote-skill").unwrap().unwrap();
@@ -388,8 +377,8 @@ mod tests {
     );
   }
 
-  #[tokio::test]
-  async fn apply_remote_skill_skips_older_version() {
+  #[test]
+  fn apply_remote_skill_skips_older_version() {
     let (_dir, domain) = test_domain();
     let local_content = "local skill";
     let local_record = shared_skill("skill-conflict", local_content, 2);
@@ -404,7 +393,6 @@ mod tests {
 
     let applied = domain
       .apply_remote_skill(remote_record, remote_content)
-      .await
       .unwrap();
     assert!(!applied);
 
@@ -416,8 +404,8 @@ mod tests {
     assert_eq!(loaded, local_content);
   }
 
-  #[tokio::test]
-  async fn apply_remote_skill_does_not_rewrite_unchanged_content() {
+  #[test]
+  fn apply_remote_skill_does_not_rewrite_unchanged_content() {
     let (_dir, domain) = test_domain();
     let content = "stable skill";
     let local = shared_skill("skill-stable", content, 1);
@@ -430,7 +418,7 @@ mod tests {
     let mut remote = shared_skill("skill-stable", content, 2);
     remote.updated_at_ms = local.updated_at_ms + 1;
 
-    let applied = domain.apply_remote_skill(remote, content).await.unwrap();
+    let applied = domain.apply_remote_skill(remote, content).unwrap();
     assert!(applied);
     assert_eq!(
       domain
@@ -444,36 +432,33 @@ mod tests {
     assert_eq!(loaded.version, 2);
   }
 
-  #[tokio::test]
-  async fn apply_remote_skill_rejects_hash_mismatch() {
+  #[test]
+  fn apply_remote_skill_rejects_hash_mismatch() {
     let (_dir, domain) = test_domain();
     let content = "real skill";
     let mut record = shared_skill("skill-hash", content, 1);
     record.content_hash = "wrong-hash".to_string();
 
-    let error = domain
-      .apply_remote_skill(record, content)
-      .await
-      .unwrap_err();
+    let error = domain.apply_remote_skill(record, content).unwrap_err();
     assert!(error.to_string().contains("content hash mismatch"));
   }
 
-  #[tokio::test]
-  async fn apply_remote_skill_rejects_empty_content() {
+  #[test]
+  fn apply_remote_skill_rejects_empty_content() {
     let (_dir, domain) = test_domain();
     let record = shared_skill("skill-empty", "", 1);
 
-    let applied = domain.apply_remote_skill(record, "").await.unwrap();
+    let applied = domain.apply_remote_skill(record, "").unwrap();
     assert!(!applied);
   }
 
-  #[tokio::test]
-  async fn apply_remote_rule_stores_new_rule_and_content() {
+  #[test]
+  fn apply_remote_rule_stores_new_rule_and_content() {
     let (_dir, domain) = test_domain();
     let content = "match = 'remote-rule'";
     let record = shared_rule("remote-rule", content, 1);
 
-    let applied = domain.apply_remote_rule(record, content).await.unwrap();
+    let applied = domain.apply_remote_rule(record, content).unwrap();
     assert!(applied);
 
     let loaded = domain.rules().get("remote-rule").unwrap().unwrap();
@@ -484,33 +469,33 @@ mod tests {
     );
   }
 
-  #[tokio::test]
-  async fn apply_remote_rule_skips_local_scope() {
+  #[test]
+  fn apply_remote_rule_skips_local_scope() {
     let (_dir, domain) = test_domain();
     let content = "local rule";
     let mut record = rule_record("rule-local", ResourceScope::NodeLocal);
-    record.content_hash = blake3::hash(content.as_bytes()).to_hex().to_string();
+    record.content_hash = crate::hash_content(content.as_bytes());
     record.version = 1;
 
-    let applied = domain.apply_remote_rule(record, content).await.unwrap();
+    let applied = domain.apply_remote_rule(record, content).unwrap();
     assert!(!applied);
   }
 
-  #[tokio::test]
-  async fn apply_remote_workspace_stores_new_shared_workspace() {
+  #[test]
+  fn apply_remote_workspace_stores_new_shared_workspace() {
     let (_dir, domain) = test_domain();
     let mut record = workspace_record("remote-ws", ResourceScope::ClusterShared);
     record.content_hash = record.compute_content_hash().unwrap();
 
-    let applied = domain.apply_remote_workspace(record.clone()).await.unwrap();
+    let applied = domain.apply_remote_workspace(record.clone()).unwrap();
     assert!(applied);
 
     let loaded = domain.workspaces().get("remote-ws").unwrap().unwrap();
     assert_eq!(loaded.version, record.version);
   }
 
-  #[tokio::test]
-  async fn apply_remote_workspace_skips_older_version() {
+  #[test]
+  fn apply_remote_workspace_skips_older_version() {
     let (_dir, domain) = test_domain();
     let mut local = workspace_record("ws-conflict", ResourceScope::ClusterShared);
     local.version = 2;
@@ -521,20 +506,20 @@ mod tests {
     remote.version = 1;
     remote.content_hash = remote.compute_content_hash().unwrap();
 
-    let applied = domain.apply_remote_workspace(remote).await.unwrap();
+    let applied = domain.apply_remote_workspace(remote).unwrap();
     assert!(!applied);
 
     let loaded = domain.workspaces().get("ws-conflict").unwrap().unwrap();
     assert_eq!(loaded.version, 2);
   }
 
-  #[tokio::test]
-  async fn apply_remote_workspace_rejects_hash_mismatch() {
+  #[test]
+  fn apply_remote_workspace_rejects_hash_mismatch() {
     let (_dir, domain) = test_domain();
     let mut record = workspace_record("ws-hash", ResourceScope::ClusterShared);
     record.content_hash = "wrong-hash".to_string();
 
-    let error = domain.apply_remote_workspace(record).await.unwrap_err();
+    let error = domain.apply_remote_workspace(record).unwrap_err();
     assert!(error.to_string().contains("content hash mismatch"));
   }
 }

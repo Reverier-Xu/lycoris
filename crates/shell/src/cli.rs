@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -11,6 +11,14 @@ pub(crate) struct Cli {
   pub(crate) command: Command,
 }
 
+/// Shared argument for commands that take a daemon configuration file.
+#[derive(Args, Debug)]
+pub(crate) struct ConfigArg {
+  /// Path to the daemon configuration file.
+  #[arg(short, long)]
+  pub(crate) config: Option<std::path::PathBuf>,
+}
+
 #[derive(Subcommand, Debug)]
 pub(crate) enum Command {
   /// Query cluster information.
@@ -18,18 +26,10 @@ pub(crate) enum Command {
   Cluster(ClusterCommand),
 
   /// Run the lycoris daemon in the foreground.
-  Daemon {
-    /// Path to the daemon configuration file.
-    #[arg(short, long)]
-    config: Option<std::path::PathBuf>,
-  },
+  Daemon(ConfigArg),
 
   /// Start the lycoris daemon as a background child process.
-  Start {
-    /// Path to the daemon configuration file.
-    #[arg(short, long)]
-    config: Option<std::path::PathBuf>,
-  },
+  Start(ConfigArg),
 
   /// Install lycoris as a user-mode background service.
   Setup,
@@ -46,17 +46,9 @@ pub(crate) enum ClusterCommand {
     /// Label selector in the form `key=value`. Can be specified multiple times.
     #[arg(short, long = "selector", value_name = "KEY=VALUE")]
     selectors: Vec<String>,
-    /// Scope filter for skills and rules (`shared` or `local`).
+    /// Scope filter (`shared` or `local`).
     #[arg(long, value_name = "SCOPE")]
     scope: Option<String>,
-  },
-
-  /// Show detailed information about a single resource.
-  Describe {
-    /// Resource kind, e.g. `node`, `skill`, `session`.
-    resource: String,
-    /// Unique resource id.
-    name: String,
   },
 
   /// Register a new node with the cluster.

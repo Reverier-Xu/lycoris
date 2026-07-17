@@ -3,7 +3,7 @@
 //! This domain persists agent session metadata and vector-backed memories.
 //!
 //! - `Session` metadata is stored in the shared `redb` database via
-//!   `RedbSessionStorage`.
+//!   [`RedbTableStorage`].
 //! - `MemoryEntry` records (including their embeddings) are stored in an
 //!   embedded LanceDB table for fast vector similarity search.
 //! - Memories can be scoped as `NodeLocal` or `ClusterShared`; only shared
@@ -12,31 +12,37 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use arrow_array::{
-  Array, BinaryArray, FixedSizeListArray, Float32Array, Int64Array, RecordBatch, StringArray,
-  types::Float32Type,
+  Array, BinaryArray, FixedSizeListArray, Float32Array, Int64Array, RecordBatch,
+  RecordBatchIterator, StringArray, types::Float32Type,
 };
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use futures_util::stream::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase};
-use lycoris_core::{DEFAULT_EMBEDDING_DIM, ResourceScope};
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use lycoris_core::ResourceScope;
+use redb::{Database, TableDefinition};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-  StorageError,
-  bytes::{Bytes, decode, encode},
-  error::{is_missing_table, redb_err},
-};
+use crate::{StorageError, bytes::Bytes, table::RedbTableStorage};
 
 const SESSIONS: TableDefinition<&str, Bytes> = TableDefinition::new("agent_sessions");
 const MEMORY_TABLE: &str = "memories";
+
+/// Default vector dimension used by embedding models in the agent memory store.
+pub const DEFAULT_EMBEDDING_DIM: usize = 384;
 
 /// A stored agent session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
   pub id: String,
   pub metadata: HashMap<String, String>,
+}
+
+impl Session {
+  /// Metadata key holding the human-readable session title.
+  pub const META_TITLE: &'static str = "title";
+  /// Metadata key holding the id of the node hosting the session.
+  pub const META_HOST_NODE_ID: &'static str = "host_node_id";
 }
 
 /// A memory entry (short- or long-term).
@@ -57,12 +63,7 @@ pub struct MemoryEntry {
 impl MemoryEntry {
   /// Compute the content hash for the entry body.
   pub fn compute_content_hash(content: &[u8]) -> String {
-    blake3::hash(content).to_hex().to_string()
-  }
-
-  /// Return the logical version used for conflict resolution.
-  pub fn version(&self) -> u64 {
-    self.version
+    crate::hash_content(content)
   }
 }
 
@@ -82,7 +83,6 @@ impl crate::versioned::VersionedRecord for MemoryEntry {
 
 /// Storage for active agent sessions.
 pub trait SessionStorage: std::fmt::Debug + Send + Sync {
-  fn create(&self, session: &Session) -> Result<(), AgentStorageError>;
   fn upsert(&self, session: &Session) -> Result<(), AgentStorageError>;
   fn get(&self, id: &str) -> Result<Option<Session>, AgentStorageError>;
   fn list(&self) -> Result<Vec<Session>, AgentStorageError>;
@@ -93,6 +93,10 @@ pub trait SessionStorage: std::fmt::Debug + Send + Sync {
 #[async_trait]
 pub trait MemoryStorage: std::fmt::Debug + Send + Sync {
   async fn store(&self, entry: &MemoryEntry) -> Result<(), AgentStorageError>;
+  /// Return the `limit` memories closest to `query` by vector similarity.
+  ///
+  /// Note: no consumer is wired up yet; this is the raison d'être of the
+  /// LanceDB backend and will be driven by the agent runtime.
   async fn recall(
     &self, query: Vec<f32>, limit: usize,
   ) -> Result<Vec<MemoryEntry>, AgentStorageError>;
@@ -111,6 +115,13 @@ pub trait MemoryStorage: std::fmt::Debug + Send + Sync {
 pub enum AgentStorageError {
   #[error("backend error: {0}")]
   Backend(String),
+  #[error("content hash mismatch")]
+  HashMismatch(#[from] crate::versioned::ContentHashMismatch),
+  /// An embedding whose length does not match the store's dimension. This is
+  /// a data problem in the record supplied by the caller (typically a peer's
+  /// memory entry during anti-entropy), not a backend failure.
+  #[error("embedding dimension mismatch: expected {expected}, got {actual}")]
+  InvalidEmbeddingDim { expected: usize, actual: usize },
 }
 
 impl From<StorageError> for AgentStorageError {
@@ -125,78 +136,25 @@ impl From<std::io::Error> for AgentStorageError {
   }
 }
 
-/// redb-backed implementation of `SessionStorage`.
-#[derive(Debug, Clone)]
-pub struct RedbSessionStorage {
-  db: Arc<Database>,
+fn backend_err(error: impl std::fmt::Display) -> AgentStorageError {
+  AgentStorageError::Backend(error.to_string())
 }
 
-impl RedbSessionStorage {
-  pub(crate) fn new(db: Arc<Database>) -> Self {
-    Self { db }
-  }
-}
-
-impl SessionStorage for RedbSessionStorage {
-  fn create(&self, session: &Session) -> Result<(), AgentStorageError> {
-    self.upsert(session)
-  }
-
+impl SessionStorage for RedbTableStorage<Session> {
   fn upsert(&self, session: &Session) -> Result<(), AgentStorageError> {
-    let write_txn = self.db.begin_write().map_err(redb_err)?;
-    {
-      let mut table = write_txn.open_table(SESSIONS).map_err(redb_err)?;
-      table
-        .insert(session.id.as_str(), Bytes(encode(session)?))
-        .map_err(redb_err)?;
-    }
-    write_txn.commit().map_err(redb_err)?;
-    Ok(())
+    RedbTableStorage::upsert(self, &session.id, session).map_err(Into::into)
   }
 
   fn get(&self, id: &str) -> Result<Option<Session>, AgentStorageError> {
-    let read_txn = self.db.begin_read().map_err(redb_err)?;
-    let table = match read_txn.open_table(SESSIONS).map_err(redb_err) {
-      Ok(table) => table,
-      Err(error) if is_missing_table(&error) => return Ok(None),
-      Err(error) => return Err(error.into()),
-    };
-
-    table
-      .get(id)
-      .map_err(redb_err)?
-      .map(|guard| decode::<Session>(&guard.value().0))
-      .transpose()
-      .map_err(Into::into)
+    RedbTableStorage::get(self, id).map_err(Into::into)
   }
 
   fn list(&self) -> Result<Vec<Session>, AgentStorageError> {
-    let read_txn = self.db.begin_read().map_err(redb_err)?;
-    let table = match read_txn.open_table(SESSIONS).map_err(redb_err) {
-      Ok(table) => table,
-      Err(error) if is_missing_table(&error) => return Ok(Vec::new()),
-      Err(error) => return Err(error.into()),
-    };
-
-    table
-      .iter()
-      .map_err(redb_err)?
-      .map(|row| {
-        let (_, value) = row.map_err(redb_err)?;
-        decode::<Session>(&value.value().0)
-      })
-      .collect::<Result<Vec<_>, _>>()
-      .map_err(Into::into)
+    RedbTableStorage::list(self).map_err(Into::into)
   }
 
   fn delete(&self, id: &str) -> Result<(), AgentStorageError> {
-    let write_txn = self.db.begin_write().map_err(redb_err)?;
-    {
-      let mut table = write_txn.open_table(SESSIONS).map_err(redb_err)?;
-      table.remove(id).map_err(redb_err)?;
-    }
-    write_txn.commit().map_err(redb_err)?;
-    Ok(())
+    RedbTableStorage::delete(self, id).map_err(Into::into)
   }
 }
 
@@ -246,7 +204,7 @@ impl LanceDbMemoryStorage {
     let conn = lancedb::connect(&uri)
       .execute()
       .await
-      .map_err(|error| AgentStorageError::Backend(error.to_string()))?;
+      .map_err(backend_err)?;
     *guard = Some(conn.clone());
     Ok(conn)
   }
@@ -255,7 +213,7 @@ impl LanceDbMemoryStorage {
     Arc::new(Schema::new(vec![
       Field::new("id", DataType::Utf8, false),
       Field::new("content", DataType::Binary, true),
-      Field::new("metadata", DataType::Utf8, true),
+      Field::new("metadata", DataType::Binary, true),
       Field::new(
         "embedding",
         DataType::FixedSizeList(
@@ -274,40 +232,42 @@ impl LanceDbMemoryStorage {
 
   fn check_dim(&self, embedding: &[f32]) -> Result<(), AgentStorageError> {
     if embedding.len() != self.embedding_dim {
-      return Err(AgentStorageError::Backend(format!(
-        "embedding dimension mismatch: expected {}, got {}",
-        self.embedding_dim,
-        embedding.len()
-      )));
+      return Err(AgentStorageError::InvalidEmbeddingDim {
+        expected: self.embedding_dim,
+        actual: embedding.len(),
+      });
     }
     Ok(())
   }
 
-  async fn query_filtered(&self, filter: &str) -> Result<Vec<MemoryEntry>, AgentStorageError> {
+  /// Open the memory table, returning `None` when it has not been created yet.
+  async fn memory_table(&self) -> Result<Option<lancedb::Table>, AgentStorageError> {
     let conn = self.connection().await?;
+    match conn.open_table(MEMORY_TABLE).execute().await {
+      Ok(table) => Ok(Some(table)),
+      Err(_) => Ok(None),
+    }
+  }
 
-    let table = match conn.open_table(MEMORY_TABLE).execute().await {
-      Ok(table) => table,
-      Err(_) => return Ok(Vec::new()),
-    };
-
-    let stream = table
-      .query()
-      .only_if(filter)
-      .execute()
-      .await
-      .map_err(|error| AgentStorageError::Backend(error.to_string()))?;
-
-    let batches = stream
-      .try_collect::<Vec<_>>()
-      .await
-      .map_err(|error| AgentStorageError::Backend(error.to_string()))?;
+  /// Execute a LanceDB query and parse every result batch into memory entries.
+  async fn collect_entries(
+    &self, query: &impl ExecutableQuery,
+  ) -> Result<Vec<MemoryEntry>, AgentStorageError> {
+    let stream = query.execute().await.map_err(backend_err)?;
+    let batches = stream.try_collect::<Vec<_>>().await.map_err(backend_err)?;
 
     let mut entries = Vec::new();
-    for batch in batches {
-      entries.extend(parse_memory_batch(&batch)?);
+    for batch in &batches {
+      entries.extend(parse_memory_batch(batch)?);
     }
     Ok(entries)
+  }
+
+  async fn query_filtered(&self, filter: &str) -> Result<Vec<MemoryEntry>, AgentStorageError> {
+    let Some(table) = self.memory_table().await? else {
+      return Ok(Vec::new());
+    };
+    self.collect_entries(&table.query().only_if(filter)).await
   }
 
   fn batch_for(&self, entries: &[MemoryEntry]) -> Result<RecordBatch, AgentStorageError> {
@@ -319,15 +279,11 @@ impl LanceDbMemoryStorage {
         .map(|entry| entry.content.as_slice())
         .collect::<Vec<_>>(),
     );
-    let metadata = StringArray::from_iter_values(
-      entries
-        .iter()
-        .map(|entry| toml::to_string(&entry.metadata))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| {
-          AgentStorageError::Backend(format!("metadata serialization failed: {error}"))
-        })?,
-    );
+    let metadata_bytes = entries
+      .iter()
+      .map(|entry| crate::bytes::encode(&entry.metadata))
+      .collect::<Result<Vec<_>, StorageError>>()?;
+    let metadata = BinaryArray::from(metadata_bytes.iter().map(Vec::as_slice).collect::<Vec<_>>());
     let embedding_values: Vec<_> = entries
       .iter()
       .map(|entry| {
@@ -342,10 +298,7 @@ impl LanceDbMemoryStorage {
       embedding_values.into_iter().map(Some),
       self.embedding_dim as i32,
     );
-    let scopes = StringArray::from_iter_values(entries.iter().map(|entry| match entry.scope {
-      ResourceScope::ClusterShared => "shared",
-      ResourceScope::NodeLocal => "local",
-    }));
+    let scopes = StringArray::from_iter_values(entries.iter().map(|entry| entry.scope.as_str()));
     let source_node_ids = StringArray::from(
       entries
         .iter()
@@ -373,7 +326,7 @@ impl LanceDbMemoryStorage {
         Arc::new(versions),
       ],
     )
-    .map_err(|error| AgentStorageError::Backend(error.to_string()))
+    .map_err(backend_err)
   }
 }
 
@@ -386,18 +339,26 @@ impl MemoryStorage for LanceDbMemoryStorage {
 
     match conn.open_table(MEMORY_TABLE).execute().await {
       Ok(table) => {
-        table
-          .add(batch)
-          .execute()
+        // Merge-insert on `id`: storing a new version of an existing memory
+        // replaces its row instead of appending a duplicate.
+        let mut merge_insert = table.merge_insert(&["id"]);
+        merge_insert
+          .when_matched_update_all(None)
+          .when_not_matched_insert_all();
+        merge_insert
+          .execute(Box::new(RecordBatchIterator::new(
+            std::iter::once(Ok(batch)),
+            self.schema(),
+          )))
           .await
-          .map_err(|error| AgentStorageError::Backend(error.to_string()))?;
+          .map_err(backend_err)?;
       }
       Err(_) => {
         conn
           .create_table(MEMORY_TABLE, batch)
           .execute()
           .await
-          .map_err(|error| AgentStorageError::Backend(error.to_string()))?;
+          .map_err(backend_err)?;
       }
     }
     Ok(())
@@ -412,27 +373,14 @@ impl MemoryStorage for LanceDbMemoryStorage {
       .open_table(MEMORY_TABLE)
       .execute()
       .await
-      .map_err(|error| AgentStorageError::Backend(error.to_string()))?;
+      .map_err(backend_err)?;
 
-    let stream = table
+    let vector_query = table
       .query()
       .nearest_to(query.as_slice())
-      .map_err(|error| AgentStorageError::Backend(error.to_string()))?
-      .limit(limit)
-      .execute()
-      .await
-      .map_err(|error| AgentStorageError::Backend(error.to_string()))?;
-
-    let batches = stream
-      .try_collect::<Vec<_>>()
-      .await
-      .map_err(|error| AgentStorageError::Backend(error.to_string()))?;
-
-    let mut entries = Vec::new();
-    for batch in batches {
-      entries.extend(parse_memory_batch(&batch)?);
-    }
-    Ok(entries)
+      .map_err(backend_err)?
+      .limit(limit);
+    self.collect_entries(&vector_query).await
   }
 
   async fn get(&self, id: &str) -> Result<Option<MemoryEntry>, AgentStorageError> {
@@ -443,29 +391,10 @@ impl MemoryStorage for LanceDbMemoryStorage {
   }
 
   async fn list(&self) -> Result<Vec<MemoryEntry>, AgentStorageError> {
-    let conn = self.connection().await?;
-
-    let table = match conn.open_table(MEMORY_TABLE).execute().await {
-      Ok(table) => table,
-      Err(_) => return Ok(Vec::new()),
+    let Some(table) = self.memory_table().await? else {
+      return Ok(Vec::new());
     };
-
-    let stream = table
-      .query()
-      .execute()
-      .await
-      .map_err(|error| AgentStorageError::Backend(error.to_string()))?;
-
-    let batches = stream
-      .try_collect::<Vec<_>>()
-      .await
-      .map_err(|error| AgentStorageError::Backend(error.to_string()))?;
-
-    let mut entries = Vec::new();
-    for batch in batches {
-      entries.extend(parse_memory_batch(&batch)?);
-    }
-    Ok(entries)
+    self.collect_entries(&table.query()).await
   }
 
   async fn list_shared(&self) -> Result<Vec<MemoryEntry>, AgentStorageError> {
@@ -520,7 +449,7 @@ fn parse_memory_batch(batch: &RecordBatch) -> Result<Vec<MemoryEntry>, AgentStor
     .ok_or_else(|| AgentStorageError::Backend("content column has wrong type".to_string()))?;
   let metadata = metadata_col
     .as_any()
-    .downcast_ref::<StringArray>()
+    .downcast_ref::<BinaryArray>()
     .ok_or_else(|| AgentStorageError::Backend("metadata column has wrong type".to_string()))?;
   let embeddings = embedding_col
     .as_any()
@@ -558,16 +487,11 @@ fn parse_memory_batch(batch: &RecordBatch) -> Result<Vec<MemoryEntry>, AgentStor
       .ok_or_else(|| AgentStorageError::Backend("embedding values have wrong type".to_string()))?
       .values()
       .to_vec();
-    let metadata_str = metadata.value(i);
-    let metadata = toml::from_str(metadata_str).map_err(|error| {
-      AgentStorageError::Backend(format!(
-        "metadata deserialization failed for row {i}: {error}"
-      ))
-    })?;
-    let scope = match scopes.value(i) {
-      "shared" => ResourceScope::ClusterShared,
-      _ => ResourceScope::NodeLocal,
-    };
+    let metadata = crate::bytes::decode::<HashMap<String, String>>(metadata.value(i))?;
+    let scope = scopes
+      .value(i)
+      .parse::<ResourceScope>()
+      .map_err(|error| AgentStorageError::Backend(error.to_string()))?;
     let source_node_id = {
       let value = source_node_ids.value(i);
       if value.is_empty() {
@@ -603,17 +527,8 @@ impl AgentDomain {
   pub(crate) fn new(db: Arc<Database>, data_dir: PathBuf) -> Self {
     let memory_uri = data_dir.join("memory.lancedb");
     Self {
-      sessions: Arc::new(RedbSessionStorage::new(db)),
+      sessions: Arc::new(RedbTableStorage::new(db, SESSIONS)),
       memory: Arc::new(LanceDbMemoryStorage::new(memory_uri)),
-    }
-  }
-
-  #[allow(dead_code)]
-  pub(crate) fn with_embedding_dim(db: Arc<Database>, data_dir: PathBuf, dim: usize) -> Self {
-    let memory_uri = data_dir.join("memory.lancedb");
-    Self {
-      sessions: Arc::new(RedbSessionStorage::new(db)),
-      memory: Arc::new(LanceDbMemoryStorage::with_embedding_dim(memory_uri, dim)),
     }
   }
 
@@ -636,19 +551,9 @@ impl AgentDomain {
     if content.is_empty() {
       return Ok(false);
     }
-    let actual_hash = blake3::hash(content).to_hex().to_string();
-    if actual_hash != entry.content_hash {
-      return Err(AgentStorageError::Backend(
-        "content hash mismatch".to_string(),
-      ));
-    }
+    crate::versioned::verify_content_hash(&crate::hash_content(content), &entry.content_hash)?;
     let local = self.memory.get(&entry.id).await?;
-    if !crate::versioned::should_apply_versioned(
-      local
-        .as_ref()
-        .map(|local| local as &dyn crate::versioned::VersionedRecord),
-      &entry,
-    ) {
+    if !crate::versioned::should_apply_versioned(local.as_ref(), &entry) {
       return Ok(false);
     }
     self.memory.store(&entry).await?;
@@ -700,7 +605,7 @@ mod tests {
         .collect(),
     };
 
-    domain.sessions().create(&session).unwrap();
+    domain.sessions().upsert(&session).unwrap();
     let loaded = domain.sessions().get("session-1").unwrap().unwrap();
     assert_eq!(loaded.id, "session-1");
     assert_eq!(loaded.metadata.get("title"), Some(&"hello".to_string()));
@@ -711,14 +616,14 @@ mod tests {
     let (_dir, domain) = test_domain();
     domain
       .sessions()
-      .create(&Session {
+      .upsert(&Session {
         id: "session-a".to_string(),
         metadata: HashMap::new(),
       })
       .unwrap();
     domain
       .sessions()
-      .create(&Session {
+      .upsert(&Session {
         id: "session-b".to_string(),
         metadata: HashMap::new(),
       })
@@ -829,6 +734,79 @@ mod tests {
     assert_eq!(loaded.scope, ResourceScope::ClusterShared);
     assert_eq!(loaded.updated_at_ms, 42);
     assert_eq!(loaded.content_hash, entry.content_hash);
+  }
+
+  #[tokio::test]
+  async fn memory_store_same_id_replaces_row() {
+    let dir = TempDir::new().unwrap();
+    let storage = Storage::open(dir.path().join("agent.redb")).unwrap();
+    let agent = storage.agent();
+    let memory = agent.memory();
+    let dim = DEFAULT_EMBEDDING_DIM;
+
+    let mut v1 = memory_entry("dup", vec![0.1_f32; dim], ResourceScope::ClusterShared, 100);
+    v1.content = b"version one".to_vec();
+    v1.content_hash = MemoryEntry::compute_content_hash(&v1.content);
+    v1.version = 1;
+    memory.store(&v1).await.unwrap();
+
+    let mut v2 = memory_entry("dup", vec![0.2_f32; dim], ResourceScope::ClusterShared, 200);
+    v2.content = b"version two".to_vec();
+    v2.content_hash = MemoryEntry::compute_content_hash(&v2.content);
+    v2.version = 2;
+    memory.store(&v2).await.unwrap();
+
+    let loaded = memory.get("dup").await.unwrap().unwrap();
+    assert_eq!(loaded.content, b"version two".to_vec());
+    assert_eq!(loaded.version, 2);
+    assert_eq!(loaded.updated_at_ms, 200);
+
+    let all = memory.list().await.unwrap();
+    assert_eq!(all.len(), 1);
+
+    let shared = memory.list_shared().await.unwrap();
+    assert_eq!(shared.len(), 1);
+    assert_eq!(shared[0].content, b"version two".to_vec());
+  }
+
+  #[tokio::test]
+  async fn apply_remote_memory_new_version_replaces_row() {
+    let dir = TempDir::new().unwrap();
+    let storage = Storage::open(dir.path().join("agent.redb")).unwrap();
+    let agent = storage.agent();
+    let dim = DEFAULT_EMBEDDING_DIM;
+
+    let v1_content = b"remote v1";
+    let mut v1 = memory_entry(
+      "remote-dup",
+      vec![0.1_f32; dim],
+      ResourceScope::ClusterShared,
+      100,
+    );
+    v1.content = v1_content.to_vec();
+    v1.content_hash = MemoryEntry::compute_content_hash(v1_content);
+    v1.version = 1;
+    assert!(agent.apply_remote_memory(v1, v1_content).await.unwrap());
+
+    let v2_content = b"remote v2";
+    let mut v2 = memory_entry(
+      "remote-dup",
+      vec![0.2_f32; dim],
+      ResourceScope::ClusterShared,
+      200,
+    );
+    v2.content = v2_content.to_vec();
+    v2.content_hash = MemoryEntry::compute_content_hash(v2_content);
+    v2.version = 2;
+    assert!(agent.apply_remote_memory(v2, v2_content).await.unwrap());
+
+    let loaded = agent.memory().get("remote-dup").await.unwrap().unwrap();
+    assert_eq!(loaded.content, v2_content.to_vec());
+    assert_eq!(loaded.version, 2);
+
+    let shared = agent.memory().list_shared().await.unwrap();
+    assert_eq!(shared.len(), 1);
+    assert_eq!(shared[0].version, 2);
   }
 
   #[tokio::test]

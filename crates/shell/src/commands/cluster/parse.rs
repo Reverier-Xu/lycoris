@@ -1,31 +1,67 @@
 use std::collections::HashMap;
 
-use lycoris_proto::node::ResourceKind;
+use lycoris_core::ResourceScope;
+use lycoris_proto::node::{ResourceKind, ResourceScope as ProtoResourceScope};
 
 use crate::error::ShellError;
 
+/// Resource kinds accepted on the CLI, each with its accepted spellings. The
+/// first spelling is the canonical name used in output — parsing and display
+/// share this single table.
+const RESOURCE_KINDS: &[(ResourceKind, &[&str])] = &[
+  (ResourceKind::Node, &["node", "nodes", "no"]),
+  (ResourceKind::Session, &["session", "sessions", "sess"]),
+  (ResourceKind::Memory, &["memory", "memories", "mem"]),
+  (ResourceKind::Skill, &["skill", "skills", "sk"]),
+  (ResourceKind::Rule, &["rule", "rules", "ru"]),
+  (ResourceKind::Workspace, &["workspace", "workspaces", "ws"]),
+];
+
 pub(crate) fn parse_resource_kind(raw: &str) -> Result<ResourceKind, ShellError> {
-  match raw.to_ascii_lowercase().as_str() {
-    "node" | "nodes" | "no" => Ok(ResourceKind::Node),
-    "session" | "sessions" | "sess" => Ok(ResourceKind::Session),
-    "memory" | "memories" | "mem" => Ok(ResourceKind::Memory),
-    "skill" | "skills" | "sk" => Ok(ResourceKind::Skill),
-    "rule" | "rules" | "ru" => Ok(ResourceKind::Rule),
-    "workspace" | "workspaces" | "ws" => Ok(ResourceKind::Workspace),
-    _ => Err(ShellError::UnknownResourceKind(raw.to_string())),
+  let normalized = raw.to_ascii_lowercase();
+  RESOURCE_KINDS
+    .iter()
+    .find(|(_, names)| names.contains(&normalized.as_str()))
+    .map(|(kind, _)| *kind)
+    .ok_or_else(|| ShellError::UnknownResourceKind(raw.to_string()))
+}
+
+pub(crate) fn resource_name(kind: ResourceKind) -> &'static str {
+  RESOURCE_KINDS
+    .iter()
+    .find(|(candidate, _)| *candidate == kind)
+    .map_or("unknown", |(_, names)| names[0])
+}
+
+/// Parse the CLI `--scope` value into the wire enum; absent means no filter.
+///
+/// The `"shared"` / `"local"` spellings come from `lycoris_core` (the single
+/// codec source); only the enum mapping is local to this proto boundary.
+pub(crate) fn parse_scope(raw: Option<String>) -> Result<ProtoResourceScope, ShellError> {
+  let Some(raw) = raw else {
+    return Ok(ProtoResourceScope::Unspecified);
+  };
+  let scope = raw
+    .parse::<ResourceScope>()
+    .map_err(|_| ShellError::UnknownScope(raw.clone()))?;
+  Ok(scope_to_proto(scope))
+}
+
+/// Map the wire scope to the domain scope for display purposes; unscoped or
+/// unknown values yield `None`.
+pub(crate) fn scope_from_proto(raw: i32) -> Option<ResourceScope> {
+  match ProtoResourceScope::try_from(raw) {
+    Ok(ProtoResourceScope::ClusterShared) => Some(ResourceScope::ClusterShared),
+    Ok(ProtoResourceScope::NodeLocal) => Some(ResourceScope::NodeLocal),
+    _ => None,
   }
 }
 
-pub(crate) fn resource_name(kind: ResourceKind) -> String {
-  match kind {
-    ResourceKind::Node => "node",
-    ResourceKind::Session => "session",
-    ResourceKind::Memory => "memory",
-    ResourceKind::Skill => "skill",
-    ResourceKind::Rule => "rule",
-    ResourceKind::Workspace => "workspace",
+fn scope_to_proto(scope: ResourceScope) -> ProtoResourceScope {
+  match scope {
+    ResourceScope::ClusterShared => ProtoResourceScope::ClusterShared,
+    ResourceScope::NodeLocal => ProtoResourceScope::NodeLocal,
   }
-  .to_string()
 }
 
 pub(crate) fn parse_selectors(raw: &[String]) -> Result<HashMap<String, String>, ShellError> {

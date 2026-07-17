@@ -1,17 +1,14 @@
-use std::{fs, path::Path};
+use std::{
+  fs,
+  path::{Path, PathBuf},
+};
 
-use lycoris_core::non_empty_string;
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 
-use crate::daemon::DaemonConfig;
-
-fn daemon_cluster_key_path(daemon: &DaemonConfig) -> String {
-  Path::new(&daemon.data_dir)
-    .join("cluster.key")
-    .to_string_lossy()
-    .to_string()
-}
+use crate::{
+  daemon::DaemonConfig, error::ConfigError, paths::default_client_config_path,
+  validation::non_empty_string,
+};
 
 /// Client configuration used by the `lycoris` CLI to talk to a daemon node.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -37,41 +34,83 @@ pub struct ClientConfig {
 }
 
 impl ClientConfig {
-  pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, ClientConfigError> {
+  pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
     let content = fs::read_to_string(path.as_ref())?;
     let config: ClientConfig = toml::from_str(&content)?;
     Ok(config)
   }
 
+  /// Load the client configuration from the default locations.
+  ///
+  /// 1. If a client configuration file exists in the user-specific
+  ///    configuration directory, use it.
+  /// 2. Otherwise derive one from the daemon configuration (same node address
+  ///    and TLS material), so a machine that only runs a daemon still yields a
+  ///    working CLI configuration.
+  ///
+  /// Returns [`ConfigError::NotFound`] when neither source exists. This is
+  /// the single implementation of the load-or-derive policy, shared by the
+  /// CLI and anything else that needs a client configuration.
+  pub fn load_default() -> Result<Self, ConfigError> {
+    if let Some(path) = default_client_config_path()
+      && path.is_file()
+    {
+      return Self::from_file(&path);
+    }
+    Ok(Self::from_daemon_config(&DaemonConfig::load(None)?))
+  }
+
+  /// Derive a client configuration from a daemon configuration: the daemon's
+  /// own address and TLS material are what the CLI should use to reach it.
   pub fn from_daemon_config(daemon: &DaemonConfig) -> Self {
     Self {
       api_address: daemon.node.address.clone(),
       ca_cert: daemon.tls.ca_cert.clone(),
       cert: daemon.tls.cert.clone(),
       key: daemon.tls.key.clone(),
-      cluster_key_path: Some(daemon_cluster_key_path(daemon)),
+      cluster_key_path: Some(
+        lycoris_core::cluster_key_path_in(Path::new(&daemon.data_dir))
+          .to_string_lossy()
+          .to_string(),
+      ),
     }
+  }
+
+  /// Resolve the cluster key file to authenticate `Cluster` RPCs with.
+  ///
+  /// An explicit `cluster_key_path` wins when the file exists; otherwise the
+  /// conventional key location in the default data directory is tried. The
+  /// fallback covers the common flow where `lycoris cluster init` wrote the
+  /// key to the default location before any client configuration existed, or
+  /// where the daemon's `data_dir` points elsewhere.
+  ///
+  /// Note the deliberate asymmetry with the daemon: a daemon that found no
+  /// key writes `cluster_key_path = None`, yet this lookup may still pick up
+  /// a default-location key. That is safe — authorization is enforced by the
+  /// server-side interceptor, so a mismatched key is rejected at RPC time —
+  /// and convenient, since the key the user just initialized is found without
+  /// extra configuration.
+  pub fn resolve_cluster_key_path(&self) -> Option<PathBuf> {
+    self
+      .cluster_key_path
+      .as_ref()
+      .map(PathBuf::from)
+      .filter(|path| path.is_file())
+      .or_else(|| {
+        let path = lycoris_core::default_cluster_key_path();
+        path.is_file().then_some(path)
+      })
   }
 
   /// Write the client configuration to a TOML file, creating parent directories
   /// if necessary.
-  pub fn write_to_file<P: AsRef<Path>>(&self, path: P) -> Result<(), ClientConfigError> {
+  pub fn write_to_file<P: AsRef<Path>>(&self, path: P) -> Result<(), ConfigError> {
     if let Some(parent) = path.as_ref().parent() {
       fs::create_dir_all(parent)?;
     }
     fs::write(path.as_ref(), toml::to_string_pretty(self)?)?;
     Ok(())
   }
-}
-
-#[derive(Debug, Error)]
-pub enum ClientConfigError {
-  #[error("io error: {0}")]
-  Io(#[from] std::io::Error),
-  #[error("parse error: {0}")]
-  Parse(#[from] toml::de::Error),
-  #[error("serialize error: {0}")]
-  Serialize(#[from] toml::ser::Error),
 }
 
 #[cfg(test)]
@@ -126,5 +165,16 @@ mod tests {
     "#;
     let result: Result<ClientConfig, _> = toml::from_str(toml);
     assert!(result.is_err());
+  }
+
+  #[test]
+  fn resolve_cluster_key_path_prefers_explicit_path() {
+    let dir = TempDir::new().unwrap();
+    let key_path = dir.path().join("cluster.key");
+    fs::write(&key_path, "aa").unwrap();
+
+    let mut config = ClientConfig::from_daemon_config(&sample_daemon_config());
+    config.cluster_key_path = Some(key_path.to_string_lossy().to_string());
+    assert_eq!(config.resolve_cluster_key_path(), Some(key_path));
   }
 }

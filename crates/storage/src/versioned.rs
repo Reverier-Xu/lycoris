@@ -1,8 +1,9 @@
 //! Versioned record utilities.
 //!
 //! Provides a shared model for resources that participate in anti-entropy
-//! synchronization. The helper functions capture the conflict-resolution rules
-//! that will later drive `apply_remote` across all resource kinds.
+//! synchronization. The helper functions capture the integrity-verification
+//! and conflict-resolution rules that drive `apply_remote` across all
+//! resource kinds.
 
 use lycoris_core::ResourceScope;
 
@@ -18,14 +19,28 @@ pub trait VersionedRecord {
   fn scope(&self) -> ResourceScope;
 }
 
+/// Error returned when remote content fails integrity verification.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("content hash mismatch")]
+pub struct ContentHashMismatch;
+
+/// Verify that the freshly computed `actual_hash` matches the `expected_hash`
+/// declared by a remote record.
+pub(crate) fn verify_content_hash(
+  actual_hash: &str, expected_hash: &str,
+) -> Result<(), ContentHashMismatch> {
+  if actual_hash != expected_hash {
+    return Err(ContentHashMismatch);
+  }
+  Ok(())
+}
+
 /// Determine whether a remote record should overwrite a local one.
 ///
 /// Local `NodeLocal` resources are never overwritten by remote shared
 /// resources. Otherwise, the higher version wins; if versions are equal, the
 /// more recent `updated_at_ms` wins.
-pub fn should_apply_versioned(
-  local: Option<&dyn VersionedRecord>, remote: &dyn VersionedRecord,
-) -> bool {
+pub fn should_apply_versioned<R: VersionedRecord>(local: Option<&R>, remote: &R) -> bool {
   if remote.scope() != ResourceScope::ClusterShared {
     return false;
   }

@@ -1,9 +1,18 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use directories::{BaseDirs, ProjectDirs};
 
 fn project_dirs() -> Option<ProjectDirs> {
   ProjectDirs::from("", "", "lycoris")
+}
+
+/// Return the conventional cluster key path inside `data_dir`.
+///
+/// This is the single source for the "cluster key lives in the node's data
+/// directory" convention (D10): the daemon, the generated client
+/// configuration, and the CLI all derive their key paths from it.
+pub fn cluster_key_path_in(data_dir: &Path) -> PathBuf {
+  data_dir.join("cluster.key")
 }
 
 /// Return the default data directory for lycoris.

@@ -14,10 +14,7 @@ version.workspace      = true
 [dependencies]
 lycoris-proto  = { workspace = true }
 lycoris-tls    = { workspace = true }
-prost.workspace     = true
-rustls.workspace    = true
 thiserror.workspace = true
-tokio.workspace     = true
 tonic.workspace     = true
 
 [lints]

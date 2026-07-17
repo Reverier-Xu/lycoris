@@ -11,15 +11,20 @@ use tokio::{
 };
 
 use crate::{
-  cluster_sync::ClusterSync,
-  membership::{MemberRegister, MembershipService, SwimConfig},
-  resource_sync::ResourceSync,
-  rpc::{resource::ResourceMapper, server::ClusterService},
+  membership::{LOCAL_INCARNATION_KEY, MemberRegister, MembershipService, SwimConfig},
+  resource::ResourceMapper,
+  rpc::server::ClusterService,
+  sync::{ClusterSync, ResourceSync},
   transport::PeerPool,
 };
 
 const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_SWIM_INTERVAL: Duration = Duration::from_secs(1);
+/// Resource anti-entropy runs on the same 5s cadence as membership
+/// anti-entropy: shared resources change rarely, and this interval balances
+/// propagation delay against RPC churn. It is a separate constant (D5) so the
+/// two planes can be tuned independently.
+const DEFAULT_RESOURCE_SYNC_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -81,6 +86,7 @@ pub async fn run_with_shutdown(
     &config.tls.cert,
     &config.tls.key,
     &config.node.id,
+    &config.node.address,
   )?;
   let server_tls = tls_bundle.server_config();
 
@@ -89,31 +95,40 @@ pub async fn run_with_shutdown(
   }
 
   if node.peers().get_primary()?.is_none()
-    && let Some(first_peer) = config.cluster.bootstrap_peers.first()
+    && let Some(first_peer) = config
+      .cluster
+      .bootstrap_peers
+      .iter()
+      .find(|peer| peer.as_str() != config.node.address)
   {
-    node.peers().set_primary(first_peer)?;
+    node.peers().set_primary(first_peer, &config.node.address)?;
   }
 
-  let mut local_register = MemberRegister::new(&config.node.id, &config.node.address, 1, 0);
+  // The local incarnation is persisted across restarts (P5b): resuming it
+  // keeps the merge dominance this node already earned, so stale rumors
+  // echoed back after a restart cannot bury its fresh state.
+  let local_incarnation = crate::persisted_counter(node.meta(), LOCAL_INCARNATION_KEY).unwrap_or(1);
+  let mut local_register =
+    MemberRegister::new(&config.node.id, &config.node.address, local_incarnation, 0);
   local_register.set_labels(node.local().labels().unwrap_or_default());
   local_register.set_annotations(node.local().annotations().unwrap_or_default());
   local_register.set_updated_at_ms(now_ms());
 
-  let membership_service = Arc::new(MembershipService::new(
-    &config.node.id,
-    SwimConfig::default(),
-    local_register,
-  ));
+  let membership_service = Arc::new(
+    MembershipService::new(&config.node.id, SwimConfig::default(), local_register)
+      .with_meta(node.meta().clone()),
+  );
 
   let mapper = ResourceMapper::new(storage.clone(), membership_service.clone());
 
-  let pool = PeerPool::new(node.clone(), &tls_bundle);
-  let resources = ResourceSync::new(mapper.clone(), pool.clone());
+  let pool = PeerPool::new(&tls_bundle);
+  let resources = ResourceSync::new(mapper.clone(), node.clone(), pool.clone());
   let cluster_sync = ClusterSync::new(
     config.node.id.clone(),
     membership_service.clone(),
+    node.clone(),
     pool,
-    resources,
+    resources.clone(),
   );
 
   let cluster_service = ClusterService::new(membership_service.clone(), storage.clone(), mapper)
@@ -122,25 +137,26 @@ pub async fn run_with_shutdown(
 
   let mut background = tokio::task::JoinSet::new();
 
-  let ae_sync = cluster_sync.clone();
-  let ae_shutdown = shutdown.clone();
-  background.spawn(async move {
-    tokio::select! {
-      _ = ae_sync.run(DEFAULT_SYNC_INTERVAL) => {}
-      _ = wait_shutdown(ae_shutdown) => {}
+  spawn_until_shutdown(&mut background, shutdown.clone(), {
+    let cluster_sync = cluster_sync.clone();
+    async move { cluster_sync.run(DEFAULT_SYNC_INTERVAL).await }
+  });
+
+  spawn_until_shutdown(&mut background, shutdown.clone(), {
+    let cluster_sync = cluster_sync.clone();
+    async move { cluster_sync.run_swim(DEFAULT_SWIM_INTERVAL).await }
+  });
+
+  spawn_until_shutdown(&mut background, shutdown.clone(), {
+    let local_address = config.node.address.clone();
+    async move {
+      resources
+        .run(DEFAULT_RESOURCE_SYNC_INTERVAL, local_address)
+        .await
     }
   });
 
-  let swim_sync = cluster_sync.clone();
-  let swim_shutdown = shutdown.clone();
-  background.spawn(async move {
-    tokio::select! {
-      _ = swim_sync.run_swim(DEFAULT_SWIM_INTERVAL) => {}
-      _ = wait_shutdown(swim_shutdown) => {}
-    }
-  });
-
-  let (sync_service, membership_service_rpc) = cluster_sync.into_servers();
+  let (sync_service, membership_service_rpc) = cluster_sync.servers();
 
   let addr: SocketAddr = config.cluster.listen_address.parse()?;
   tracing::info!(%addr, "node api server listening");
@@ -161,9 +177,26 @@ pub async fn run_with_shutdown(
 
   background.abort_all();
   while background.join_next().await.is_some() {}
+  // Stop tracked fire-and-forget work (gossip forwarding, action dispatch)
+  // alongside the periodic loops.
+  cluster_sync.abort_tasks().await;
 
   result?;
   Ok(())
+}
+
+/// Spawn `task` onto `background`, cancelling it when the shutdown signal
+/// fires. Every periodic daemon loop goes through this single wrapper.
+fn spawn_until_shutdown(
+  background: &mut tokio::task::JoinSet<()>, shutdown: watch::Receiver<bool>,
+  task: impl std::future::Future<Output = ()> + Send + 'static,
+) {
+  background.spawn(async move {
+    tokio::select! {
+      _ = task => {}
+      _ = wait_shutdown(shutdown) => {}
+    }
+  });
 }
 
 async fn wait_shutdown(mut shutdown: watch::Receiver<bool>) {
@@ -176,6 +209,9 @@ async fn wait_shutdown(mut shutdown: watch::Receiver<bool>) {
 
 fn write_client_config(config: &DaemonConfig, cluster_key: Option<&ClusterKey>) {
   let mut client_config = ClientConfig::from_daemon_config(config);
+  // A daemon without a key records `None` — it has no key to point at. The
+  // CLI may still fall back to the default key location; see
+  // `ClientConfig::resolve_cluster_key_path` for why that is safe.
   if cluster_key.is_none() {
     client_config.cluster_key_path = None;
   }
@@ -193,7 +229,7 @@ fn write_client_config(config: &DaemonConfig, cluster_key: Option<&ClusterKey>) 
 }
 
 fn load_cluster_key(data_dir: &str) -> Option<ClusterKey> {
-  let path = PathBuf::from(data_dir).join("cluster.key");
+  let path = lycoris_core::cluster_key_path_in(std::path::Path::new(data_dir));
   if !path.is_file() {
     return None;
   }

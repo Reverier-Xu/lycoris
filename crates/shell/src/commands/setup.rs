@@ -3,7 +3,6 @@ use std::env;
 use crate::error::ShellError;
 
 const SERVICE_NAME: &str = "lycoris";
-const DEFAULT_CONFIG_NAME: &str = "lycoris.toml";
 
 /// Install `lycoris` as a user service.
 ///
@@ -23,11 +22,45 @@ pub(crate) fn run() -> Result<(), ShellError> {
   platform::install(bin_dir)
 }
 
+/// Return the server binary path inside `bin_dir`, verifying it exists.
+///
+/// The daemon and the CLI ship as a single binary, so the server binary must
+/// sit next to the running executable.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn server_binary_path(bin_dir: &std::path::Path) -> Result<std::path::PathBuf, ShellError> {
+  let server_binary = bin_dir.join("lycoris");
+  if !server_binary.is_file() {
+    return Err(ShellError::setup(format!(
+      "server binary not found at {}; ensure 'lycoris' is in the same directory as the lycoris binary",
+      server_binary.display()
+    )));
+  }
+  Ok(server_binary)
+}
+
+/// Create `path` and all missing parents, with the shared setup error shape.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn ensure_dir(path: &std::path::Path) -> Result<(), ShellError> {
+  std::fs::create_dir_all(path)
+    .map_err(|error| ShellError::setup(format!("failed to create {}: {error}", path.display())))
+}
+
+/// Return the current user's home directory (used by the unix service
+/// layouts; windows resolves directories through `lycoris_config` instead).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn home_dir() -> Result<std::path::PathBuf, ShellError> {
+  env::var("HOME")
+    .map(std::path::PathBuf::from)
+    .map_err(|_| ShellError::setup("HOME environment variable is not set"))
+}
+
 #[cfg(target_os = "linux")]
 mod platform {
-  use std::{env, fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
+  use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
 
-  use super::{DEFAULT_CONFIG_NAME, SERVICE_NAME};
+  use lycoris_config::DAEMON_CONFIG_FILE_NAME;
+
+  use super::{SERVICE_NAME, ensure_dir, home_dir, server_binary_path};
   use crate::error::ShellError;
 
   pub(crate) fn install(bin_dir: &Path) -> Result<(), ShellError> {
@@ -53,7 +86,7 @@ mod platform {
     println!("next steps:");
     println!(
       "  1. create {}",
-      config_dir.join(DEFAULT_CONFIG_NAME).display()
+      config_dir.join(DAEMON_CONFIG_FILE_NAME).display()
     );
     println!("  2. systemctl --user start {SERVICE_NAME}");
 
@@ -63,14 +96,7 @@ mod platform {
   fn install_common(
     bin_dir: &Path, systemd_dir: &Path, config_dir: &Path, data_dir: &Path,
   ) -> Result<(), ShellError> {
-    let server_binary = bin_dir.join("lycoris");
-
-    if !server_binary.is_file() {
-      return Err(ShellError::setup(format!(
-        "server binary not found at {}; ensure 'lycoris' is in the same directory as the lycoris binary",
-        server_binary.display()
-      )));
-    }
+    let server_binary = server_binary_path(bin_dir)?;
 
     let metadata = server_binary.metadata().map_err(|error| {
       ShellError::setup(format!(
@@ -86,21 +112,9 @@ mod platform {
       )));
     }
 
-    fs::create_dir_all(systemd_dir).map_err(|error| {
-      ShellError::setup(format!(
-        "failed to create {}: {error}",
-        systemd_dir.display()
-      ))
-    })?;
-    fs::create_dir_all(config_dir).map_err(|error| {
-      ShellError::setup(format!(
-        "failed to create {}: {error}",
-        config_dir.display()
-      ))
-    })?;
-    fs::create_dir_all(data_dir).map_err(|error| {
-      ShellError::setup(format!("failed to create {}: {error}", data_dir.display()))
-    })?;
+    ensure_dir(systemd_dir)?;
+    ensure_dir(config_dir)?;
+    ensure_dir(data_dir)?;
 
     let service_path = systemd_dir.join(format!("{SERVICE_NAME}.service"));
     let unit_content = render_user_unit(&server_binary, config_dir, data_dir);
@@ -118,7 +132,7 @@ mod platform {
     let exec_start = format!(
       "\"{}\" daemon --config \"{}\"",
       server_binary.to_string_lossy(),
-      config_dir.join(DEFAULT_CONFIG_NAME).display()
+      config_dir.join(DAEMON_CONFIG_FILE_NAME).display()
     );
 
     format!(
@@ -169,12 +183,6 @@ mod platform {
     }
 
     Ok(())
-  }
-
-  fn home_dir() -> Result<std::path::PathBuf, ShellError> {
-    env::var("HOME")
-      .map(std::path::PathBuf::from)
-      .map_err(|_| ShellError::setup("HOME environment variable is not set"))
   }
 
   #[cfg(test)]
@@ -254,9 +262,11 @@ mod platform {
 
 #[cfg(target_os = "macos")]
 mod platform {
-  use std::{env, fs, path::Path, process::Command};
+  use std::{fs, path::Path, process::Command};
 
-  use super::{DEFAULT_CONFIG_NAME, SERVICE_NAME};
+  use lycoris_config::DAEMON_CONFIG_FILE_NAME;
+
+  use super::{SERVICE_NAME, ensure_dir, home_dir, server_binary_path};
   use crate::error::ShellError;
 
   pub(crate) fn install(bin_dir: &Path) -> Result<(), ShellError> {
@@ -280,7 +290,7 @@ mod platform {
     println!("next steps:");
     println!(
       "  1. create {}",
-      config_dir.join(DEFAULT_CONFIG_NAME).display()
+      config_dir.join(DAEMON_CONFIG_FILE_NAME).display()
     );
     println!("  2. launchctl start {SERVICE_NAME}");
 
@@ -290,30 +300,11 @@ mod platform {
   fn install_common(
     bin_dir: &Path, launchd_dir: &Path, config_dir: &Path, data_dir: &Path,
   ) -> Result<(), ShellError> {
-    let server_binary = bin_dir.join("lycoris");
+    let server_binary = server_binary_path(bin_dir)?;
 
-    if !server_binary.is_file() {
-      return Err(ShellError::setup(format!(
-        "server binary not found at {}; ensure 'lycoris' is in the same directory as the lycoris binary",
-        server_binary.display()
-      )));
-    }
-
-    fs::create_dir_all(launchd_dir).map_err(|error| {
-      ShellError::setup(format!(
-        "failed to create {}: {error}",
-        launchd_dir.display()
-      ))
-    })?;
-    fs::create_dir_all(config_dir).map_err(|error| {
-      ShellError::setup(format!(
-        "failed to create {}: {error}",
-        config_dir.display()
-      ))
-    })?;
-    fs::create_dir_all(data_dir).map_err(|error| {
-      ShellError::setup(format!("failed to create {}: {error}", data_dir.display()))
-    })?;
+    ensure_dir(launchd_dir)?;
+    ensure_dir(config_dir)?;
+    ensure_dir(data_dir)?;
 
     let plist_path = launchd_dir.join(format!("{SERVICE_NAME}.plist"));
     let plist_content = render_plist(&server_binary, config_dir, data_dir);
@@ -325,7 +316,7 @@ mod platform {
   }
 
   fn render_plist(server_binary: &Path, config_dir: &Path, data_dir: &Path) -> String {
-    let config_path = config_dir.join(DEFAULT_CONFIG_NAME);
+    let config_path = config_dir.join(DAEMON_CONFIG_FILE_NAME);
 
     format!(
       "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -378,45 +369,27 @@ mod platform {
 
     Ok(())
   }
-
-  fn home_dir() -> Result<std::path::PathBuf, ShellError> {
-    env::var("HOME")
-      .map(std::path::PathBuf::from)
-      .map_err(|_| ShellError::setup("HOME environment variable is not set"))
-  }
 }
 
 #[cfg(target_os = "windows")]
 mod platform {
-  use std::{fs, path::Path};
+  use std::path::Path;
 
-  use super::{DEFAULT_CONFIG_NAME, SERVICE_NAME};
+  use lycoris_config::DAEMON_CONFIG_FILE_NAME;
+
+  use super::{SERVICE_NAME, ensure_dir, server_binary_path};
   use crate::error::ShellError;
 
   pub(crate) fn install(bin_dir: &Path) -> Result<(), ShellError> {
-    let server_binary = bin_dir.join("lycoris");
-
-    if !server_binary.is_file() {
-      return Err(ShellError::setup(format!(
-        "server binary not found at {}; ensure 'lycoris' is in the same directory as the lycoris binary",
-        server_binary.display()
-      )));
-    }
+    let server_binary = server_binary_path(bin_dir)?;
 
     let config_dir = lycoris_config::user_config_dir()
       .ok_or_else(|| ShellError::setup("failed to determine user config directory"))?;
     let data_dir = lycoris_config::user_data_dir()
       .ok_or_else(|| ShellError::setup("failed to determine user data directory"))?;
 
-    fs::create_dir_all(&config_dir).map_err(|error| {
-      ShellError::setup(format!(
-        "failed to create {}: {error}",
-        config_dir.display()
-      ))
-    })?;
-    fs::create_dir_all(&data_dir).map_err(|error| {
-      ShellError::setup(format!("failed to create {}: {error}", data_dir.display()))
-    })?;
+    ensure_dir(&config_dir)?;
+    ensure_dir(&data_dir)?;
 
     println!("windows service setup is not yet automated.");
     println!();
@@ -427,13 +400,13 @@ mod platform {
     println!("next steps:");
     println!(
       "  1. create {}",
-      config_dir.join(DEFAULT_CONFIG_NAME).display()
+      config_dir.join(DAEMON_CONFIG_FILE_NAME).display()
     );
     println!("  2. register {} as a windows service, e.g.:", SERVICE_NAME);
     println!(
       "     sc create {SERVICE_NAME} binPath= \"{} daemon --config \\\"{}\\\"\" start= auto",
       server_binary.display(),
-      config_dir.join(DEFAULT_CONFIG_NAME).display()
+      config_dir.join(DAEMON_CONFIG_FILE_NAME).display()
     );
     println!("  3. start the service: sc start {SERVICE_NAME}");
 

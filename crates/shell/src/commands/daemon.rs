@@ -1,6 +1,6 @@
 use std::{path::PathBuf, process::Command};
 
-use lycoris_config::{DaemonConfig, default_daemon_config_path};
+use lycoris_config::{ConfigError, DaemonConfig, default_daemon_config_path};
 
 use crate::error::ShellError;
 
@@ -11,15 +11,9 @@ use crate::error::ShellError;
 /// `lycoris-daemon` runtime, which performs its own client-config and
 /// cluster-key setup.
 pub(crate) async fn run(config: Option<PathBuf>) -> Result<(), ShellError> {
-  let config_path = config
-    .or_else(default_daemon_config_path)
-    .ok_or(ShellError::ConfigNotFound)?;
-  let daemon_config =
-    DaemonConfig::from_file(&config_path).map_err(ShellError::DaemonConfigLoad)?;
-
-  lycoris_daemon::runtime::run(daemon_config)
-    .await
-    .map_err(|error| ShellError::DaemonStart(error.to_string()))
+  let daemon_config = DaemonConfig::load(config.as_deref())?;
+  lycoris_daemon::runtime::run(daemon_config).await?;
+  Ok(())
 }
 
 /// Spawn the daemon as a child process.
@@ -29,9 +23,9 @@ pub(crate) async fn run(config: Option<PathBuf>) -> Result<(), ShellError> {
 pub(crate) fn spawn(config: Option<PathBuf>) -> Result<std::process::Child, ShellError> {
   let config_path = config
     .or_else(default_daemon_config_path)
-    .ok_or(ShellError::ConfigNotFound)?;
+    .ok_or(ConfigError::NotFound)?;
   let exe = std::env::current_exe().map_err(|error| {
-    ShellError::DaemonStart(format!("failed to locate current executable: {error}"))
+    ShellError::DaemonSpawn(format!("failed to locate current executable: {error}"))
   })?;
 
   Command::new(exe)
@@ -39,5 +33,5 @@ pub(crate) fn spawn(config: Option<PathBuf>) -> Result<std::process::Child, Shel
     .arg("--config")
     .arg(config_path)
     .spawn()
-    .map_err(|error| ShellError::DaemonStart(format!("failed to spawn daemon: {error}")))
+    .map_err(|error| ShellError::DaemonSpawn(format!("failed to spawn daemon: {error}")))
 }

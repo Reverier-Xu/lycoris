@@ -5,32 +5,34 @@ mod agent;
 mod bytes;
 mod error;
 mod node;
+mod table;
 mod versioned;
 mod workspace;
 
 use std::{path::Path, sync::Arc};
 
 pub use agent::{
-  AgentDomain, AgentStorageError, MemoryEntry, MemoryStorage, Session, SessionStorage,
+  AgentDomain, AgentStorageError, DEFAULT_EMBEDDING_DIM, MemoryEntry, MemoryStorage, Session,
+  SessionStorage,
 };
 pub use error::StorageError;
 pub use lycoris_core::ResourceScope;
-pub use node::{LocalStorage, NodeDomain, PeerRecord, PeerStorage};
+pub use node::{LocalStorage, MetaStorage, NodeDomain, PeerRecord, PeerStorage};
 use redb::Database;
-pub use versioned::{VersionedRecord, should_apply_versioned};
+pub use table::RedbTableStorage;
+pub use versioned::{ContentHashMismatch, VersionedRecord, should_apply_versioned};
 pub use workspace::{
   RedbRuleStorage, RedbSkillStorage, RedbWorkspaceStorage, RuleRecord, RuleStorage, SkillRecord,
   SkillStorage, VersionedContentStore, VersionedResource, WorkspaceDomain,
   WorkspaceMetadataStorage, WorkspaceRecord, WorkspaceStorageError,
 };
 
-/// `Storage` is the top-level entry point for all persistent state. It owns a
-/// single `redb::Database` and hands out lightweight, cloneable domain handles
-/// for node-local state, agent orchestration state, and workspace state.
+/// `Storage` is the top-level entry point for all persistent state. The
+/// underlying `redb::Database` is shared (via `Arc`) by lightweight, cloneable
+/// domain handles for node-local state, agent orchestration state, and
+/// workspace state.
 #[derive(Debug, Clone)]
 pub struct Storage {
-  #[allow(dead_code)]
-  db: Arc<Database>,
   node: NodeDomain,
   agent: AgentDomain,
   workspace: WorkspaceDomain,
@@ -40,8 +42,7 @@ impl Storage {
   /// Open or create the storage at `db_path`.
   ///
   /// The workspace domain stores skill/rule content in a subdirectory of the
-  /// database's parent directory. To place content elsewhere, use
-  /// [`Storage::open_with_data_dir`].
+  /// database's parent directory.
   pub fn open<P: AsRef<Path>>(db_path: P) -> Result<Self, StorageError> {
     let db_path = db_path.as_ref().to_path_buf();
     let data_dir = db_path
@@ -53,7 +54,7 @@ impl Storage {
 
   /// Open or create the storage at `db_path`, storing domain files in
   /// `data_dir`.
-  pub fn open_with_data_dir<P: AsRef<Path>, Q: AsRef<Path>>(
+  fn open_with_data_dir<P: AsRef<Path>, Q: AsRef<Path>>(
     db_path: P, data_dir: Q,
   ) -> Result<Self, StorageError> {
     let db_path = db_path.as_ref().to_path_buf();
@@ -68,10 +69,9 @@ impl Storage {
     let db = Arc::new(db);
 
     Ok(Self {
-      db: db.clone(),
       node: NodeDomain::new(db.clone()),
       agent: AgentDomain::new(db.clone(), data_dir.clone()),
-      workspace: WorkspaceDomain::new(db, data_dir)?,
+      workspace: WorkspaceDomain::new(db, data_dir),
     })
   }
 
@@ -89,4 +89,9 @@ impl Storage {
   pub fn workspace(&self) -> &WorkspaceDomain {
     &self.workspace
   }
+}
+
+/// Compute the canonical blake3 content hash used across all storage domains.
+pub(crate) fn hash_content(content: &[u8]) -> String {
+  blake3::hash(content).to_hex().to_string()
 }

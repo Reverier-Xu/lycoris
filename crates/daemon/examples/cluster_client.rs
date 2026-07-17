@@ -1,6 +1,7 @@
 use std::{collections::HashMap, time::Duration};
 
 use lycoris_client::{ClientError, ClusterClient};
+use lycoris_proto::node::NodeInfo;
 use lycoris_tls::{install_crypto_provider, load_tls_bundle};
 use thiserror::Error;
 
@@ -44,8 +45,13 @@ async fn main() -> Result<(), ExampleError> {
   let mut client = ClusterClient::connect(register_addr, &tls)
     .await?
     .with_cluster_key(cluster_key.to_string());
-  let node = proto_node_info(expected_id.clone(), "127.0.0.1:59999".to_string());
-  client.register(node, cluster_key).await?;
+  let node = NodeInfo::new(
+    expected_id.clone(),
+    "127.0.0.1:59999".to_string(),
+    HashMap::new(),
+    HashMap::new(),
+  );
+  client.register(node).await?;
   println!("registered {expected_id} via {register_addr}");
 
   tokio::time::sleep(Duration::from_secs(2)).await;
@@ -57,7 +63,7 @@ async fn main() -> Result<(), ExampleError> {
     .list_resources(
       lycoris_proto::node::ResourceKind::Node,
       HashMap::new(),
-      String::new(),
+      lycoris_proto::node::ResourceScope::Unspecified,
     )
     .await?;
   let ids: Vec<String> = resources
@@ -79,23 +85,5 @@ async fn main() -> Result<(), ExampleError> {
       expected_id.clone(),
       query_addr.clone(),
     ))
-  }
-}
-
-fn proto_node_info(
-  id: impl Into<String>, address: impl Into<String>,
-) -> lycoris_proto::node::NodeInfo {
-  use lycoris_core::now_ms;
-  lycoris_proto::node::NodeInfo {
-    id: id.into(),
-    address: address.into(),
-    labels: HashMap::new(),
-    annotations: HashMap::new(),
-    last_heartbeat_unix_ms: now_ms(),
-    state: "active".to_string(),
-    incarnation: 1,
-    heartbeat: 0,
-    in_degree: Vec::new(),
-    out_degree: Vec::new(),
   }
 }

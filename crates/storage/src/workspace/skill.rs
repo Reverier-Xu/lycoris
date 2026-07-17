@@ -1,6 +1,4 @@
-use std::sync::Arc;
-
-use redb::{Database, TableDefinition};
+use redb::TableDefinition;
 
 use crate::{
   bytes::Bytes,
@@ -10,7 +8,8 @@ use crate::{
   },
 };
 
-const SKILLS: TableDefinition<&str, Bytes> = TableDefinition::new("skills");
+/// redb table holding skill metadata records.
+pub(crate) const SKILLS: TableDefinition<&str, Bytes> = TableDefinition::new("skills");
 
 /// Persistent metadata for a reusable skill.
 pub type SkillRecord = VersionedResource;
@@ -23,8 +22,3 @@ pub type RedbSkillStorage = RedbVersionedStorage;
 
 /// Git-backed content store for skill bodies.
 pub type SkillContentStore = GitContentStore;
-
-/// Create a redb-backed skill metadata storage.
-pub(crate) fn new_skill_storage(db: Arc<Database>) -> RedbSkillStorage {
-  RedbVersionedStorage::new(db, SKILLS)
-}

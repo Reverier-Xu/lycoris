@@ -3,18 +3,34 @@
 
 use std::{collections::HashMap, time::Duration};
 
-use lycoris_proto::node::{
-  DescribeResourceRequest, FetchRegistersRequest, GetOutDegreeRequest, GetOutDegreeResponse,
-  GetResourceRequest, JoinRequest, LeaveRequest, ListResourcesRequest, NodeInfo as ProtoNodeInfo,
-  ProbeRequest, ProbeResponse, PushNodeRequest, PushRegistersRequest, RegisterRequest,
-  Resource as ProtoResource, ResourceKind as ProtoResourceKind, SetPrimaryEndpointRequest,
-  StateMessage, StateResponse, SyncNodesRequest, SyncNodesResponse, SyncResourcesRequest,
-  cluster_client::ClusterClient, membership_client::MembershipClient, sync_client::SyncClient,
+use lycoris_proto::{
+  CLUSTER_KEY_HEADER,
+  node::{
+    FetchRegistersRequest, GetResourceRequest, JoinRequest, LeaveRequest, ListResourcesRequest,
+    NodeInfo as ProtoNodeInfo, ProbeRequest, ProbeResponse, PushNodeRequest, PushRegistersRequest,
+    RegisterRequest, Resource as ProtoResource, ResourceKind as ProtoResourceKind,
+    ResourceScope as ProtoResourceScope, SetPrimaryEndpointRequest, StateMessage, StateResponse,
+    SyncNodesRequest, SyncNodesResponse, SyncResourcesRequest, cluster_client::ClusterClient,
+    membership_client::MembershipClient, sync_client::SyncClient,
+  },
 };
 use thiserror::Error;
 use tonic::{Request, metadata::MetadataValue, transport::Channel};
 
-const CLUSTER_KEY_HEADER: &str = "x-lycoris-cluster-key";
+/// Timeout applied to the connection handshake of every peer channel.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Build a connected channel with the shared client defaults: mutual TLS from
+/// `tls_bundle` and a bounded connect handshake. Every handle constructor goes
+/// through here so connection policy stays single-sourced.
+async fn build_channel(
+  address: &str, tls_bundle: &lycoris_tls::TlsBundle,
+) -> Result<Channel, ClientError> {
+  let endpoint = Channel::from_shared(address.to_string())?
+    .tls_config(tls_bundle.client_config())?
+    .connect_timeout(CONNECT_TIMEOUT);
+  Ok(endpoint.connect().await?)
+}
 
 #[derive(Debug, Clone)]
 pub struct ClusterClientHandle {
@@ -26,17 +42,9 @@ impl ClusterClientHandle {
   pub async fn connect(
     address: &str, tls_bundle: &lycoris_tls::TlsBundle,
   ) -> Result<Self, ClientError> {
-    Self::connect_with_tls(address, tls_bundle.client_config()).await
-  }
-
-  pub async fn connect_with_tls(
-    address: &str, tls: tonic::transport::ClientTlsConfig,
-  ) -> Result<Self, ClientError> {
-    let endpoint = Channel::from_shared(address.to_string())?
-      .tls_config(tls)?
-      .connect_timeout(Duration::from_secs(3));
-    let channel = endpoint.connect().await?;
-    Ok(Self::from_channel(channel))
+    Ok(Self::from_channel(
+      build_channel(address, tls_bundle).await?,
+    ))
   }
 
   pub fn from_channel(channel: Channel) -> Self {
@@ -61,16 +69,11 @@ impl ClusterClientHandle {
     Ok(request)
   }
 
-  pub async fn register(
-    &mut self, node: ProtoNodeInfo, cluster_key: &str,
-  ) -> Result<(), ClientError> {
-    let request = Request::new(RegisterRequest {
-      info: Some(node),
-      cluster_key: cluster_key.to_string(),
-    });
+  pub async fn register(&mut self, node: ProtoNodeInfo) -> Result<(), ClientError> {
+    let request = Request::new(RegisterRequest { info: Some(node) });
     let request = self.attach_cluster_key(request)?;
-    let response = self.inner.register(request).await?;
-    accepted(response.into_inner().accepted, "register")
+    let response = self.inner.register(request).await?.into_inner();
+    accepted("register", response.accepted, response.reason)
   }
 
   pub async fn set_primary_endpoint(&mut self, address: &str) -> Result<(), ClientError> {
@@ -78,25 +81,15 @@ impl ClusterClientHandle {
       address: address.to_string(),
     });
     let request = self.attach_cluster_key(request)?;
-    let response = self.inner.set_primary_endpoint(request).await?;
-    accepted(response.into_inner().accepted, "set_primary_endpoint")
+    let response = self.inner.set_primary_endpoint(request).await?.into_inner();
+    accepted("set_primary_endpoint", response.accepted, response.reason)
   }
 
-  pub async fn get_out_degree(&mut self) -> Result<Option<GetOutDegreeResponse>, ClientError> {
-    let request = Request::new(GetOutDegreeRequest {});
+  pub async fn join(&mut self, node: ProtoNodeInfo) -> Result<(), ClientError> {
+    let request = Request::new(JoinRequest { info: Some(node) });
     let request = self.attach_cluster_key(request)?;
-    let response = self.inner.get_out_degree(request).await?;
-    Ok(Some(response.into_inner()))
-  }
-
-  pub async fn join(&mut self, node: ProtoNodeInfo, cluster_key: &str) -> Result<(), ClientError> {
-    let request = Request::new(JoinRequest {
-      info: Some(node),
-      cluster_key: cluster_key.to_string(),
-    });
-    let request = self.attach_cluster_key(request)?;
-    let response = self.inner.join(request).await?;
-    accepted(response.into_inner().accepted, "join")
+    let response = self.inner.join(request).await?.into_inner();
+    accepted("join", response.accepted, response.reason)
   }
 
   pub async fn leave(&mut self, node_id: &str) -> Result<(), ClientError> {
@@ -104,17 +97,18 @@ impl ClusterClientHandle {
       node_id: node_id.to_string(),
     });
     let request = self.attach_cluster_key(request)?;
-    let response = self.inner.leave(request).await?;
-    accepted(response.into_inner().accepted, "leave")
+    let response = self.inner.leave(request).await?.into_inner();
+    accepted("leave", response.accepted, response.reason)
   }
 
   pub async fn list_resources(
-    &mut self, kind: ProtoResourceKind, selector: HashMap<String, String>, scope: String,
+    &mut self, kind: ProtoResourceKind, selector: HashMap<String, String>,
+    scope: ProtoResourceScope,
   ) -> Result<Vec<ProtoResource>, ClientError> {
     let request = Request::new(ListResourcesRequest {
       kind: kind as i32,
       selector,
-      scope,
+      scope: scope as i32,
     });
     let request = self.attach_cluster_key(request)?;
     let response = self.inner.list_resources(request).await?;
@@ -132,18 +126,6 @@ impl ClusterClientHandle {
     let response = self.inner.get_resource(request).await?;
     Ok(Some(response.into_inner()).filter(|r| r.metadata.is_some()))
   }
-
-  pub async fn describe_resource(
-    &mut self, kind: ProtoResourceKind, id: &str,
-  ) -> Result<Option<ProtoResource>, ClientError> {
-    let request = Request::new(DescribeResourceRequest {
-      kind: kind as i32,
-      id: id.to_string(),
-    });
-    let request = self.attach_cluster_key(request)?;
-    let response = self.inner.describe_resource(request).await?;
-    Ok(Some(response.into_inner()).filter(|r| r.metadata.is_some()))
-  }
 }
 
 #[derive(Debug, Clone)]
@@ -153,13 +135,11 @@ pub struct SyncClientHandle {
 
 impl SyncClientHandle {
   pub async fn connect(
-    address: &str, tls: tonic::transport::ClientTlsConfig,
+    address: &str, tls_bundle: &lycoris_tls::TlsBundle,
   ) -> Result<Self, ClientError> {
-    let endpoint = Channel::from_shared(address.to_string())?
-      .tls_config(tls)?
-      .connect_timeout(Duration::from_secs(3));
-    let channel = endpoint.connect().await?;
-    Ok(Self::from_channel(channel))
+    Ok(Self::from_channel(
+      build_channel(address, tls_bundle).await?,
+    ))
   }
 
   pub fn from_channel(channel: Channel) -> Self {
@@ -192,8 +172,9 @@ impl SyncClientHandle {
       origin_node_id,
       sequence,
     });
-    let response = self.inner.push_node(request).await?;
-    accepted(response.into_inner().accepted, "push_node")
+    let response = self.inner.push_node(request).await?.into_inner();
+    // The wire response carries no reason field, so a rejection has none.
+    accepted("push_node", response.accepted, String::new())
   }
 }
 
@@ -204,13 +185,11 @@ pub struct MembershipClientHandle {
 
 impl MembershipClientHandle {
   pub async fn connect(
-    address: &str, tls: tonic::transport::ClientTlsConfig,
+    address: &str, tls_bundle: &lycoris_tls::TlsBundle,
   ) -> Result<Self, ClientError> {
-    let endpoint = Channel::from_shared(address.to_string())?
-      .tls_config(tls)?
-      .connect_timeout(Duration::from_secs(3));
-    let channel = endpoint.connect().await?;
-    Ok(Self::from_channel(channel))
+    Ok(Self::from_channel(
+      build_channel(address, tls_bundle).await?,
+    ))
   }
 
   pub fn from_channel(channel: Channel) -> Self {
@@ -250,12 +229,10 @@ impl MembershipClientHandle {
     Ok(response.into_inner())
   }
 
-  pub async fn push_registers(
-    &mut self, registers: Vec<ProtoNodeInfo>,
-  ) -> Result<Vec<ProtoNodeInfo>, ClientError> {
+  pub async fn push_registers(&mut self, registers: Vec<ProtoNodeInfo>) -> Result<(), ClientError> {
     let request = Request::new(PushRegistersRequest { registers });
-    let response = self.inner.push_registers(request).await?;
-    Ok(response.into_inner().registers)
+    self.inner.push_registers(request).await?;
+    Ok(())
   }
 
   pub async fn state(&mut self, message: StateMessage) -> Result<StateResponse, ClientError> {
@@ -276,11 +253,9 @@ impl PeerClient {
   pub async fn connect(
     address: &str, tls_bundle: &lycoris_tls::TlsBundle,
   ) -> Result<Self, ClientError> {
-    let endpoint = Channel::from_shared(address.to_string())?
-      .tls_config(tls_bundle.client_config())?
-      .connect_timeout(Duration::from_secs(3));
-    let channel = endpoint.connect().await?;
-    Ok(Self::from_channel(channel))
+    Ok(Self::from_channel(
+      build_channel(address, tls_bundle).await?,
+    ))
   }
 
   pub fn from_channel(channel: Channel) -> Self {
@@ -292,11 +267,16 @@ impl PeerClient {
   }
 }
 
-fn accepted(accepted: bool, operation: &str) -> Result<(), ClientError> {
+/// Translate an accepted/reason response pair into a `Result`, keeping the
+/// server's rejection reason instead of dropping it.
+fn accepted(operation: &str, accepted: bool, reason: String) -> Result<(), ClientError> {
   if accepted {
     Ok(())
   } else {
-    Err(ClientError::Rejected(operation.to_string()))
+    Err(ClientError::Rejected {
+      operation: operation.to_string(),
+      reason,
+    })
   }
 }
 
@@ -306,14 +286,12 @@ pub enum ClientError {
   InvalidUri(#[from] tonic::codegen::http::uri::InvalidUri),
   #[error("transport error: {0}")]
   Transport(#[from] tonic::transport::Error),
-  #[error("io error: {0}")]
-  Io(#[from] std::io::Error),
-  #[error("tls error: {0}")]
-  Tls(#[from] lycoris_tls::TlsError),
   #[error("rpc status: {0}")]
   Status(Box<tonic::Status>),
-  #[error("{0} rejected by peer")]
-  Rejected(String),
+  #[error("timed out waiting for peer: {0}")]
+  Timeout(&'static str),
+  #[error("{operation} rejected by peer: {reason}")]
+  Rejected { operation: String, reason: String },
   #[error("invalid cluster key header")]
   InvalidClusterKey,
 }
@@ -321,5 +299,24 @@ pub enum ClientError {
 impl From<tonic::Status> for ClientError {
   fn from(status: tonic::Status) -> Self {
     Self::Status(Box::new(status))
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn rejection_carries_server_reason() {
+    let error = accepted("join", false, "cluster key mismatch".to_string()).unwrap_err();
+    assert_eq!(
+      error.to_string(),
+      "join rejected by peer: cluster key mismatch"
+    );
+  }
+
+  #[test]
+  fn accepted_response_passes_through() {
+    assert!(accepted("join", true, String::new()).is_ok());
   }
 }

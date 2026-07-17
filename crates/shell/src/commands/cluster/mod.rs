@@ -1,9 +1,7 @@
-use std::path::PathBuf;
-
 use lycoris_client::ClusterClient;
-use lycoris_config::{ClientConfig, DaemonConfig, default_daemon_config_path};
+use lycoris_config::{ClientConfig, DaemonConfig};
 use lycoris_core::{ClusterKey, default_cluster_key_path};
-use lycoris_tls::TlsBundle;
+use lycoris_proto::node::{NodeInfo, ResourceKind};
 use owo_colors::OwoColorize;
 
 use crate::error::ShellError;
@@ -18,6 +16,13 @@ pub(crate) async fn get_resources(
   let mut client = connect_cluster(client_config).await?;
   let kind = parse::parse_resource_kind(resource)?;
   let kind_name = parse::resource_name(kind);
+  // The local node marker is only rendered for node listings; other kinds
+  // skip the daemon-config read (and its warning) entirely.
+  let local_id = if kind == ResourceKind::Node {
+    local_node_id()
+  } else {
+    String::new()
+  };
 
   match name {
     Some(id) => {
@@ -25,26 +30,27 @@ pub(crate) async fn get_resources(
         .get_resource(kind, &id)
         .await
         .map_err(|source| ShellError::GetResource {
-          kind: kind_name.clone(),
+          kind: kind_name.to_string(),
           id: id.clone(),
           source,
         })?
         .ok_or_else(|| ShellError::ResourceNotFound {
-          kind: kind_name.clone(),
+          kind: kind_name.to_string(),
           id: id.clone(),
         })?;
-      render::render_resource(&resource, kind, &local_node_id().unwrap_or_default(), true);
+      render::render_resource(&resource, kind, &local_id);
     }
     None => {
       let selector = parse::parse_selectors(selectors)?;
+      let scope = parse::parse_scope(scope)?;
       let resources = client
-        .list_resources(kind, selector, scope.unwrap_or_default())
+        .list_resources(kind, selector, scope)
         .await
         .map_err(|source| ShellError::ListResources {
-          kind: kind_name.clone(),
+          kind: kind_name.to_string(),
           source,
         })?;
-      render::render_list(kind, &resources, &local_node_id().unwrap_or_default());
+      render::render_list(kind, &resources, &local_id);
       println!("total: {}", resources.len());
     }
   }
@@ -52,57 +58,30 @@ pub(crate) async fn get_resources(
   Ok(())
 }
 
-pub(crate) async fn describe_resource(
-  client_config: &ClientConfig, resource: &str, name: &str,
-) -> Result<(), ShellError> {
-  let mut client = connect_cluster(client_config).await?;
-  let kind = parse::parse_resource_kind(resource)?;
-  let kind_name = parse::resource_name(kind);
-
-  let resource = client
-    .describe_resource(kind, name)
-    .await
-    .map_err(|source| ShellError::DescribeResource {
-      kind: kind_name.clone(),
-      id: name.to_string(),
-      source,
-    })?
-    .ok_or_else(|| ShellError::ResourceNotFound {
-      kind: kind_name.clone(),
-      id: name.to_string(),
-    })?;
-
-  render::render_resource(&resource, kind, &local_node_id().unwrap_or_default(), false);
-  Ok(())
-}
-
 pub(crate) async fn register(
   client_config: &ClientConfig, id: String, address: String, key: String,
 ) -> Result<(), ShellError> {
   let key = key.trim().to_string();
-  let mut client = connect_cluster(client_config).await?;
-  let node = proto_node_info(
+  let mut client = connect_cluster(client_config).await?.with_cluster_key(key);
+  let node = NodeInfo::new(
     id.clone(),
     address,
     std::collections::HashMap::new(),
     std::collections::HashMap::new(),
   );
-  client
-    .register(node, &key)
-    .await
-    .map_err(ShellError::Register)?;
+  client.register(node).await.map_err(ShellError::Register)?;
   println!("registered node {}", id.cyan());
   Ok(())
 }
 
 pub(crate) fn init_cluster(key: Option<String>) -> Result<(), ShellError> {
   let cluster_key = match key {
-    Some(hex) => ClusterKey::from_hex(hex.trim()).map_err(ShellError::ClusterKey)?,
-    None => ClusterKey::generate().map_err(ShellError::ClusterKey)?,
+    Some(hex) => ClusterKey::from_hex(hex.trim())?,
+    None => ClusterKey::generate()?,
   };
 
   let path = default_cluster_key_path();
-  cluster_key.save(&path).map_err(ShellError::ClusterKey)?;
+  cluster_key.save(&path)?;
   println!(
     "initialized cluster with key {}",
     cluster_key.to_hex().cyan()
@@ -115,24 +94,28 @@ pub(crate) async fn join_cluster(
   client_config: &ClientConfig, peer: String, key: String,
 ) -> Result<(), ShellError> {
   let key = key.trim().to_string();
-  let daemon_config = load_daemon_config()?;
-  let tls = load_tls_bundle(client_config)?;
+  let daemon_config = DaemonConfig::load(None)?;
+  let tls = lycoris_tls::load_tls_bundle(
+    &client_config.cert,
+    &client_config.key,
+    &client_config.ca_cert,
+  )?;
   let mut client = ClusterClient::connect(&peer, &tls)
     .await
     .map_err(|source| ShellError::Connect {
       address: peer.clone(),
       source,
     })?
-    .with_cluster_key(key.clone());
+    .with_cluster_key(key);
 
-  let node = proto_node_info(
+  let node = NodeInfo::new(
     daemon_config.node.id.clone(),
     daemon_config.node.address.clone(),
     std::collections::HashMap::new(),
     std::collections::HashMap::new(),
   );
 
-  client.join(node, &key).await.map_err(ShellError::Join)?;
+  client.join(node).await.map_err(ShellError::Join)?;
 
   let mut local_client = connect_cluster(client_config).await?;
   local_client
@@ -149,7 +132,7 @@ pub(crate) async fn join_cluster(
 }
 
 pub(crate) async fn leave_cluster(client_config: &ClientConfig) -> Result<(), ShellError> {
-  let daemon_config = load_daemon_config()?;
+  let daemon_config = DaemonConfig::load(None)?;
   let mut client = connect_cluster(client_config).await?;
   client
     .leave(&daemon_config.node.id)
@@ -168,14 +151,20 @@ pub(crate) fn show_key() -> Result<(), ShellError> {
     return Err(ShellError::ClusterKeyNotFound);
   }
 
-  let key = ClusterKey::load(&path).map_err(ShellError::ClusterKey)?;
+  let key = ClusterKey::load(&path)?;
   println!("{}", key.to_hex());
   Ok(())
 }
 
 async fn connect_cluster(client_config: &ClientConfig) -> Result<ClusterClient, ShellError> {
+  // A missing key is not fatal here: commands like `join` authenticate with
+  // an explicit `--key`, and the server rejects unauthenticated calls anyway.
   let key = load_cluster_key(client_config).ok();
-  let tls = load_tls_bundle(client_config)?;
+  let tls = lycoris_tls::load_tls_bundle(
+    &client_config.cert,
+    &client_config.key,
+    &client_config.ca_cert,
+  )?;
   let client = ClusterClient::connect(&client_config.api_address, &tls)
     .await
     .map_err(|source| ShellError::Connect {
@@ -190,50 +179,22 @@ async fn connect_cluster(client_config: &ClientConfig) -> Result<ClusterClient, 
 
 fn load_cluster_key(client_config: &ClientConfig) -> Result<String, ShellError> {
   let path = client_config
-    .cluster_key_path
-    .as_ref()
-    .map(PathBuf::from)
-    .filter(|p| p.is_file())
-    .or_else(|| Some(default_cluster_key_path()).filter(|p| p.is_file()))
+    .resolve_cluster_key_path()
     .ok_or(ShellError::ClusterKeyNotFound)?;
-  ClusterKey::load(&path)
-    .map(|key| key.to_hex())
-    .map_err(ShellError::ClusterKey)
+  Ok(ClusterKey::load(&path)?.to_hex())
 }
 
-fn load_tls_bundle(client_config: &ClientConfig) -> Result<TlsBundle, ShellError> {
-  lycoris_tls::load_tls_bundle(
-    &client_config.cert,
-    &client_config.key,
-    &client_config.ca_cert,
-  )
-  .map_err(ShellError::TlsLoad)
-}
-
-fn load_daemon_config() -> Result<DaemonConfig, ShellError> {
-  let path = default_daemon_config_path().ok_or(ShellError::ConfigNotFound)?;
-  DaemonConfig::from_file(&path).map_err(Into::into)
-}
-
-fn local_node_id() -> Option<String> {
-  load_daemon_config().map(|config| config.node.id).ok()
-}
-
-fn proto_node_info(
-  id: String, address: String, labels: std::collections::HashMap<String, String>,
-  annotations: std::collections::HashMap<String, String>,
-) -> lycoris_proto::node::NodeInfo {
-  use lycoris_core::now_ms;
-  lycoris_proto::node::NodeInfo {
-    id,
-    address,
-    labels,
-    annotations,
-    last_heartbeat_unix_ms: now_ms(),
-    state: "active".to_string(),
-    incarnation: 1,
-    heartbeat: 0,
-    in_degree: Vec::new(),
-    out_degree: Vec::new(),
+/// Best-effort local node id used to mark the current node in listings.
+///
+/// The daemon configuration is read once per command; a failure is surfaced
+/// as a warning and degrades to no marker instead of failing the query or
+/// being swallowed silently.
+fn local_node_id() -> String {
+  match DaemonConfig::load(None) {
+    Ok(config) => config.node.id,
+    Err(error) => {
+      eprintln!("warning: failed to load daemon config, local node will not be marked: {error}");
+      String::new()
+    }
   }
 }

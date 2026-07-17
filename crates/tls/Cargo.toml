@@ -15,7 +15,9 @@ version.workspace      = true
 rcgen     = { workspace = true }
 rustls    = { workspace = true }
 thiserror = { workspace = true }
+time      = { workspace = true }
 tonic     = { workspace = true }
+tracing   = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

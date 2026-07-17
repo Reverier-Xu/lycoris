@@ -7,12 +7,10 @@ service Cluster {
   rpc SetPrimaryEndpoint(SetPrimaryEndpointRequest) returns (SetPrimaryEndpointResponse);
   rpc Join(JoinRequest) returns (JoinResponse);
   rpc Leave(LeaveRequest) returns (LeaveResponse);
-  rpc GetOutDegree(GetOutDegreeRequest) returns (GetOutDegreeResponse);
 
   // Generic resource API.
   rpc ListResources(ListResourcesRequest) returns (ListResourcesResponse);
   rpc GetResource(GetResourceRequest) returns (Resource);
-  rpc DescribeResource(DescribeResourceRequest) returns (Resource);
 }
 
 enum ResourceKind {
@@ -24,20 +22,42 @@ enum ResourceKind {
   WORKSPACE = 5;
 }
 
+// Lifecycle state of a cluster member, mirroring the membership CRDT's
+// MemberState. UNSPECIFIED never appears in registers emitted by a daemon.
+enum NodeState {
+  NODE_STATE_UNSPECIFIED = 0;
+  NODE_STATE_ACTIVE = 1;
+  NODE_STATE_SUSPECTED = 2;
+  NODE_STATE_OFFLINE = 3;
+  NODE_STATE_LEAVING = 4;
+}
+
+// Visibility scope of a resource. Cluster-shared resources participate in
+// resource anti-entropy; node-local resources never leave their origin node.
+enum ResourceScope {
+  RESOURCE_SCOPE_UNSPECIFIED = 0;
+  RESOURCE_SCOPE_CLUSTER_SHARED = 1;
+  RESOURCE_SCOPE_NODE_LOCAL = 2;
+}
+
 message ResourceMetadata {
   string id = 1;
   string name = 2;
   ResourceKind kind = 3;
   map<string, string> labels = 4;
   map<string, string> annotations = 5;
-  // "shared", "local", or empty.
-  string scope = 6;
+  // The single copy of the resource scope; UNSPECIFIED for resources that
+  // are not scoped (nodes, sessions).
+  ResourceScope scope = 6;
   // Origin node for shared resources; empty for local origin.
   string source_node_id = 7;
   int64 created_at_ms = 8;
   int64 updated_at_ms = 9;
 }
 
+// The NodeInfo payload is the single copy of a node resource's id, labels,
+// and annotations; the enclosing ResourceMetadata only carries the generic
+// scaffold (id/name/kind/timestamps).
 message NodeBody {
   NodeInfo node = 1;
 }
@@ -48,15 +68,14 @@ message SessionBody {
   map<string, string> metadata = 3;
 }
 
+// Scope, source node, and update time live on ResourceMetadata only; bodies
+// carry kind-specific payloads.
 message MemoryBody {
   bytes content = 1;
   map<string, string> metadata = 2;
-  string scope = 3;
-  string source_node_id = 4;
-  int64 updated_at_ms = 5;
-  string content_hash = 6;
-  repeated float embedding = 7;
-  uint64 version = 8;
+  string content_hash = 3;
+  repeated float embedding = 4;
+  uint64 version = 5;
 }
 
 message SkillBody {
@@ -77,10 +96,8 @@ message WorkspaceBody {
   string root = 1;
   repeated string session_ids = 2;
   map<string, string> metadata = 3;
-  string scope = 4;
-  string source_node_id = 5;
-  uint64 version = 6;
-  string content_hash = 7;
+  uint64 version = 4;
+  string content_hash = 5;
 }
 
 message Resource {
@@ -98,7 +115,8 @@ message Resource {
 message ListResourcesRequest {
   ResourceKind kind = 1;
   map<string, string> selector = 2;
-  string scope = 3;
+  // Optional scope filter; UNSPECIFIED lists resources of every scope.
+  ResourceScope scope = 3;
 }
 
 message ListResourcesResponse {
@@ -110,29 +128,15 @@ message GetResourceRequest {
   string id = 2;
 }
 
-message DescribeResourceRequest {
-  ResourceKind kind = 1;
-  string id = 2;
-}
-
 message NodeInfo {
   string id = 1;
   string address = 2;
   map<string, string> labels = 3;
   map<string, string> annotations = 4;
   int64 last_heartbeat_unix_ms = 5;
-  string state = 6;
+  NodeState state = 6;
   uint64 incarnation = 7;
   uint64 heartbeat = 8;
-  repeated string in_degree = 9;
-  repeated string out_degree = 10;
-}
-
-message GetOutDegreeRequest {}
-
-message GetOutDegreeResponse {
-  string node_id = 1;
-  string address = 2;
 }
 
 message MerkleRootRequest {}
@@ -154,8 +158,9 @@ message MerkleLeafEntry {
 message MerkleNodeResult {
   MerkleNodeRef node = 1;
   bytes hash = 2;
-  bool is_leaf = 3;
-  repeated MerkleLeafEntry entries = 4;
+  // Leaf entries are present exactly when `node` references the leaf depth;
+  // the receiver derives leaf-ness from the depth, not from a flag.
+  repeated MerkleLeafEntry entries = 3;
 }
 
 message MerkleNodesRequest {
@@ -178,6 +183,8 @@ message PushRegistersRequest {
   repeated NodeInfo registers = 1;
 }
 
+message PushRegistersResponse {}
+
 message ProbeRequest {
   uint64 seq = 1;
   string target = 2;
@@ -192,13 +199,16 @@ service Membership {
   rpc MerkleRoot(MerkleRootRequest) returns (MerkleRootResponse);
   rpc MerkleNodes(MerkleNodesRequest) returns (MerkleNodesResponse);
   rpc FetchRegisters(FetchRegistersRequest) returns (FetchRegistersResponse);
-  rpc PushRegisters(PushRegistersRequest) returns (FetchRegistersResponse);
+  rpc PushRegisters(PushRegistersRequest) returns (PushRegistersResponse);
   rpc Probe(ProbeRequest) returns (ProbeResponse);
   rpc State(StateMessage) returns (StateResponse);
 }
 
 service Sync {
   rpc SyncNodes(SyncNodesRequest) returns (SyncNodesResponse);
+  // Gossip channel for register (Alive) updates, including Offline registers
+  // which ride the Alive path so that partitions can heal on reconnect.
+  // (origin_node_id, sequence) is the receiver-side dedup key.
   rpc PushNode(PushNodeRequest) returns (PushNodeResponse);
   rpc SyncResources(SyncResourcesRequest) returns (SyncResourcesResponse);
 }
@@ -211,11 +221,13 @@ message SyncResourcesResponse {
   repeated Resource resources = 1;
 }
 
+// SWIM state rumors gossiped between nodes. Register-carrying Alive updates
+// (including Offline registers) travel on `Sync.PushNode` instead; this
+// channel carries only the register-less Suspect and Leave rumors.
 message StateMessage {
   oneof payload {
-    NodeInfo alive = 1;
-    SuspectMessage suspect = 2;
-    LeaveMessage leave = 3;
+    SuspectMessage suspect = 1;
+    LeaveMessage leave = 2;
   }
 }
 
@@ -235,7 +247,6 @@ message StateResponse {
 
 message RegisterRequest {
   NodeInfo info = 1;
-  string cluster_key = 2;
 }
 
 message RegisterResponse {
@@ -272,7 +283,6 @@ message SetPrimaryEndpointResponse {
 
 message JoinRequest {
   NodeInfo info = 1;
-  string cluster_key = 2;
 }
 
 message JoinResponse {

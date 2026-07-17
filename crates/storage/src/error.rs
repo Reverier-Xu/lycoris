@@ -8,12 +8,8 @@ pub enum StorageError {
   Io(#[from] std::io::Error),
   #[error("serialization error: {0}")]
   Serialization(#[from] postcard::Error),
-  #[error("agent storage error: {0}")]
-  Agent(String),
-  #[error("workspace storage error: {0}")]
-  Workspace(String),
-  #[error("corrupt state in database: {0}")]
-  CorruptState(String),
+  #[error("cannot set the local node's own address as primary")]
+  SelfPrimary,
 }
 
 /// Returns true when the error indicates that a redb table has not been

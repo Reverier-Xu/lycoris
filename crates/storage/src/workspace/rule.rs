@@ -1,6 +1,4 @@
-use std::sync::Arc;
-
-use redb::{Database, TableDefinition};
+use redb::TableDefinition;
 
 use crate::{
   bytes::Bytes,
@@ -10,7 +8,8 @@ use crate::{
   },
 };
 
-const RULES: TableDefinition<&str, Bytes> = TableDefinition::new("rules");
+/// redb table holding rule metadata records.
+pub(crate) const RULES: TableDefinition<&str, Bytes> = TableDefinition::new("rules");
 
 /// Persistent metadata for a reusable rule.
 pub type RuleRecord = VersionedResource;
@@ -23,8 +22,3 @@ pub type RedbRuleStorage = RedbVersionedStorage;
 
 /// Git-backed content store for rule bodies.
 pub type RuleContentStore = GitContentStore;
-
-/// Create a redb-backed rule metadata storage.
-pub(crate) fn new_rule_storage(db: Arc<Database>) -> RedbRuleStorage {
-  RedbVersionedStorage::new(db, RULES)
-}

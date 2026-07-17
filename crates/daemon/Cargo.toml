@@ -12,7 +12,6 @@ rust-version.workspace = true
 version.workspace      = true
 
 [dependencies]
-blake3.workspace         = true
 lycoris-client.workspace     = true
 lycoris-config.workspace     = true
 lycoris-core.workspace       = true
@@ -26,13 +25,10 @@ tonic.workspace          = true
 tracing.workspace        = true
 
 [dev-dependencies]
-lycoris-client.workspace = true
-lycoris-config.workspace = true
-lycoris-core.workspace   = true
-lycoris-tls.workspace    = true
-rcgen.workspace          = true
-rustls.workspace         = true
-tempfile.workspace       = true
+blake3.workspace     = true
+rcgen.workspace      = true
+rustls.workspace     = true
+tempfile.workspace   = true
 
 [lints]
 workspace = true

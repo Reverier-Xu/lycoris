@@ -48,13 +48,14 @@ blake3        = "1.8"
 owo-colors    = "4.3"
 postcard      = { version = "1.0", features = ["use-std"] }
 prost         = "0.13"
-rcgen         = "0.13"
+rcgen         = { version = "0.13", features = ["x509-parser"] }
 ring          = "0.17"
 redb          = "3.0"
 rustls        = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde         = { version = "1.0", features = ["derive"] }
 tempfile      = "3"
 thiserror     = "2.0"
+time          = "0.3"
 tokio         = { version = "1.52", features = ["full"] }
 toml          = "0.8"
 tonic         = { version = "0.13", features = ["tls-ring"] }

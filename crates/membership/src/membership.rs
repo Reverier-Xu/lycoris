@@ -9,16 +9,37 @@ use crate::register::{MemberRegister, MemberState};
 /// `Membership` is a map from node id to `MemberRegister`. Merging two
 /// memberships merges each register independently, which guarantees
 /// convergence without coordination.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// The `version` counter is bumped by every mutation that can change the
+/// Merkle tree contents (register writes/merges and state transitions). It
+/// lets callers cache expensive derived structures — such as the Merkle tree —
+/// and rebuild them only when the membership actually changed. `heartbeat`
+/// bumps do not advance the version while the state stays unchanged, because
+/// the heartbeat counter is excluded from the tree hash (see
+/// `merkle::hash_register`); a heartbeat that flips `Suspected` back to
+/// `Active` does advance it.
+#[derive(Debug, Clone, Default)]
 pub struct Membership {
   members: HashMap<String, MemberRegister>,
+  version: u64,
 }
+
+/// Equality compares only the replicated state. The `version` counter is a
+/// local cache-invalidation signal, not part of the CRDT value.
+impl PartialEq for Membership {
+  fn eq(&self, other: &Self) -> bool {
+    self.members == other.members
+  }
+}
+
+impl Eq for Membership {}
 
 impl Membership {
   /// Create an empty membership.
   pub fn new() -> Self {
     Self {
       members: HashMap::new(),
+      version: 0,
     }
   }
 
@@ -29,6 +50,10 @@ impl Membership {
       .entry(register.node_id().to_string())
       .and_modify(|existing| existing.merge(register))
       .or_insert_with(|| register.clone());
+    // Conservatively bump on every write/merge; detecting a no-op merge would
+    // cost a full register comparison and merges on the anti-entropy path are
+    // rare compared to reads.
+    self.version += 1;
   }
 
   /// Merge another membership into this one.
@@ -57,25 +82,22 @@ impl Membership {
       .collect()
   }
 
-  /// Return true if the membership contains no members.
-  pub fn is_empty(&self) -> bool {
-    self.members.is_empty()
-  }
-
-  /// Return the number of members.
-  pub fn len(&self) -> usize {
-    self.members.len()
-  }
-
-  /// Return an iterator over member ids.
-  pub fn node_ids(&self) -> impl Iterator<Item = &String> {
-    self.members.keys()
+  /// Return the mutation version counter (see the type-level docs).
+  pub fn version(&self) -> u64 {
+    self.version
   }
 
   /// Bump the heartbeat for `node_id` if it exists.
   pub fn heartbeat(&mut self, node_id: &str, now_ms: i64) -> bool {
     if let Some(register) = self.members.get_mut(node_id) {
+      let state_before = register.state();
       register.bump_heartbeat(now_ms);
+      // The heartbeat counter is not part of the Merkle hash, so a pure
+      // heartbeat bump does not change the tree; only an accompanying state
+      // flip (Suspected -> Active) does.
+      if register.state() != state_before {
+        self.version += 1;
+      }
       return true;
     }
     false
@@ -89,6 +111,7 @@ impl Membership {
     let previous = register.state();
     register.suspect(now_ms);
     if previous == MemberState::Active && register.state() == MemberState::Suspected {
+      self.version += 1;
       Some(register.incarnation())
     } else {
       None
@@ -99,6 +122,7 @@ impl Membership {
   pub fn offline(&mut self, node_id: &str, now_ms: i64) -> bool {
     if let Some(register) = self.members.get_mut(node_id) {
       register.offline(now_ms);
+      self.version += 1;
       return true;
     }
     false
@@ -108,6 +132,7 @@ impl Membership {
   pub fn leave(&mut self, node_id: &str, now_ms: i64) -> bool {
     if let Some(register) = self.members.get_mut(node_id) {
       register.leave(now_ms);
+      self.version += 1;
       return true;
     }
     false
@@ -117,6 +142,7 @@ impl Membership {
   pub fn refute(&mut self, node_id: &str, now_ms: i64) -> bool {
     if let Some(register) = self.members.get_mut(node_id) {
       register.refute(now_ms);
+      self.version += 1;
       return true;
     }
     false
@@ -239,13 +265,103 @@ mod tests {
 
     let mut right = Membership::new();
     right.merge_register(&register("a", 1, 12, MemberState::Active));
-    right.merge_register(&register("b", 1, 6, MemberState::Active));
+    // D1: at the same incarnation the Offline rumor outranks Active, so a
+    // revival must arrive with a higher incarnation (I2).
+    right.merge_register(&register("b", 2, 6, MemberState::Active));
 
     left.merge(&right);
 
     assert_eq!(left.get("a").unwrap().heartbeat(), 12);
     assert_eq!(left.get("b").unwrap().state(), MemberState::Active);
+    assert_eq!(left.get("b").unwrap().incarnation(), 2);
     assert_eq!(left.get("b").unwrap().heartbeat(), 6);
+  }
+
+  #[test]
+  fn offline_outranks_active_at_same_incarnation() {
+    let mut left = Membership::new();
+    left.merge_register(&register("b", 1, 5, MemberState::Offline));
+
+    let mut right = Membership::new();
+    right.merge_register(&register("b", 1, 6, MemberState::Active));
+
+    left.merge(&right);
+    assert_eq!(left.get("b").unwrap().state(), MemberState::Offline);
+
+    // Merge direction must not matter.
+    right.merge(&left);
+    assert_eq!(right.get("b").unwrap().state(), MemberState::Offline);
+  }
+
+  #[test]
+  fn equal_key_different_state_merge_is_commutative() {
+    // Same (incarnation, heartbeat), different states: the state rank decides
+    // regardless of merge direction (D1/I1).
+    for (lower, higher) in [
+      (MemberState::Active, MemberState::Suspected),
+      (MemberState::Suspected, MemberState::Offline),
+      (MemberState::Active, MemberState::Offline),
+    ] {
+      let a = register("x", 1, 10, lower);
+      let b = register("x", 1, 10, higher);
+
+      let mut ab = Membership::new();
+      ab.merge_register(&a);
+      ab.merge_register(&b);
+
+      let mut ba = Membership::new();
+      ba.merge_register(&b);
+      ba.merge_register(&a);
+
+      assert_eq!(ab, ba, "merge not commutative for {lower:?} vs {higher:?}");
+      assert_eq!(ab.get("x").unwrap().state(), higher);
+    }
+  }
+
+  #[test]
+  fn equal_key_label_conflict_resolves_deterministically() {
+    // Identical order keys but conflicting labels: the lexicographically
+    // larger map wins, so the outcome is direction-independent (D1/I1).
+    let mut labels_a = HashMap::new();
+    labels_a.insert("zone".to_string(), "a".to_string());
+    let mut labels_b = HashMap::new();
+    labels_b.insert("zone".to_string(), "b".to_string());
+
+    let a = register("x", 1, 10, MemberState::Active).with_labels(labels_a);
+    let b = register("x", 1, 10, MemberState::Active).with_labels(labels_b);
+
+    let mut ab = Membership::new();
+    ab.merge_register(&a);
+    ab.merge_register(&b);
+
+    let mut ba = Membership::new();
+    ba.merge_register(&b);
+    ba.merge_register(&a);
+
+    assert_eq!(ab, ba);
+    assert_eq!(
+      ab.get("x").unwrap().labels().get("zone"),
+      Some(&"b".to_string())
+    );
+  }
+
+  #[test]
+  fn version_tracks_hash_relevant_mutations() {
+    let mut m = Membership::new();
+    let v0 = m.version();
+
+    m.merge_register(&register("a", 1, 1, MemberState::Active));
+    let v1 = m.version();
+    assert!(v1 > v0, "register merge must bump the version");
+
+    // A pure heartbeat bump is invisible to the Merkle tree (D3), so the
+    // version — and any cached tree — stays put.
+    assert!(m.heartbeat("a", 2_000));
+    assert_eq!(m.version(), v1);
+
+    // A state transition changes the tree and must bump the version.
+    assert!(m.suspect("a", 3_000).is_some());
+    assert!(m.version() > v1);
   }
 
   #[test]
@@ -317,8 +433,10 @@ mod tests {
     membership.merge_register(&suspected);
     membership.merge_register(&offline);
 
+    // The Offline rank (D1), not a heartbeat trick, is what decides the merge:
+    // the winning register keeps its own low heartbeat.
     let merged = membership.get("a").unwrap();
     assert_eq!(merged.state(), MemberState::Offline);
-    assert!(merged.heartbeat() > suspected.heartbeat());
+    assert_eq!(merged.heartbeat(), 2);
   }
 }

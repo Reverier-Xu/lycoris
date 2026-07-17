@@ -1,10 +1,12 @@
 use std::{fs, path::Path};
 
-use lycoris_core::non_empty_string;
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 
-use crate::paths::default_data_dir;
+use crate::{
+  error::{ConfigError, InvalidAddressError},
+  paths::{default_daemon_config_path, default_data_dir},
+  validation::non_empty_string,
+};
 
 /// Node bootstrap configuration.
 ///
@@ -38,13 +40,30 @@ impl DaemonConfig {
     Ok(config)
   }
 
+  /// Load the daemon configuration from an explicit `path`, or — when `None`
+  /// — from the default configuration locations.
+  ///
+  /// A missing file at an explicit path surfaces as [`ConfigError::Io`]; a
+  /// missing file in the default locations surfaces as
+  /// [`ConfigError::NotFound`].
+  pub fn load(path: Option<&Path>) -> Result<Self, ConfigError> {
+    match path {
+      Some(path) => Self::from_file(path),
+      None => {
+        let path = default_daemon_config_path().ok_or(ConfigError::NotFound)?;
+        if !path.is_file() {
+          return Err(ConfigError::NotFound);
+        }
+        Self::from_file(&path)
+      }
+    }
+  }
+
   fn validate(&self) -> Result<(), ConfigError> {
     validate_cluster_address(&self.node.address)?;
     for (index, peer) in self.cluster.bootstrap_peers.iter().enumerate() {
-      validate_cluster_address(peer).map_err(|error| ConfigError::InvalidPeerAddress {
-        index,
-        source: error,
-      })?;
+      validate_cluster_address(peer)
+        .map_err(|source| ConfigError::InvalidPeerAddress { index, source })?;
     }
     Ok(())
   }
@@ -80,38 +99,14 @@ pub struct ClusterConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TlsConfig {
+  #[serde(deserialize_with = "non_empty_string")]
   pub ca_cert: String,
+  #[serde(deserialize_with = "non_empty_string")]
   pub ca_key: String,
+  #[serde(deserialize_with = "non_empty_string")]
   pub cert: String,
+  #[serde(deserialize_with = "non_empty_string")]
   pub key: String,
-}
-
-#[derive(Debug, Error)]
-pub enum ConfigError {
-  #[error("io error: {0}")]
-  Io(#[from] std::io::Error),
-  #[error("parse error: {0}")]
-  Parse(#[from] toml::de::Error),
-  #[error("serialize error: {0}")]
-  Serialize(#[from] toml::ser::Error),
-  #[error("node address '{address}' must start with https://")]
-  InvalidNodeAddress { address: String },
-  #[error("bootstrap peer at index {index} is not a valid https:// address: {source}")]
-  InvalidPeerAddress {
-    index: usize,
-    #[source]
-    source: InvalidAddressError,
-  },
-}
-
-#[derive(Debug, Error)]
-#[error("'{0}' must start with https://")]
-pub struct InvalidAddressError(String);
-
-impl InvalidAddressError {
-  fn into_address(self) -> String {
-    self.0
-  }
 }
 
 fn validate_cluster_address(address: &str) -> Result<(), InvalidAddressError> {
@@ -122,21 +117,11 @@ fn validate_cluster_address(address: &str) -> Result<(), InvalidAddressError> {
   }
 }
 
-impl From<InvalidAddressError> for ConfigError {
-  fn from(error: InvalidAddressError) -> Self {
-    Self::InvalidNodeAddress {
-      address: error.into_address(),
-    }
-  }
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
 
-  #[test]
-  fn parse_node_config() {
-    let toml = r#"
+  const VALID_TOML: &str = r#"
             data_dir = "data"
 
             [node]
@@ -153,7 +138,10 @@ mod tests {
             cert = "certs/node.crt"
             key = "certs/node.key"
         "#;
-    let cfg: DaemonConfig = toml::from_str(toml).unwrap();
+
+  #[test]
+  fn parse_node_config() {
+    let cfg: DaemonConfig = toml::from_str(VALID_TOML).unwrap();
     assert_eq!(cfg.node.id, "node-01");
     assert_eq!(cfg.cluster.bootstrap_peers.len(), 1);
     assert_eq!(cfg.data_dir, "data");
@@ -161,24 +149,53 @@ mod tests {
 
   #[test]
   fn reject_empty_node_id() {
-    let toml = r#"
-            data_dir = "data"
-
-            [node]
-            id = ""
-            address = "https://127.0.0.1:5001"
-
-            [cluster]
-            listen_address = "0.0.0.0:5001"
-            bootstrap_peers = []
-
-            [tls]
-            ca_cert = "c"
-            ca_key = "ck"
-            cert = "c"
-            key = "k"
-        "#;
-    let result: Result<DaemonConfig, _> = toml::from_str(toml);
+    let toml = VALID_TOML.replace("node-01", "");
+    let result: Result<DaemonConfig, _> = toml::from_str(&toml);
     assert!(result.is_err());
+  }
+
+  #[test]
+  fn reject_empty_tls_field() {
+    let toml = VALID_TOML.replace("certs/ca.key", "");
+    let result: Result<DaemonConfig, _> = toml::from_str(&toml);
+    assert!(result.is_err());
+  }
+
+  #[test]
+  fn reject_non_https_node_address() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("lycoris.toml");
+    fs::write(
+      &path,
+      VALID_TOML.replace("https://127.0.0.1:5001\"", "http://127.0.0.1:5001\""),
+    )
+    .unwrap();
+    let error = DaemonConfig::from_file(&path).unwrap_err();
+    assert!(
+      matches!(error, ConfigError::InvalidNodeAddress { .. }),
+      "expected InvalidNodeAddress, got {error}"
+    );
+  }
+
+  #[test]
+  fn reject_non_https_bootstrap_peer_with_index() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("lycoris.toml");
+    fs::write(
+      &path,
+      VALID_TOML.replace("https://127.0.0.1:5002", "http://127.0.0.1:5002"),
+    )
+    .unwrap();
+    let error = DaemonConfig::from_file(&path).unwrap_err();
+    match error {
+      ConfigError::InvalidPeerAddress { index, source } => {
+        assert_eq!(index, 0);
+        assert_eq!(
+          source.to_string(),
+          "'http://127.0.0.1:5002' must start with https://"
+        );
+      }
+      other => panic!("expected InvalidPeerAddress, got {other}"),
+    }
   }
 }

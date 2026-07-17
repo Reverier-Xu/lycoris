@@ -7,10 +7,11 @@ use std::{
 
 use lycoris_client::{ClusterClient, PeerClient};
 use lycoris_config::{ClusterConfig, DaemonConfig, NodeConfig, TlsConfig};
-use lycoris_core::{ClusterKey, DEFAULT_EMBEDDING_DIM, now_ms};
-use lycoris_proto::node::ResourceKind;
+use lycoris_core::{ClusterKey, now_ms};
+use lycoris_proto::node::{NodeInfo, ResourceKind, ResourceScope as ProtoResourceScope};
 use lycoris_storage::{
-  MemoryEntry, ResourceScope, SkillRecord, Storage, VersionedContentStore, WorkspaceRecord,
+  DEFAULT_EMBEDDING_DIM, MemoryEntry, ResourceScope, SkillRecord, Storage, VersionedContentStore,
+  WorkspaceRecord,
 };
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
 use tempfile::TempDir;
@@ -40,7 +41,11 @@ async fn wait_for_node(client: &mut ClusterClient, node_id: &str, timeout: Durat
 
 async fn list_node_ids(client: &mut ClusterClient) -> Vec<String> {
   client
-    .list_resources(ResourceKind::Node, HashMap::new(), String::new())
+    .list_resources(
+      ResourceKind::Node,
+      HashMap::new(),
+      ProtoResourceScope::Unspecified,
+    )
     .await
     .expect("list resources failed")
     .into_iter()
@@ -88,30 +93,10 @@ fn generate_test_certs(
   (dir, ca_cert_path, ca_key_path, cert_paths, key_paths)
 }
 
-fn client_tls_config(
+fn client_tls_bundle(
   cert_path: &std::path::Path, key_path: &std::path::Path, ca_path: &std::path::Path,
-) -> tonic::transport::ClientTlsConfig {
-  lycoris_tls::load_tls_bundle(cert_path, key_path, ca_path)
-    .unwrap()
-    .client_config()
-}
-
-fn proto_node_info(
-  id: impl Into<String>, address: impl Into<String>,
-) -> lycoris_proto::node::NodeInfo {
-  use lycoris_core::now_ms;
-  lycoris_proto::node::NodeInfo {
-    id: id.into(),
-    address: address.into(),
-    labels: HashMap::new(),
-    annotations: HashMap::new(),
-    last_heartbeat_unix_ms: now_ms(),
-    state: "active".to_string(),
-    incarnation: 1,
-    heartbeat: 0,
-    in_degree: Vec::new(),
-    out_degree: Vec::new(),
-  }
+) -> lycoris_tls::TlsBundle {
+  lycoris_tls::load_tls_bundle(cert_path, key_path, ca_path).unwrap()
 }
 
 fn spawn_runtime(config: DaemonConfig, key: ClusterKey) {
@@ -195,9 +180,9 @@ async fn registry_converges_across_three_node_chain() {
   time::sleep(Duration::from_millis(300)).await;
 
   // Register an external node through node-0.
-  let client_tls = client_tls_config(&cert_paths[0], &key_paths[0], &ca_cert_path);
+  let client_tls = client_tls_bundle(&cert_paths[0], &key_paths[0], &ca_cert_path);
   let node0_url = format!("https://127.0.0.1:{base_port}");
-  let mut client = ClusterClient::connect_with_tls(&node0_url, client_tls)
+  let mut client = ClusterClient::connect(&node0_url, &client_tls)
     .await
     .expect("failed to connect to node-0")
     .with_cluster_key(key_hex.clone());
@@ -205,22 +190,21 @@ async fn registry_converges_across_three_node_chain() {
   let external_dir = TempDir::new().unwrap();
   let _external_storage =
     Storage::open(external_dir.path().join("external.redb")).expect("open external storage");
-  let external = proto_node_info(
+  let external = NodeInfo::new(
     "external-node".to_string(),
     format!("127.0.0.1:{}", base_port + 99),
+    HashMap::new(),
+    HashMap::new(),
   );
-  client
-    .register(external, &key_hex)
-    .await
-    .expect("register failed");
+  client.register(external).await.expect("register failed");
 
   // Wait for push + anti-entropy to propagate through the chain.
   time::sleep(Duration::from_millis(10000)).await;
 
   // Query node-2 (the far end of the chain) and verify it knows external-node.
-  let client_tls = client_tls_config(&cert_paths[2], &key_paths[2], &ca_cert_path);
+  let client_tls = client_tls_bundle(&cert_paths[2], &key_paths[2], &ca_cert_path);
   let node2_url = format!("https://127.0.0.1:{}", base_port + 2);
-  let mut client = ClusterClient::connect_with_tls(&node2_url, client_tls)
+  let mut client = ClusterClient::connect(&node2_url, &client_tls)
     .await
     .expect("failed to connect to node-2")
     .with_cluster_key(key_hex.clone());
@@ -295,8 +279,8 @@ async fn primary_failure_falls_back_and_promotes() {
 
   // Point node-0's primary at an unreachable address.
   let node0_url = format!("https://127.0.0.1:{base_port}");
-  let client_tls = client_tls_config(&cert_paths[0], &key_paths[0], &ca_cert_path);
-  let mut client = ClusterClient::connect_with_tls(&node0_url, client_tls.clone())
+  let client_tls = client_tls_bundle(&cert_paths[0], &key_paths[0], &ca_cert_path);
+  let mut client = ClusterClient::connect(&node0_url, &client_tls)
     .await
     .expect("failed to connect to node-0")
     .with_cluster_key(key_hex.clone());
@@ -310,20 +294,19 @@ async fn primary_failure_falls_back_and_promotes() {
   let external_dir = TempDir::new().unwrap();
   let _external_storage =
     Storage::open(external_dir.path().join("external.redb")).expect("open external storage");
-  let external = proto_node_info(
+  let external = NodeInfo::new(
     "fallback-external-node".to_string(),
     format!("127.0.0.1:{}", base_port + 99),
+    HashMap::new(),
+    HashMap::new(),
   );
-  client
-    .register(external, &key_hex)
-    .await
-    .expect("register failed");
+  client.register(external).await.expect("register failed");
 
   time::sleep(Duration::from_millis(5500)).await;
 
   // Verify node-1 received the external node via fallback sync.
   let node1_url = format!("https://127.0.0.1:{}", base_port + 1);
-  let mut client = ClusterClient::connect_with_tls(&node1_url, client_tls)
+  let mut client = ClusterClient::connect(&node1_url, &client_tls)
     .await
     .expect("failed to connect to node-1")
     .with_cluster_key(key_hex.clone());
@@ -385,8 +368,8 @@ async fn partition_merge_reconciles_bidirectional_membership() {
 
   let node0_url = format!("https://127.0.0.1:{base_port}");
   let node1_url = format!("https://127.0.0.1:{}", base_port + 1);
-  let client_tls = client_tls_config(&cert_paths[0], &key_paths[0], &ca_cert_path);
-  let mut client = ClusterClient::connect_with_tls(&node0_url, client_tls.clone())
+  let client_tls = client_tls_bundle(&cert_paths[0], &key_paths[0], &ca_cert_path);
+  let mut client = ClusterClient::connect(&node0_url, &client_tls)
     .await
     .expect("failed to connect to node-0")
     .with_cluster_key(key_hex.clone());
@@ -394,29 +377,33 @@ async fn partition_merge_reconciles_bidirectional_membership() {
   let alpha_dir = TempDir::new().unwrap();
   let _alpha_storage =
     Storage::open(alpha_dir.path().join("alpha.redb")).expect("open alpha storage");
-  let alpha = proto_node_info("alpha".to_string(), format!("127.0.0.1:{}", base_port + 98));
-  client
-    .register(alpha, &key_hex)
-    .await
-    .expect("register alpha failed");
+  let alpha = NodeInfo::new(
+    "alpha".to_string(),
+    format!("127.0.0.1:{}", base_port + 98),
+    HashMap::new(),
+    HashMap::new(),
+  );
+  client.register(alpha).await.expect("register alpha failed");
 
-  let mut client = ClusterClient::connect_with_tls(&node1_url, client_tls.clone())
+  let mut client = ClusterClient::connect(&node1_url, &client_tls)
     .await
     .expect("failed to connect to node-1")
     .with_cluster_key(key_hex.clone());
 
   let beta_dir = TempDir::new().unwrap();
   let _beta_storage = Storage::open(beta_dir.path().join("beta.redb")).expect("open beta storage");
-  let beta = proto_node_info("beta".to_string(), format!("127.0.0.1:{}", base_port + 97));
-  client
-    .register(beta, &key_hex)
-    .await
-    .expect("register beta failed");
+  let beta = NodeInfo::new(
+    "beta".to_string(),
+    format!("127.0.0.1:{}", base_port + 97),
+    HashMap::new(),
+    HashMap::new(),
+  );
+  client.register(beta).await.expect("register beta failed");
 
   time::sleep(Duration::from_millis(1500)).await;
 
   for url in [&node0_url, &node1_url] {
-    let mut client = ClusterClient::connect_with_tls(url, client_tls.clone())
+    let mut client = ClusterClient::connect(url, &client_tls)
       .await
       .expect("failed to connect")
       .with_cluster_key(key_hex.clone());
@@ -474,8 +461,8 @@ async fn failure_detector_marks_unresponsive_peer() {
 
   let node0_url = format!("https://127.0.0.1:{base_port}");
   let _node1_url = format!("https://127.0.0.1:{}", base_port + 1);
-  let client_tls = client_tls_config(&cert_paths[0], &key_paths[0], &ca_cert_path);
-  let mut client = ClusterClient::connect_with_tls(&node0_url, client_tls.clone())
+  let client_tls = client_tls_bundle(&cert_paths[0], &key_paths[0], &ca_cert_path);
+  let mut client = ClusterClient::connect(&node0_url, &client_tls)
     .await
     .expect("failed to connect to node-0")
     .with_cluster_key(key_hex.clone());
@@ -489,9 +476,7 @@ async fn failure_detector_marks_unresponsive_peer() {
   // (1s interval + 3s timeout per failure = ~11s).
   time::sleep(Duration::from_secs(12)).await;
 
-  let tls_bundle = lycoris_tls::load_tls_bundle(&cert_paths[0], &key_paths[0], &ca_cert_path)
-    .expect("load tls bundle");
-  let mut peer = PeerClient::connect(&node0_url, &tls_bundle)
+  let mut peer = PeerClient::connect(&node0_url, &client_tls)
     .await
     .expect("failed to connect membership client");
   let registers = peer
@@ -501,7 +486,8 @@ async fn failure_detector_marks_unresponsive_peer() {
     .expect("fetch_registers failed");
   assert_eq!(registers.len(), 1);
   assert_eq!(
-    registers[0].state, "suspected",
+    registers[0].state,
+    lycoris_proto::node::NodeState::Suspected as i32,
     "node-1 should be suspected after probes time out"
   );
 }
@@ -576,8 +562,8 @@ async fn shared_skills_replicate_via_anti_entropy() {
   time::sleep(Duration::from_millis(300)).await;
 
   let node2_url = format!("https://127.0.0.1:{}", base_port + 2);
-  let client_tls = client_tls_config(&cert_paths[2], &key_paths[2], &ca_cert_path);
-  let mut client = ClusterClient::connect_with_tls(&node2_url, client_tls)
+  let client_tls = client_tls_bundle(&cert_paths[2], &key_paths[2], &ca_cert_path);
+  let mut client = ClusterClient::connect(&node2_url, &client_tls)
     .await
     .expect("failed to connect to node-2")
     .with_cluster_key(key_hex.clone());
@@ -585,7 +571,11 @@ async fn shared_skills_replicate_via_anti_entropy() {
   let start = std::time::Instant::now();
   loop {
     let resources = client
-      .list_resources(ResourceKind::Skill, HashMap::new(), String::new())
+      .list_resources(
+        ResourceKind::Skill,
+        HashMap::new(),
+        ProtoResourceScope::Unspecified,
+      )
       .await
       .expect("list skills failed");
     let found = resources.iter().any(|resource| {
@@ -611,7 +601,7 @@ async fn wait_for_resource(
   let start = std::time::Instant::now();
   loop {
     let resources = client
-      .list_resources(kind, HashMap::new(), String::new())
+      .list_resources(kind, HashMap::new(), ProtoResourceScope::Unspecified)
       .await
       .expect("list resources failed");
     if resources.iter().any(|resource| {
@@ -729,8 +719,8 @@ async fn shared_memories_replicate_via_anti_entropy() {
   time::sleep(Duration::from_millis(300)).await;
 
   let node2_url = format!("https://127.0.0.1:{}", base_port + 2);
-  let client_tls = client_tls_config(&cert_paths[2], &key_paths[2], &ca_cert_path);
-  let mut client = ClusterClient::connect_with_tls(&node2_url, client_tls)
+  let client_tls = client_tls_bundle(&cert_paths[2], &key_paths[2], &ca_cert_path);
+  let mut client = ClusterClient::connect(&node2_url, &client_tls)
     .await
     .expect("failed to connect to node-2")
     .with_cluster_key(key_hex.clone());
@@ -798,8 +788,8 @@ async fn shared_workspaces_replicate_via_anti_entropy() {
   time::sleep(Duration::from_millis(300)).await;
 
   let node2_url = format!("https://127.0.0.1:{}", base_port + 2);
-  let client_tls = client_tls_config(&cert_paths[2], &key_paths[2], &ca_cert_path);
-  let mut client = ClusterClient::connect_with_tls(&node2_url, client_tls)
+  let client_tls = client_tls_bundle(&cert_paths[2], &key_paths[2], &ca_cert_path);
+  let mut client = ClusterClient::connect(&node2_url, &client_tls)
     .await
     .expect("failed to connect to node-2")
     .with_cluster_key(key_hex.clone());
@@ -874,8 +864,8 @@ async fn local_resources_do_not_replicate() {
   time::sleep(Duration::from_millis(300)).await;
 
   let node1_url = format!("https://127.0.0.1:{}", base_port + 1);
-  let client_tls = client_tls_config(&cert_paths[1], &key_paths[1], &ca_cert_path);
-  let mut client = ClusterClient::connect_with_tls(&node1_url, client_tls)
+  let client_tls = client_tls_bundle(&cert_paths[1], &key_paths[1], &ca_cert_path);
+  let mut client = ClusterClient::connect(&node1_url, &client_tls)
     .await
     .expect("failed to connect to node-1")
     .with_cluster_key(key_hex.clone());
@@ -883,7 +873,11 @@ async fn local_resources_do_not_replicate() {
   time::sleep(Duration::from_secs(2)).await;
 
   let memories = client
-    .list_resources(ResourceKind::Memory, HashMap::new(), String::new())
+    .list_resources(
+      ResourceKind::Memory,
+      HashMap::new(),
+      ProtoResourceScope::Unspecified,
+    )
     .await
     .expect("list memories failed");
   assert!(
@@ -898,7 +892,11 @@ async fn local_resources_do_not_replicate() {
   );
 
   let workspaces = client
-    .list_resources(ResourceKind::Workspace, HashMap::new(), String::new())
+    .list_resources(
+      ResourceKind::Workspace,
+      HashMap::new(),
+      ProtoResourceScope::Unspecified,
+    )
     .await
     .expect("list workspaces failed");
   assert!(
@@ -1006,8 +1004,8 @@ async fn partition_merge_reconciles_shared_resources() {
   time::sleep(Duration::from_millis(300)).await;
 
   let node1_url = format!("https://127.0.0.1:{}", base_port + 1);
-  let client_tls = client_tls_config(&cert_paths[1], &key_paths[1], &ca_cert_path);
-  let mut client = ClusterClient::connect_with_tls(&node1_url, client_tls)
+  let client_tls = client_tls_bundle(&cert_paths[1], &key_paths[1], &ca_cert_path);
+  let mut client = ClusterClient::connect(&node1_url, &client_tls)
     .await
     .expect("failed to connect to node-1")
     .with_cluster_key(key_hex.clone());
@@ -1095,8 +1093,8 @@ async fn workspace_content_hash_verifies_on_apply() {
   time::sleep(Duration::from_millis(300)).await;
 
   let node1_url = format!("https://127.0.0.1:{}", base_port + 1);
-  let client_tls = client_tls_config(&cert_paths[1], &key_paths[1], &ca_cert_path);
-  let mut client = ClusterClient::connect_with_tls(&node1_url, client_tls)
+  let client_tls = client_tls_bundle(&cert_paths[1], &key_paths[1], &ca_cert_path);
+  let mut client = ClusterClient::connect(&node1_url, &client_tls)
     .await
     .expect("failed to connect to node-1")
     .with_cluster_key(key_hex.clone());
@@ -1163,8 +1161,8 @@ async fn memory_content_hash_verifies_on_apply() {
   time::sleep(Duration::from_millis(300)).await;
 
   let node1_url = format!("https://127.0.0.1:{}", base_port + 1);
-  let client_tls = client_tls_config(&cert_paths[1], &key_paths[1], &ca_cert_path);
-  let mut client = ClusterClient::connect_with_tls(&node1_url, client_tls)
+  let client_tls = client_tls_bundle(&cert_paths[1], &key_paths[1], &ca_cert_path);
+  let mut client = ClusterClient::connect(&node1_url, &client_tls)
     .await
     .expect("failed to connect to node-1")
     .with_cluster_key(key_hex.clone());
@@ -1233,8 +1231,8 @@ async fn memory_recall_works_after_replication() {
   time::sleep(Duration::from_millis(300)).await;
 
   let node1_url = format!("https://127.0.0.1:{}", base_port + 1);
-  let client_tls = client_tls_config(&cert_paths[1], &key_paths[1], &ca_cert_path);
-  let mut client = ClusterClient::connect_with_tls(&node1_url, client_tls)
+  let client_tls = client_tls_bundle(&cert_paths[1], &key_paths[1], &ca_cert_path);
+  let mut client = ClusterClient::connect(&node1_url, &client_tls)
     .await
     .expect("failed to connect to node-1")
     .with_cluster_key(key_hex.clone());

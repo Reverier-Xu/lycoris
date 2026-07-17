@@ -33,16 +33,28 @@ impl MemberState {
       MemberState::Offline => 3,
     }
   }
-}
 
-const OFFLINE_HEARTBEAT_BUMP: u64 = 1_000_000;
+  /// Rank of the state in the CRDT merge order:
+  /// `Active < Suspected < Leaving < Offline`.
+  ///
+  /// Within one incarnation a more severe rumor always wins, so an `Offline`
+  /// rumor cannot be overwritten by a concurrent `Suspected`/`Active` register
+  /// with a higher heartbeat; only a higher incarnation (e.g. the node
+  /// refuting the rumor about itself) revives it. The numeric values match
+  /// `as_u8`, but the two serve different purposes: `rank` drives merge
+  /// ordering, `as_u8` is the hash serialization.
+  pub fn rank(self) -> u8 {
+    self.as_u8()
+  }
+}
 
 /// A single node's membership register.
 ///
 /// This is the unit of replication. Each node owns its own register and
 /// monotonically increases `incarnation` on restart and `heartbeat` on every
-/// update. The pair `(incarnation, heartbeat)` gives a total order for the
-/// same `node_id`, which makes merge deterministic and CRDT-safe.
+/// update. The triple `(incarnation, state_rank, heartbeat)` gives a total
+/// order for the same `node_id` (D1), which makes merge deterministic and
+/// CRDT-safe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberRegister {
   node_id: String,
@@ -117,19 +129,9 @@ impl MemberRegister {
     self.state = state;
   }
 
-  /// Set the cluster address.
-  pub fn set_address(&mut self, address: impl Into<String>) {
-    self.address = address.into();
-  }
-
   /// Set the incarnation.
   pub fn set_incarnation(&mut self, incarnation: u64) {
     self.incarnation = incarnation;
-  }
-
-  /// Set the heartbeat counter.
-  pub fn set_heartbeat(&mut self, heartbeat: u64) {
-    self.heartbeat = heartbeat;
   }
 
   /// Replace the label map.
@@ -159,18 +161,6 @@ impl MemberRegister {
     self
   }
 
-  /// Builder: set the incarnation.
-  pub fn with_incarnation(mut self, incarnation: u64) -> Self {
-    self.incarnation = incarnation;
-    self
-  }
-
-  /// Builder: set the heartbeat counter.
-  pub fn with_heartbeat(mut self, heartbeat: u64) -> Self {
-    self.heartbeat = heartbeat;
-    self
-  }
-
   /// Builder: replace the label map.
   pub fn with_labels(mut self, labels: HashMap<String, String>) -> Self {
     self.labels = labels;
@@ -189,23 +179,32 @@ impl MemberRegister {
     self
   }
 
+  /// Return the total-order key used for CRDT merges (D1):
+  /// `(incarnation, state_rank, heartbeat)`, lexicographic, larger wins.
+  ///
+  /// `state_rank` orders `Active < Suspected < Leaving < Offline`, so within
+  /// one incarnation a more severe rumor always wins and a node revives only
+  /// by refuting with a higher incarnation. `heartbeat` is only the final
+  /// tiebreak between registers with identical incarnation and state.
+  fn order_key(&self) -> (u64, u8, u64) {
+    (self.incarnation, self.state.rank(), self.heartbeat)
+  }
+
   /// Return true if `self` dominates `other` according to CRDT ordering.
   ///
-  /// Ordering: higher incarnation wins; if equal, higher heartbeat wins. This
-  /// is a total preorder per node. `updated_at_ms` is intentionally not used
-  /// as a tiebreaker because wall clocks are unreliable across partitions.
+  /// `updated_at_ms` is intentionally not part of the order because wall
+  /// clocks are unreliable across partitions.
   pub fn dominates(&self, other: &Self) -> bool {
-    if self.incarnation != other.incarnation {
-      return self.incarnation > other.incarnation;
-    }
-    self.heartbeat > other.heartbeat
+    self.order_key() > other.order_key()
   }
 
   /// Merge another register into this one, keeping the dominant state.
   ///
   /// If one register clearly dominates, its full state wins so that stale
-  /// duplicates cannot revert newer labels or annotations. Only when the two
-  /// registers are equivalent in ordering are the maps merged defensively.
+  /// duplicates cannot revert newer labels or annotations. When the two
+  /// registers are equivalent under the total order, conflicting metadata is
+  /// resolved field-by-field with deterministic rules (see below), which
+  /// makes merge commutative, associative, and idempotent (I1).
   pub fn merge(&mut self, other: &Self) {
     if other.dominates(self) {
       *self = other.clone();
@@ -217,9 +216,20 @@ impl MemberRegister {
       return;
     }
 
-    // Same ordering: merge all maps and keep the more recent timestamp.
-    self.labels.extend(other.labels.clone());
-    self.annotations.extend(other.annotations.clone());
+    // Equal order keys (same incarnation, state, and heartbeat): resolve each
+    // field independently with an order-independent "larger value wins" rule.
+    // For maps this compares the key-sorted entry sequences lexicographically
+    // and takes the larger map as a whole, so the outcome never depends on
+    // merge direction.
+    if other.address > self.address {
+      self.address.clone_from(&other.address);
+    }
+    if canonical_map_cmp(&other.labels, &self.labels) == std::cmp::Ordering::Greater {
+      self.labels.clone_from(&other.labels);
+    }
+    if canonical_map_cmp(&other.annotations, &self.annotations) == std::cmp::Ordering::Greater {
+      self.annotations.clone_from(&other.annotations);
+    }
     self.updated_at_ms = self.updated_at_ms.max(other.updated_at_ms);
   }
 
@@ -255,12 +265,12 @@ impl MemberRegister {
 
   /// Mark the node as confirmed failed or departed.
   ///
-  /// The heartbeat is bumped by a large constant so that, within the same
-  /// incarnation, an `Offline` register dominates any concurrent `Suspected`
-  /// register and cannot be accidentally downgraded back to `Suspected`.
+  /// The `Offline` state's higher rank in the merge order (D1) is what makes
+  /// this register dominate any concurrent `Suspected`/`Active` register with
+  /// the same incarnation; no heartbeat inflation is needed.
   pub fn offline(&mut self, now_ms: i64) {
     self.state = MemberState::Offline;
-    self.heartbeat = self.heartbeat.saturating_add(OFFLINE_HEARTBEAT_BUMP);
+    self.heartbeat = self.heartbeat.saturating_add(1);
     self.updated_at_ms = now_ms;
   }
 
@@ -283,4 +293,18 @@ impl MemberRegister {
     self.state = MemberState::Active;
     self.updated_at_ms = now_ms;
   }
+}
+
+/// Compare two label/annotation maps deterministically: entries are sorted by
+/// key and the resulting sequences are compared lexicographically. Used by
+/// `MemberRegister::merge` to resolve conflicts between registers with equal
+/// order keys without depending on merge direction.
+fn canonical_map_cmp(
+  a: &HashMap<String, String>, b: &HashMap<String, String>,
+) -> std::cmp::Ordering {
+  let mut a_sorted: Vec<(&String, &String)> = a.iter().collect();
+  a_sorted.sort();
+  let mut b_sorted: Vec<(&String, &String)> = b.iter().collect();
+  b_sorted.sort();
+  a_sorted.cmp(&b_sorted)
 }

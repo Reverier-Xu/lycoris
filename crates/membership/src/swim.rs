@@ -110,13 +110,6 @@ impl Swim {
     &mut self.membership
   }
 
-  /// Record a heartbeat for `node_id` at `now_ms`.
-  ///
-  /// This updates the CRDT register (if the node is already known).
-  pub fn heartbeat(&mut self, node_id: &str, now_ms: i64) {
-    self.membership.heartbeat(node_id, now_ms);
-  }
-
   /// Process an incoming SWIM message from `from`.
   pub fn on_message(&mut self, from: &str, message: SwimMessage, now_ms: i64) -> Vec<SwimAction> {
     match message {
@@ -126,15 +119,15 @@ impl Swim {
           seq,
         }]
       }
-      SwimMessage::Ack { seq } => self.handle_ack(seq, now_ms),
+      SwimMessage::Ack { seq } => {
+        self.handle_ack(seq);
+        Vec::new()
+      }
       SwimMessage::Suspect {
         node_id,
         incarnation,
       } => self.handle_suspect_state(&node_id, incarnation, now_ms),
-      SwimMessage::Alive { register } => {
-        self.handle_alive_state(&register, now_ms);
-        Vec::new()
-      }
+      SwimMessage::Alive { register } => self.handle_alive_state(&register, now_ms),
       SwimMessage::Leave {
         node_id,
         incarnation,
@@ -149,6 +142,11 @@ impl Swim {
   ///
   /// Callers should drive this method from a periodic tick loop.
   pub fn tick(&mut self, now_ms: i64) -> Vec<SwimAction> {
+    // Heartbeat ownership (D2): only the node itself bumps its own heartbeat,
+    // once per probe round. The counter is the final tiebreak of the merge
+    // order and is excluded from the Merkle hash (D3), so this bump neither
+    // triggers anti-entropy exchanges nor needs to be gossiped on its own.
+    self.membership.heartbeat(&self.local_node_id, now_ms);
     let now_u64 = u64::try_from(now_ms).unwrap_or(0);
     let mut actions = self.check_timeouts(now_u64, now_ms);
     actions.extend(self.check_suspect_timeouts(now_ms));
@@ -191,37 +189,42 @@ impl Swim {
     }
   }
 
-  fn handle_ack(&mut self, seq: u64, now_ms: i64) -> Vec<SwimAction> {
-    let Some(pending) = self.pending_pings.remove(&seq) else {
-      return Vec::new();
-    };
-
-    let target = pending.target;
-    self.consecutive_failures.remove(&target);
-    self.heartbeat(&target, now_ms);
-
-    let mut actions = Vec::new();
-    if let Some(register) = self.membership.get(&target)
-      && register.state() == MemberState::Suspected
-    {
-      actions.push(SwimAction::Broadcast(SwimMessage::Alive {
-        register: register.clone(),
-      }));
+  /// Record a successful probe.
+  ///
+  /// An ack only updates local probe bookkeeping: it clears the pending entry
+  /// and resets the consecutive-failure counter. It never bumps the peer's
+  /// heartbeat — heartbeat ownership stays with the node itself (D2).
+  ///
+  /// Suspicion clearing follows the faithful SWIM+Suspicion model: a
+  /// `Suspected` view is only cleared by an `Alive` register with a higher
+  /// incarnation (i.e. the suspected node refuting the rumor itself), never
+  /// directly by an ack. An ack-driven clear cannot converge under the D1
+  /// merge order anyway: `Active` ranks below `Suspected` at the same
+  /// incarnation, so any peer still holding the suspicion rumor would win the
+  /// next merge and reinstate it.
+  fn handle_ack(&mut self, seq: u64) {
+    if let Some(pending) = self.pending_pings.remove(&seq) {
+      self.consecutive_failures.remove(&pending.target);
     }
-    actions
   }
 
   fn handle_suspect_state(
     &mut self, node_id: &str, incarnation: u64, now_ms: i64,
   ) -> Vec<SwimAction> {
     if node_id == self.local_node_id {
-      self.membership.refute(node_id, now_ms);
-      if let Some(register) = self.membership.get(node_id) {
-        return vec![SwimAction::Broadcast(SwimMessage::Alive {
-          register: register.clone(),
-        })];
+      // Refute only rumors that are not older than our own incarnation: an
+      // older rumor is an echo of a state we already refuted, and answering
+      // it again would needlessly inflate the incarnation counter. A node
+      // that declared `Leaving` never refutes — leaving is its own choice.
+      let dominated = self
+        .membership
+        .get(node_id)
+        .map(|local| local.state() != MemberState::Leaving && incarnation >= local.incarnation())
+        .unwrap_or(false);
+      if !dominated {
+        return Vec::new();
       }
-      return Vec::new();
+      return self.refute_and_broadcast(now_ms);
     }
 
     if let Some(existing) = self.membership.get(node_id) {
@@ -236,12 +239,45 @@ impl Swim {
     Vec::new()
   }
 
-  fn handle_alive_state(&mut self, register: &MemberRegister, now_ms: i64) {
+  fn handle_alive_state(&mut self, register: &MemberRegister, now_ms: i64) -> Vec<SwimAction> {
     if register.node_id() == self.local_node_id {
-      return;
+      return self.refute_if_dominated(register, now_ms);
     }
     self.membership.merge_register(register);
-    let _ = now_ms;
+    Vec::new()
+  }
+
+  /// Handle a rumor about the local node carried by an `Alive` message (the
+  /// register's state may be `Suspected`, `Leaving`, or `Offline`; gossiped
+  /// `Alive` messages are the propagation channel for all state changes).
+  ///
+  /// A non-`Active` rumor whose order key is not below the local register's
+  /// key is refuted by bumping the incarnation and broadcasting the fresh
+  /// `Active` register (D4). `Active` rumors need no refutation, and a local
+  /// node that declared `Leaving` never refutes — leaving is its own choice.
+  fn refute_if_dominated(&mut self, rumor: &MemberRegister, now_ms: i64) -> Vec<SwimAction> {
+    if rumor.state() == MemberState::Active {
+      return Vec::new();
+    }
+    let Some(local) = self.membership.get(&self.local_node_id) else {
+      return Vec::new();
+    };
+    if local.state() == MemberState::Leaving || local.dominates(rumor) {
+      return Vec::new();
+    }
+    self.refute_and_broadcast(now_ms)
+  }
+
+  /// Bump the local incarnation to override a rumor about ourselves and
+  /// broadcast the resulting `Active` register.
+  fn refute_and_broadcast(&mut self, now_ms: i64) -> Vec<SwimAction> {
+    self.membership.refute(&self.local_node_id, now_ms);
+    match self.membership.get(&self.local_node_id) {
+      Some(register) => vec![SwimAction::Broadcast(SwimMessage::Alive {
+        register: register.clone(),
+      })],
+      None => Vec::new(),
+    }
   }
 
   fn handle_leave_state(&mut self, node_id: &str, incarnation: u64, now_ms: i64) {
@@ -256,12 +292,9 @@ impl Swim {
       return;
     }
 
-    // A Leave rumor for the same incarnation must not revive a node that has
-    // already been confirmed Offline.
-    if existing.incarnation() == incarnation && existing.state() == MemberState::Offline {
-      return;
-    }
-
+    // No special-casing for an existing `Offline` register: in the D1 merge
+    // order `Offline` outranks `Leaving` at the same incarnation, so a Leave
+    // rumor cannot revive an Offline node — the merge below is a no-op then.
     let mut register = existing.clone();
     register.set_incarnation(incarnation);
     register.leave(now_ms);
@@ -273,7 +306,7 @@ impl Swim {
     let timed_out: Vec<u64> = self
       .pending_pings
       .iter()
-      .filter(|(_, pending)| now_u64 - pending.sent_at >= self.config.ping_timeout_ms)
+      .filter(|(_, pending)| now_u64.saturating_sub(pending.sent_at) >= self.config.ping_timeout_ms)
       .map(|(seq, _)| *seq)
       .collect();
 
@@ -300,11 +333,21 @@ impl Swim {
       .map(|register| register.node_id().to_string())
       .collect();
 
+    let mut actions = Vec::new();
     for node_id in expired {
-      self.membership.offline(&node_id, now_ms);
+      // The Suspected -> Offline transition is disseminated (D4) so the whole
+      // cluster converges on the failure verdict instead of rediscovering it
+      // node by node. Gossiped `Alive` messages carry full registers, so the
+      // `Offline` state rides the same broadcast path as `Active` updates.
+      if self.membership.offline(&node_id, now_ms)
+        && let Some(register) = self.membership.get(&node_id)
+      {
+        actions.push(SwimAction::Broadcast(SwimMessage::Alive {
+          register: register.clone(),
+        }));
+      }
     }
-
-    Vec::new()
+    actions
   }
 
   fn mark_suspected(&mut self, target: &str, now_ms: i64) -> Vec<SwimAction> {
@@ -347,10 +390,6 @@ impl Swim {
       seq,
     })
   }
-
-  pub fn local_node_id(&self) -> &str {
-    &self.local_node_id
-  }
 }
 
 #[cfg(test)]
@@ -376,7 +415,7 @@ mod tests {
   }
 
   #[test]
-  fn ack_records_heartbeat_and_clears_pending() {
+  fn ack_clears_pending_and_failures_without_bumping_peer_heartbeat() {
     let mut swim = Swim::new("local", SwimConfig::default(), local_register("local"));
     swim.membership.merge_register(&peer_register("peer"));
 
@@ -386,10 +425,30 @@ mod tests {
       _ => panic!("expected ping"),
     };
 
+    let heartbeat_before = swim.membership.get("peer").unwrap().heartbeat();
     let ack_actions = swim.on_message("peer", SwimMessage::Ack { seq }, 1_100);
     assert!(ack_actions.is_empty());
     assert!(swim.pending_pings.is_empty());
-    assert!(swim.membership.get("peer").unwrap().heartbeat() > 0);
+    // D2: an ack never bumps the peer's heartbeat; only the peer itself may.
+    assert_eq!(
+      swim.membership.get("peer").unwrap().heartbeat(),
+      heartbeat_before
+    );
+  }
+
+  #[test]
+  fn local_node_bumps_own_heartbeat_each_tick() {
+    let mut swim = Swim::new("local", SwimConfig::default(), local_register("local"));
+
+    let _ = swim.tick(1_000);
+    assert_eq!(swim.membership.get("local").unwrap().heartbeat(), 1);
+    let _ = swim.tick(2_000);
+    assert_eq!(swim.membership.get("local").unwrap().heartbeat(), 2);
+    // Owner bumps keep the node Active but do not resurrect terminal states.
+    assert_eq!(
+      swim.membership.get("local").unwrap().state(),
+      MemberState::Active
+    );
   }
 
   #[test]
@@ -528,5 +587,142 @@ mod tests {
         seq: 7
       }]
     );
+  }
+
+  #[test]
+  fn suspected_to_offline_transition_broadcasts_register() {
+    let config = SwimConfig {
+      ping_interval_ms: 1_000,
+      ping_timeout_ms: 2_000,
+      failure_threshold: 1,
+      suspect_timeout_ms: 5_000,
+    };
+    let mut swim = Swim::new("local", config, local_register("local"));
+    swim.membership.merge_register(&peer_register("peer"));
+
+    // Fail one probe so the peer becomes suspected at t=3_100.
+    let _ = swim.tick(1_000);
+    let _ = swim.tick(3_100);
+    assert_eq!(
+      swim.membership.get("peer").unwrap().state(),
+      MemberState::Suspected
+    );
+
+    // After the suspect timeout expires the peer goes Offline and the new
+    // register is gossiped (D4).
+    let actions = swim.tick(9_000);
+    assert_eq!(
+      swim.membership.get("peer").unwrap().state(),
+      MemberState::Offline
+    );
+    assert!(
+      actions.iter().any(|a| matches!(
+        a,
+        SwimAction::Broadcast(SwimMessage::Alive { register })
+          if register.node_id() == "peer" && register.state() == MemberState::Offline
+      )),
+      "expected an Offline register broadcast, got {actions:?}"
+    );
+  }
+
+  #[test]
+  fn offline_rumor_about_local_triggers_refute() {
+    let mut swim = Swim::new("local", SwimConfig::default(), local_register("local"));
+
+    let mut rumor = local_register("local");
+    rumor.offline(1_000);
+    let actions = swim.on_message("peer", SwimMessage::Alive { register: rumor }, 2_000);
+
+    let local = swim.membership.get("local").unwrap();
+    assert_eq!(local.state(), MemberState::Active);
+    assert_eq!(local.incarnation(), 2);
+    assert!(
+      actions.iter().any(|a| matches!(
+        a,
+        SwimAction::Broadcast(SwimMessage::Alive { register })
+          if register.node_id() == "local" && register.state() == MemberState::Active
+      )),
+      "expected an Active refutation broadcast, got {actions:?}"
+    );
+  }
+
+  #[test]
+  fn stale_rumor_about_local_does_not_inflate_incarnation() {
+    let mut swim = Swim::new("local", SwimConfig::default(), local_register("local"));
+
+    // Refute once: local incarnation becomes 2.
+    let _ = swim.on_message(
+      "peer",
+      SwimMessage::Suspect {
+        node_id: "local".to_string(),
+        incarnation: 1,
+      },
+      1_000,
+    );
+    assert_eq!(swim.membership.get("local").unwrap().incarnation(), 2);
+
+    // An older suspect rumor (incarnation 1 < 2) must be ignored.
+    let actions = swim.on_message(
+      "peer",
+      SwimMessage::Suspect {
+        node_id: "local".to_string(),
+        incarnation: 1,
+      },
+      2_000,
+    );
+    assert!(actions.is_empty());
+    assert_eq!(swim.membership.get("local").unwrap().incarnation(), 2);
+  }
+
+  #[test]
+  fn partition_heals_after_reconnect() {
+    // Partition A declares X offline; X lives on in partition B, bumping its
+    // own heartbeat. After the partitions reconnect, X refutes the Offline
+    // rumor and every view converges back to Active (I2).
+    let mut swim_a = Swim::new("a", SwimConfig::default(), local_register("a"));
+    let mut offline_x = peer_register("x");
+    offline_x.offline(1_000);
+    swim_a.membership.merge_register(&offline_x);
+    assert_eq!(
+      swim_a.membership.get("x").unwrap().state(),
+      MemberState::Offline
+    );
+
+    let mut swim_x = Swim::new("x", SwimConfig::default(), local_register("x"));
+    let _ = swim_x.tick(1_500);
+
+    // X receives the Offline rumor about itself (anti-entropy or gossip) and
+    // refutes it with a higher incarnation.
+    let refute_actions = swim_x.on_message(
+      "a",
+      SwimMessage::Alive {
+        register: offline_x,
+      },
+      2_000,
+    );
+    let refuted = swim_x.membership.get("x").unwrap().clone();
+    assert_eq!(refuted.state(), MemberState::Active);
+    assert_eq!(refuted.incarnation(), 2);
+    assert!(
+      refute_actions.iter().any(|a| matches!(
+        a,
+        SwimAction::Broadcast(SwimMessage::Alive { register })
+          if register.node_id() == "x" && register.incarnation() == 2
+      )),
+      "expected a refutation broadcast, got {refute_actions:?}"
+    );
+
+    // A merges the refutation; X is Active everywhere with incarnation 2.
+    let _ = swim_a.on_message(
+      "x",
+      SwimMessage::Alive {
+        register: refuted.clone(),
+      },
+      2_500,
+    );
+    let x_in_a = swim_a.membership.get("x").unwrap();
+    assert_eq!(x_in_a.state(), MemberState::Active);
+    assert_eq!(x_in_a.incarnation(), 2);
+    assert_eq!(x_in_a, &refuted);
   }
 }

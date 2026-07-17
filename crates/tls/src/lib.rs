@@ -60,8 +60,8 @@ pub enum TlsError {
   Io(#[from] std::io::Error),
   #[error("certificate generation error: {0}")]
   Generation(#[from] rcgen::Error),
-  #[error("failed to generate key pair")]
-  KeyGeneration,
+  #[error("invalid advertise address '{0}': expected https://<host>:<port>")]
+  InvalidAddress(String),
 }
 
 #[cfg(test)]
@@ -79,7 +79,15 @@ mod tests {
     let cert = dir.path().join("node.crt");
     let key = dir.path().join("node.key");
 
-    let bundle = ensure_tls_bundle(&ca_cert, &ca_key, &cert, &key, "test-node").unwrap();
+    let bundle = ensure_tls_bundle(
+      &ca_cert,
+      &ca_key,
+      &cert,
+      &key,
+      "test-node",
+      "https://127.0.0.1:5001",
+    )
+    .unwrap();
     let _client = load_tls_bundle(&cert, &key, &ca_cert)
       .unwrap()
       .client_config();
