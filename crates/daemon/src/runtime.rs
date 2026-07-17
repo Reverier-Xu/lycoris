@@ -5,10 +5,7 @@ use lycoris_core::{ClusterKey, now_ms};
 use lycoris_storage::{Storage, StorageError};
 use lycoris_tls::{TlsError, ensure_tls_bundle, install_crypto_provider};
 use thiserror::Error;
-use tokio::{
-  signal::unix::{SignalKind, signal},
-  sync::watch,
-};
+use tokio::sync::watch;
 
 use crate::{
   membership::{LOCAL_INCARNATION_KEY, MemberRegister, MembershipService, SwimConfig},
@@ -40,6 +37,32 @@ pub enum RuntimeError {
   Transport(#[from] tonic::transport::Error),
 }
 
+/// Wait for the process shutdown signal: SIGTERM or SIGINT on unix.
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() {
+  use tokio::signal::unix::{SignalKind, signal};
+
+  let mut terminate = match signal(SignalKind::terminate()) {
+    Ok(signal) => signal,
+    Err(_) => return,
+  };
+  let mut interrupt = match signal(SignalKind::interrupt()) {
+    Ok(signal) => signal,
+    Err(_) => return,
+  };
+
+  tokio::select! {
+    _ = terminate.recv() => {}
+    _ = interrupt.recv() => {}
+  }
+}
+
+/// Wait for the process shutdown signal: Ctrl+C on non-unix platforms.
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() {
+  let _ = tokio::signal::ctrl_c().await;
+}
+
 /// Run the daemon until the process is interrupted.
 pub async fn run(config: DaemonConfig) -> Result<(), RuntimeError> {
   let _ = install_crypto_provider();
@@ -50,20 +73,7 @@ pub async fn run(config: DaemonConfig) -> Result<(), RuntimeError> {
 
   let shutdown_tx_signal = shutdown_tx.clone();
   tokio::spawn(async move {
-    let mut terminate = match signal(SignalKind::terminate()) {
-      Ok(signal) => signal,
-      Err(_) => return,
-    };
-    let mut interrupt = match signal(SignalKind::interrupt()) {
-      Ok(signal) => signal,
-      Err(_) => return,
-    };
-
-    tokio::select! {
-      _ = terminate.recv() => {}
-      _ = interrupt.recv() => {}
-    }
-
+    wait_for_shutdown_signal().await;
     let _ = shutdown_tx_signal.send(true);
   });
 
