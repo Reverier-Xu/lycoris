@@ -213,8 +213,14 @@ pub async fn run_with_shutdown(
   tracing::info!(%addr, "node api server listening");
 
   let server_shutdown = shutdown.clone();
-  let cluster_server = lycoris_proto::node::cluster_server::ClusterServer::with_interceptor(
-    cluster_service,
+  // The message limits live on `ClusterServer`, so they are applied before
+  // wrapping it into the intercepted service (`with_interceptor` only takes
+  // the raw inner service).
+  let cluster_server = lycoris_proto::node::cluster_server::ClusterServer::new(cluster_service)
+    .max_decoding_message_size(lycoris_client::MAX_RPC_MESSAGE_BYTES)
+    .max_encoding_message_size(lycoris_client::MAX_RPC_MESSAGE_BYTES);
+  let cluster_server = tonic::service::interceptor::InterceptedService::new(
+    cluster_server,
     crate::rpc::interceptor::cluster_key_interceptor(cluster_key.map(Arc::new)),
   );
   let result = tonic::transport::Server::builder()

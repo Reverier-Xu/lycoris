@@ -20,6 +20,16 @@ use tonic::{Request, metadata::MetadataValue, transport::Channel};
 /// Timeout applied to the connection handshake of every peer channel.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Maximum gRPC message size applied to every peer RPC, in both directions.
+///
+/// `sync_resources` carries the complete shared-resource set (memory entries
+/// include full content plus embeddings) in a single message, so tonic's 4
+/// MiB default makes every resource anti-entropy round fail once the set
+/// outgrows it. 64 MiB is the temporary ceiling until the exchange is
+/// paginated — headroom, not a target message size. Client stubs and daemon
+/// servers share this single value so both sides of a connection agree.
+pub const MAX_RPC_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
 /// Build a connected channel with the shared client defaults: mutual TLS from
 /// `tls_bundle` and a bounded connect handshake. Every handle constructor goes
 /// through here so connection policy stays single-sourced.
@@ -49,7 +59,9 @@ impl ClusterClientHandle {
 
   pub fn from_channel(channel: Channel) -> Self {
     Self {
-      inner: ClusterClient::new(channel),
+      inner: ClusterClient::new(channel)
+        .max_decoding_message_size(MAX_RPC_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_RPC_MESSAGE_BYTES),
       cluster_key: None,
     }
   }
@@ -144,7 +156,9 @@ impl SyncClientHandle {
 
   pub fn from_channel(channel: Channel) -> Self {
     Self {
-      inner: SyncClient::new(channel),
+      inner: SyncClient::new(channel)
+        .max_decoding_message_size(MAX_RPC_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_RPC_MESSAGE_BYTES),
     }
   }
 
@@ -194,7 +208,9 @@ impl MembershipClientHandle {
 
   pub fn from_channel(channel: Channel) -> Self {
     Self {
-      inner: MembershipClient::new(channel),
+      inner: MembershipClient::new(channel)
+        .max_decoding_message_size(MAX_RPC_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_RPC_MESSAGE_BYTES),
     }
   }
 

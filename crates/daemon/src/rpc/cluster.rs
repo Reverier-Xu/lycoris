@@ -24,8 +24,12 @@ impl ClusterSync {
   /// Build the tonic server handles serving this instance.
   pub fn servers(&self) -> (SyncServerHandle, MembershipServerHandle) {
     (
-      SyncServer::new(self.clone()),
-      MembershipServer::new(self.clone()),
+      SyncServer::new(self.clone())
+        .max_decoding_message_size(lycoris_client::MAX_RPC_MESSAGE_BYTES)
+        .max_encoding_message_size(lycoris_client::MAX_RPC_MESSAGE_BYTES),
+      MembershipServer::new(self.clone())
+        .max_decoding_message_size(lycoris_client::MAX_RPC_MESSAGE_BYTES)
+        .max_encoding_message_size(lycoris_client::MAX_RPC_MESSAGE_BYTES),
     )
   }
 }
