@@ -120,9 +120,11 @@ impl MembershipService {
   /// Register or update a node from an incoming register.
   ///
   /// `updated_at_ms` is deliberately overwritten with the local clock: merging
-  /// a remote register is a local view update, and the field drives local
-  /// timers (e.g. the suspect timeout), so it must come from a clock we trust.
-  /// It is excluded from both the merge order and the Merkle hash.
+  /// a remote register is a local view update, and the field is republished to
+  /// peers as `last_heartbeat_unix_ms`, so it must come from a clock we trust.
+  /// It is excluded from both the merge order and the Merkle hash; the
+  /// Suspected -> Offline timer runs on local observation times tracked inside
+  /// the SWIM state machine, not on this field.
   pub async fn register(&self, register: MemberRegister) -> Vec<SwimAction> {
     let now = now_ms();
     let mut state = self.state.lock().await;

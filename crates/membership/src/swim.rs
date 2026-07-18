@@ -14,7 +14,9 @@ pub struct SwimConfig {
   pub ping_timeout_ms: u64,
   /// Consecutive probe failures required before marking a peer suspected.
   pub failure_threshold: u32,
-  /// Milliseconds a peer may stay suspected before being marked offline.
+  /// Milliseconds a peer may stay suspected before being marked offline,
+  /// counted on the local clock from the first local observation of the
+  /// suspected state.
   pub suspect_timeout_ms: u64,
 }
 
@@ -80,6 +82,10 @@ pub struct Swim {
   sequence: u64,
   pending_pings: HashMap<u64, PendingPing>,
   last_probe_ms: HashMap<String, u64>,
+  /// Local timestamp at which each currently-suspected member was first
+  /// observed in the Suspected state. The Suspected -> Offline timeout reads
+  /// only this map, so the verdict depends on the local clock alone.
+  suspected_since_ms: HashMap<String, i64>,
 }
 
 impl Swim {
@@ -97,6 +103,7 @@ impl Swim {
       sequence: 0,
       pending_pings: HashMap::new(),
       last_probe_ms: HashMap::new(),
+      suspected_since_ms: HashMap::new(),
     }
   }
 
@@ -321,17 +328,37 @@ impl Swim {
 
   fn check_suspect_timeouts(&mut self, now_ms: i64) -> Vec<SwimAction> {
     let timeout = i64::try_from(self.config.suspect_timeout_ms).unwrap_or(i64::MAX);
-    let expired: Vec<String> = self
+    let suspected: Vec<String> = self
       .membership
       .active()
       .into_iter()
       .filter(|register| {
-        register.node_id() != self.local_node_id
-          && register.state() == MemberState::Suspected
-          && now_ms.saturating_sub(register.updated_at_ms()) >= timeout
+        register.node_id() != self.local_node_id && register.state() == MemberState::Suspected
       })
       .map(|register| register.node_id().to_string())
       .collect();
+
+    // The Suspected -> Offline timer runs purely on the local clock: it starts
+    // when this node first observes a member in the Suspected state, and a
+    // member that recovers and is suspected again later gets a fresh timer.
+    // The register's `updated_at_ms` must not drive this verdict: merging
+    // resolves equal-order registers field-wise with "largest value wins", so
+    // a fast remote clock could push the timestamp into the future and
+    // postpone the Offline transition indefinitely.
+    self
+      .suspected_since_ms
+      .retain(|node_id, _| suspected.contains(node_id));
+
+    let mut expired = Vec::new();
+    for node_id in suspected {
+      let since = *self
+        .suspected_since_ms
+        .entry(node_id.clone())
+        .or_insert(now_ms);
+      if now_ms.saturating_sub(since) >= timeout {
+        expired.push(node_id);
+      }
+    }
 
     let mut actions = Vec::new();
     for node_id in expired {
@@ -586,6 +613,54 @@ mod tests {
         to: "peer".to_string(),
         seq: 7
       }]
+    );
+  }
+
+  #[test]
+  fn suspect_timer_uses_local_observation_time_not_remote_clock() {
+    let config = SwimConfig {
+      ping_interval_ms: 1_000,
+      ping_timeout_ms: 2_000,
+      failure_threshold: 1,
+      suspect_timeout_ms: 5_000,
+    };
+    let mut swim = Swim::new("local", config, local_register("local"));
+
+    // A suspect register stamped by a fast remote clock: its timestamp lies
+    // far in the local future. The Offline verdict must still advance on the
+    // local clock, starting when the rumor is first observed locally.
+    let mut rumor = peer_register("peer");
+    rumor.suspect(1_000_000);
+    let _ = swim.on_message("other", SwimMessage::Alive { register: rumor }, 1_000);
+    assert_eq!(
+      swim.membership.get("peer").unwrap().state(),
+      MemberState::Suspected
+    );
+
+    // This tick records the first local observation (t=1_000).
+    let _ = swim.tick(1_000);
+
+    // Before the local suspect timeout elapses the peer stays suspected.
+    let _ = swim.tick(5_999);
+    assert_eq!(
+      swim.membership.get("peer").unwrap().state(),
+      MemberState::Suspected
+    );
+
+    // Once the local timeout has elapsed the peer goes Offline even though
+    // the register timestamp is still in the future.
+    let actions = swim.tick(6_000);
+    assert_eq!(
+      swim.membership.get("peer").unwrap().state(),
+      MemberState::Offline
+    );
+    assert!(
+      actions.iter().any(|a| matches!(
+        a,
+        SwimAction::Broadcast(SwimMessage::Alive { register })
+          if register.node_id() == "peer" && register.state() == MemberState::Offline
+      )),
+      "expected an Offline register broadcast, got {actions:?}"
     );
   }
 

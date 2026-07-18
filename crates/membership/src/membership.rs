@@ -346,6 +346,26 @@ mod tests {
   }
 
   #[test]
+  fn equal_key_merge_keeps_max_updated_at_ms() {
+    // Equal order keys: `updated_at_ms` resolves largest-value-wins like the
+    // other non-key fields, so the outcome is direction-independent (I1).
+    // Nothing in the CRDT clamps it to any node's clock.
+    let a = register("x", 1, 10, MemberState::Suspected).with_updated_at_ms(5_000);
+    let b = register("x", 1, 10, MemberState::Suspected).with_updated_at_ms(9_000);
+
+    let mut ab = Membership::new();
+    ab.merge_register(&a);
+    ab.merge_register(&b);
+
+    let mut ba = Membership::new();
+    ba.merge_register(&b);
+    ba.merge_register(&a);
+
+    assert_eq!(ab, ba);
+    assert_eq!(ab.get("x").unwrap().updated_at_ms(), 9_000);
+  }
+
+  #[test]
   fn version_tracks_hash_relevant_mutations() {
     let mut m = Membership::new();
     let v0 = m.version();

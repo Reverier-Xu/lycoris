@@ -10,8 +10,8 @@ use lycoris_proto::node::{NodeInfo as ProtoNodeInfo, NodeState};
 /// Convert a wire `NodeInfo` into a domain register.
 ///
 /// `updated_at_ms` is left at the register default on purpose: the merge
-/// paths in `MembershipService` overwrite it with the local clock, which is
-/// the only clock trusted for local timers.
+/// paths in `MembershipService` overwrite it with the local clock — the only
+/// clock this node trusts — before the register enters local state.
 pub fn proto_to_register(info: &ProtoNodeInfo) -> MemberRegister {
   MemberRegister::new(
     info.id.clone(),
