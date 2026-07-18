@@ -9,4 +9,4 @@ RUN chmod 755 /usr/local/bin/lycoris
 RUN mkdir -p /etc/lycoris /var/lib/lycoris
 
 ENTRYPOINT ["lycoris", "daemon"]
-CMD ["--config", "/etc/lycoris/config.toml"]
+CMD ["--config", "/etc/lycoris/lycoris.toml"]

@@ -10,7 +10,7 @@ mkdir -p "${CERTS_DIR}"
 cd "${CERTS_DIR}"
 
 # CA
-openssl req -x509 -newkey rsa:4096 -keyout ca.key -out ca.crt -days 1 -nodes \
+openssl req -x509 -newkey rsa:4096 -keyout ca.key -out ca.crt -days 30 -nodes \
   -subj "/CN=lycoris-e2e-ca" \
   2>/dev/null
 
@@ -20,7 +20,7 @@ for node in "${NODES[@]}"; do
     -addext "subjectAltName=DNS:${node}" \
     2>/dev/null
   openssl x509 -req -in "${node}.csr" -CA ca.crt -CAkey ca.key -CAcreateserial \
-    -out "${node}.crt" -days 1 \
+    -out "${node}.crt" -days 30 \
     -copy_extensions copy \
     2>/dev/null
   rm -f "${node}.csr"

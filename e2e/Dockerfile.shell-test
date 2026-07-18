@@ -6,5 +6,8 @@ RUN apk add --no-cache ca-certificates iptables
 COPY target/x86_64-unknown-linux-musl/release/lycoris /usr/local/bin/lycoris
 RUN chmod 755 /usr/local/bin/lycoris
 
+# The daemon config is mounted at the default user config path by the test
+# scripts, so no --config flag is needed here.
+RUN mkdir -p /root/.config/lycoris
+
 ENTRYPOINT ["lycoris", "daemon"]
-CMD ["--config", "/etc/lycoris/lycoris.toml"]

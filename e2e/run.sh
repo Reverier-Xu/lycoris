@@ -16,8 +16,8 @@ elif command -v docker-compose >/dev/null 2>&1; then
     EXEC="docker"
   else
     EXEC="podman"
-    if [ -z "${DOCKER_HOST:-}" ] && [ -S "/run/user/$(id - u)/podman/podman.sock" ]; then
-      export DOCKER_HOST="unix:///run/user/$(id - u)/podman/podman.sock"
+    if [ -z "${DOCKER_HOST:-}" ] && [ -S "/run/user/$(id -u)/podman/podman.sock" ]; then
+      export DOCKER_HOST="unix:///run/user/$(id -u)/podman/podman.sock"
     fi
   fi
 elif command -v podman >/dev/null 2>&1 && command -v podman-compose >/dev/null 2>&1; then
@@ -118,7 +118,7 @@ wait_for_cluster
 
 echo ""
 echo "=== test 1: register a node and observe convergence ==="
-register_node lycoris-e2e-node-0 alpha https://alpha:5001
+register_node lycoris-e2e-node-0 alpha https://alpha:5000
 if wait_for_node lycoris-e2e-node-2 alpha; then
   echo "  ok: alpha propagated to node-2"
 else
@@ -132,7 +132,10 @@ echo "  disconnecting node-1 from both networks"
 ${EXEC} network disconnect "${NETWORK_LEFT}" lycoris-e2e-node-1
 ${EXEC} network disconnect "${NETWORK_RIGHT}" lycoris-e2e-node-1
 
-register_node lycoris-e2e-node-0 beta https://beta:5001
+register_node lycoris-e2e-node-0 beta https://beta:5000
+# Negative assertion window: polling can only prove that a state was reached,
+# never that it was NOT reached, so "beta must not cross the partition" has to
+# be checked after a fixed wait that exceeds the sync interval.
 sleep 3
 
 if has_node lycoris-e2e-node-2 beta; then
@@ -160,7 +163,7 @@ echo "=== test 3: node failure and restart ==="
 echo "  stopping node-2"
 ${EXEC} stop lycoris-e2e-node-2
 
-register_node lycoris-e2e-node-0 gamma https://gamma:5001
+register_node lycoris-e2e-node-0 gamma https://gamma:5000
 
 if wait_for_node lycoris-e2e-node-1 gamma; then
   echo "  ok: gamma reached node-1 while node-2 was down"

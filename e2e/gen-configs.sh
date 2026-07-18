@@ -12,11 +12,11 @@ data_dir = "/var/lib/lycoris"
 
 [node]
 id = "node-0"
-address = "https://node-0:5001"
+address = "https://node-0:5000"
 
 [cluster]
-listen_address = "0.0.0.0:5001"
-bootstrap_peers = ["https://node-1:5001"]
+listen_address = "0.0.0.0:5000"
+bootstrap_peers = ["https://node-1:5000"]
 
 [tls]
 ca_cert = "/etc/lycoris/certs/ca.crt"
@@ -30,11 +30,11 @@ data_dir = "/var/lib/lycoris"
 
 [node]
 id = "node-1"
-address = "https://node-1:5001"
+address = "https://node-1:5000"
 
 [cluster]
-listen_address = "0.0.0.0:5001"
-bootstrap_peers = ["https://node-0:5001", "https://node-2:5001"]
+listen_address = "0.0.0.0:5000"
+bootstrap_peers = ["https://node-0:5000", "https://node-2:5000"]
 
 [tls]
 ca_cert = "/etc/lycoris/certs/ca.crt"
@@ -48,11 +48,11 @@ data_dir = "/var/lib/lycoris"
 
 [node]
 id = "node-2"
-address = "https://node-2:5001"
+address = "https://node-2:5000"
 
 [cluster]
-listen_address = "0.0.0.0:5001"
-bootstrap_peers = ["https://node-1:5001"]
+listen_address = "0.0.0.0:5000"
+bootstrap_peers = ["https://node-1:5000"]
 
 [tls]
 ca_cert = "/etc/lycoris/certs/ca.crt"
