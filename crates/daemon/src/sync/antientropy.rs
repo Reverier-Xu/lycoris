@@ -151,7 +151,9 @@ impl ClusterSync {
     let local_root = self.service.merkle_root().await;
     if remote_root == local_root.to_vec() {
       let now = now_ms();
-      let _ = self.node.peers().mark_seen(peer, now);
+      if let Err(error) = self.node.peers().mark_seen(peer, now) {
+        tracing::warn!(%peer, %error, "failed to mark peer seen");
+      }
       return Ok(());
     }
 
@@ -208,7 +210,9 @@ impl ClusterSync {
 
     self.seed_known_peers(&local_address).await;
 
-    let _ = self.node.peers().mark_seen(peer, now_ms());
+    if let Err(error) = self.node.peers().mark_seen(peer, now_ms()) {
+      tracing::warn!(%peer, %error, "failed to mark peer seen");
+    }
     Ok(())
   }
 
@@ -283,7 +287,9 @@ impl ClusterSync {
     let local_address = self.local_address().await.unwrap_or_default();
     self.seed_known_peers(&local_address).await;
 
-    let _ = self.node.peers().mark_seen(peer, now_ms());
+    if let Err(error) = self.node.peers().mark_seen(peer, now_ms()) {
+      tracing::warn!(%peer, %error, "failed to mark peer seen");
+    }
     Ok(())
   }
 
@@ -292,8 +298,10 @@ impl ClusterSync {
   /// candidates.
   async fn seed_known_peers(&self, local_address: &str) {
     for register in self.service.list_nodes(&HashMap::new()).await {
-      if register.address() != local_address {
-        let _ = self.node.peers().seed(register.address());
+      if register.address() != local_address
+        && let Err(error) = self.node.peers().seed(register.address())
+      {
+        tracing::warn!(address = %register.address(), %error, "failed to seed known peer");
       }
     }
   }
@@ -303,8 +311,10 @@ impl ClusterSync {
   pub async fn serve_sync_nodes(&self, nodes: Vec<ProtoNodeInfo>) -> Vec<ProtoNodeInfo> {
     let local_address = self.local_address().await.unwrap_or_default();
     for info in &nodes {
-      if info.address != local_address {
-        let _ = self.node.peers().seed(&info.address);
+      if info.address != local_address
+        && let Err(error) = self.node.peers().seed(&info.address)
+      {
+        tracing::warn!(address = %info.address, %error, "failed to seed peer address");
       }
     }
     let (snapshot, actions) = self

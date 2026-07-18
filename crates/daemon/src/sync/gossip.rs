@@ -146,7 +146,9 @@ impl ClusterSync {
   ) {
     match timeout(RPC_TIMEOUT, send).await {
       Ok(Ok(())) => {
-        let _ = self.node.peers().mark_seen(peer, now_ms());
+        if let Err(error) = self.node.peers().mark_seen(peer, now_ms()) {
+          tracing::warn!(%peer, %error, "failed to mark peer seen");
+        }
       }
       Ok(Err(error)) => {
         tracing::warn!(%peer, %error, "{what} to peer failed");
@@ -218,8 +220,10 @@ impl ClusterSync {
     }
 
     let local_address = self.local_address().await.unwrap_or_default();
-    if info.address != local_address {
-      let _ = self.node.peers().seed(&info.address);
+    if info.address != local_address
+      && let Err(error) = self.node.peers().seed(&info.address)
+    {
+      tracing::warn!(address = %info.address, %error, "failed to seed peer address");
     }
     let actions = self.service.register(proto_to_register(&info)).await;
 

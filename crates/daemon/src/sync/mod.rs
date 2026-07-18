@@ -136,7 +136,9 @@ impl ClusterSync {
   /// Record a failed contact with `peer`: mark the attempt failed so the
   /// selection policy backs off ([`peers`]), and evict the cached channel.
   pub(super) async fn record_peer_failure(&self, peer: &str) {
-    let _ = self.node.peers().mark_attempt(peer, false);
+    if let Err(error) = self.node.peers().mark_attempt(peer, false) {
+      tracing::warn!(%peer, %error, "failed to record failed peer attempt");
+    }
     self.pool.remove(peer).await;
   }
 }
