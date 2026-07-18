@@ -1,12 +1,14 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
-#![allow(clippy::large_enum_variant, clippy::result_large_err)]
 
+// The generated code needs these allowances; hand-written code in this crate
+// does not get them.
+#[allow(clippy::large_enum_variant, clippy::result_large_err)]
 pub mod node {
   tonic::include_proto!("lycoris.daemon");
 }
 
-pub use node::*;
+use node::{NodeInfo, NodeState};
 
 /// Metadata header carrying the cluster key that authorizes `Cluster` RPCs.
 ///

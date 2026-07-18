@@ -22,9 +22,9 @@ use redb::Database;
 pub use table::RedbTableStorage;
 pub use versioned::{ContentHashMismatch, VersionedRecord, should_apply_versioned};
 pub use workspace::{
-  RedbRuleStorage, RedbSkillStorage, RedbWorkspaceStorage, RuleRecord, RuleStorage, SkillRecord,
-  SkillStorage, VersionedContentStore, VersionedResource, VersionedStorage, WorkspaceDomain,
-  WorkspaceMetadataStorage, WorkspaceRecord, WorkspaceStorageError,
+  RuleRecord, RuleStorage, SkillRecord, SkillStorage, VersionedContentStore, VersionedResource,
+  VersionedStorage, WorkspaceDomain, WorkspaceMetadataStorage, WorkspaceRecord,
+  WorkspaceStorageError,
 };
 
 /// `Storage` is the top-level entry point for all persistent state. The

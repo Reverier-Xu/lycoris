@@ -11,7 +11,6 @@ pub use client::ClientConfig;
 pub use daemon::{ClusterConfig, DaemonConfig, NodeConfig, TlsConfig};
 pub use error::{ConfigError, InvalidAddressError};
 pub use paths::{
-  CLIENT_CONFIG_FILE_NAME, DAEMON_CONFIG_FILE_NAME, config_dirs, default_client_config_path,
-  default_daemon_config_path, default_data_dir, select_config_path, system_config_dir,
-  user_config_dir, user_data_dir,
+  DAEMON_CONFIG_FILE_NAME, default_client_config_path, default_daemon_config_path, user_config_dir,
+  user_data_dir,
 };

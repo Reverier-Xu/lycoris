@@ -45,11 +45,6 @@ impl ClusterKey {
     Ok(Self(bytes))
   }
 
-  /// Construct a key from raw bytes.
-  pub fn from_bytes(bytes: [u8; KEY_LENGTH]) -> Self {
-    Self(bytes)
-  }
-
   /// Parse a key from a hex string.
   pub fn from_hex(hex: &str) -> Result<Self, ClusterKeyError> {
     let bytes = hex::decode(hex).map_err(|_| ClusterKeyError::InvalidHex)?;
@@ -62,11 +57,6 @@ impl ClusterKey {
   /// Return the key as a hex string.
   pub fn to_hex(&self) -> String {
     hex::encode(self.0)
-  }
-
-  /// Return the raw key bytes.
-  pub fn as_bytes(&self) -> &[u8; KEY_LENGTH] {
-    &self.0
   }
 
   /// Load a key from a file. The file is expected to contain a single line of
@@ -96,12 +86,6 @@ impl ClusterKey {
     file.write_all(b"\n")?;
     file.flush()?;
     Ok(())
-  }
-}
-
-impl Default for ClusterKey {
-  fn default() -> Self {
-    Self([0u8; KEY_LENGTH])
   }
 }
 
@@ -143,7 +127,7 @@ mod tests {
   fn from_hex_accepts_valid_key() {
     let hex = "a".repeat(KEY_LENGTH * 2);
     let key = ClusterKey::from_hex(&hex).unwrap();
-    assert_eq!(key.as_bytes(), &[0xAA; KEY_LENGTH]);
+    assert_eq!(key.to_hex(), hex);
   }
 
   #[test]
@@ -162,12 +146,16 @@ mod tests {
 
   #[test]
   fn equality_compares_every_byte() {
-    let key = ClusterKey::from_bytes([0xAA; KEY_LENGTH]);
-    assert_eq!(key, ClusterKey::from_bytes([0xAA; KEY_LENGTH]));
+    let hex_of = |bytes: [u8; KEY_LENGTH]| hex::encode(bytes);
+    let key = ClusterKey::from_hex(&hex_of([0xAA; KEY_LENGTH])).unwrap();
+    assert_eq!(
+      key,
+      ClusterKey::from_hex(&hex_of([0xAA; KEY_LENGTH])).unwrap()
+    );
     for index in [0, KEY_LENGTH - 1] {
       let mut bytes = [0xAA; KEY_LENGTH];
       bytes[index] ^= 0x01;
-      assert_ne!(key, ClusterKey::from_bytes(bytes));
+      assert_ne!(key, ClusterKey::from_hex(&hex_of(bytes)).unwrap());
     }
   }
 }

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use directories::{BaseDirs, ProjectDirs};
 
 pub const DAEMON_CONFIG_FILE_NAME: &str = "lycoris.toml";
-pub const CLIENT_CONFIG_FILE_NAME: &str = "lycoris.client.conf";
+pub(crate) const CLIENT_CONFIG_FILE_NAME: &str = "lycoris.client.conf";
 
 fn project_dirs() -> Option<ProjectDirs> {
   ProjectDirs::from("", "", "lycoris")
@@ -25,14 +25,14 @@ pub fn user_config_dir() -> Option<PathBuf> {
 /// - Linux: `/etc/lycoris`
 /// - macOS: `/Library/Application Support/lycoris`
 /// - Windows: `%PROGRAMDATA%\lycoris`
-pub fn system_config_dir() -> Option<PathBuf> {
+pub(crate) fn system_config_dir() -> Option<PathBuf> {
   BaseDirs::new().map(|dirs| dirs.config_dir().join("lycoris"))
 }
 
 /// Return candidate configuration directories in precedence order.
 ///
 /// User configuration takes precedence over system configuration.
-pub fn config_dirs() -> Vec<PathBuf> {
+pub(crate) fn config_dirs() -> Vec<PathBuf> {
   user_config_dir()
     .into_iter()
     .chain(system_config_dir())
@@ -44,7 +44,7 @@ pub fn config_dirs() -> Vec<PathBuf> {
 ///
 /// Returns the first existing config file found. If none exist, returns the
 /// path in the first candidate directory.
-pub fn select_config_path(dirs: &[PathBuf], file_name: &str) -> Option<PathBuf> {
+pub(crate) fn select_config_path(dirs: &[PathBuf], file_name: &str) -> Option<PathBuf> {
   for dir in dirs {
     let path = dir.join(file_name);
     if path.is_file() {
@@ -70,7 +70,8 @@ pub fn default_client_config_path() -> Option<PathBuf> {
   user_config_dir().map(|dir| dir.join(CLIENT_CONFIG_FILE_NAME))
 }
 
-pub use lycoris_core::{default_data_dir, user_data_dir};
+pub(crate) use lycoris_core::default_data_dir;
+pub use lycoris_core::user_data_dir;
 
 #[cfg(test)]
 mod tests {

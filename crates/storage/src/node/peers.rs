@@ -103,7 +103,7 @@ impl PeerStorage {
   }
 
   /// Return candidate peer addresses excluding the current primary.
-  pub fn fallback_addresses(&self) -> Result<Vec<String>, StorageError> {
+  fn fallback_addresses(&self) -> Result<Vec<String>, StorageError> {
     let primary = self.get_primary()?;
     Ok(
       self

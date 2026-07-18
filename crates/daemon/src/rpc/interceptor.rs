@@ -46,7 +46,7 @@ mod tests {
   use super::*;
 
   fn key() -> ClusterKey {
-    ClusterKey::from_bytes([0xAB; 32])
+    ClusterKey::from_hex(&"ab".repeat(32)).unwrap()
   }
 
   fn request_with_key(value: &str) -> Request<()> {
@@ -67,7 +67,7 @@ mod tests {
   #[test]
   fn rejects_mismatched_key() {
     let interceptor = cluster_key_interceptor(Some(Arc::new(key())));
-    let other = ClusterKey::from_bytes([0xCD; 32]);
+    let other = ClusterKey::from_hex(&"cd".repeat(32)).unwrap();
     let status = interceptor(request_with_key(&other.to_hex())).unwrap_err();
     assert_eq!(status.code(), Code::PermissionDenied);
   }

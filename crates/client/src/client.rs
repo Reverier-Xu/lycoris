@@ -57,7 +57,7 @@ impl ClusterClientHandle {
     ))
   }
 
-  pub fn from_channel(channel: Channel) -> Self {
+  pub(crate) fn from_channel(channel: Channel) -> Self {
     Self {
       inner: ClusterClient::new(channel)
         .max_decoding_message_size(MAX_RPC_MESSAGE_BYTES)
@@ -146,15 +146,7 @@ pub struct SyncClientHandle {
 }
 
 impl SyncClientHandle {
-  pub async fn connect(
-    address: &str, tls_bundle: &lycoris_tls::TlsBundle,
-  ) -> Result<Self, ClientError> {
-    Ok(Self::from_channel(
-      build_channel(address, tls_bundle).await?,
-    ))
-  }
-
-  pub fn from_channel(channel: Channel) -> Self {
+  pub(crate) fn from_channel(channel: Channel) -> Self {
     Self {
       inner: SyncClient::new(channel)
         .max_decoding_message_size(MAX_RPC_MESSAGE_BYTES)
@@ -198,15 +190,7 @@ pub struct MembershipClientHandle {
 }
 
 impl MembershipClientHandle {
-  pub async fn connect(
-    address: &str, tls_bundle: &lycoris_tls::TlsBundle,
-  ) -> Result<Self, ClientError> {
-    Ok(Self::from_channel(
-      build_channel(address, tls_bundle).await?,
-    ))
-  }
-
-  pub fn from_channel(channel: Channel) -> Self {
+  pub(crate) fn from_channel(channel: Channel) -> Self {
     Self {
       inner: MembershipClient::new(channel)
         .max_decoding_message_size(MAX_RPC_MESSAGE_BYTES)
@@ -274,7 +258,7 @@ impl PeerClient {
     ))
   }
 
-  pub fn from_channel(channel: Channel) -> Self {
+  pub(crate) fn from_channel(channel: Channel) -> Self {
     Self {
       cluster: ClusterClientHandle::from_channel(channel.clone()),
       sync: SyncClientHandle::from_channel(channel.clone()),
