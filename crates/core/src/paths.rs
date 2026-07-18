@@ -2,7 +2,11 @@ use std::path::{Path, PathBuf};
 
 use directories::{BaseDirs, ProjectDirs};
 
-fn project_dirs() -> Option<ProjectDirs> {
+/// Return the platform project directories for lycoris.
+///
+/// Single source for the `ProjectDirs::from("", "", "lycoris")` invocation;
+/// config and data paths across the workspace derive from it.
+pub fn project_dirs() -> Option<ProjectDirs> {
   ProjectDirs::from("", "", "lycoris")
 }
 

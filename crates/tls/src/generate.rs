@@ -240,21 +240,7 @@ fn write_file<P: AsRef<Path>>(path: P, content: String) -> Result<(), TlsError> 
 
 /// Write a private key file with owner-only permissions (`0o600` on unix).
 fn write_private_file<P: AsRef<Path>>(path: P, content: &str) -> Result<(), TlsError> {
-  use std::io::Write;
-
-  if let Some(parent) = path.as_ref().parent() {
-    std::fs::create_dir_all(parent)?;
-  }
-  let mut file = std::fs::File::create(path.as_ref())?;
-  #[cfg(unix)]
-  {
-    use std::os::unix::fs::PermissionsExt;
-    let mut permissions = file.metadata()?.permissions();
-    permissions.set_mode(0o600);
-    file.set_permissions(permissions)?;
-  }
-  file.write_all(content.as_bytes())?;
-  file.flush()?;
+  lycoris_core::write_private_file(path, content.as_bytes())?;
   Ok(())
 }
 

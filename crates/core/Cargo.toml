@@ -16,7 +16,7 @@ directories = { workspace = true }
 hex         = { workspace = true }
 is-root     = { workspace = true }
 ring        = { workspace = true }
-serde       = { workspace = true, features = ["derive"] }
+serde       = { workspace = true }
 thiserror   = { workspace = true }
 
 [dev-dependencies]

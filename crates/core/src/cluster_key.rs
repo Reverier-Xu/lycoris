@@ -1,8 +1,4 @@
-use std::{
-  fs,
-  io::{self, Write},
-  path::Path,
-};
+use std::{fs, io, path::Path};
 
 use thiserror::Error;
 
@@ -69,22 +65,8 @@ impl ClusterKey {
 
   /// Save the key to a file with restricted permissions.
   pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<(), ClusterKeyError> {
-    if let Some(parent) = path.as_ref().parent() {
-      fs::create_dir_all(parent)?;
-    }
-
-    let mut file = fs::File::create(path.as_ref())?;
-    #[cfg(unix)]
-    {
-      use std::os::unix::fs::PermissionsExt;
-      let mut permissions = file.metadata()?.permissions();
-      permissions.set_mode(0o600);
-      file.set_permissions(permissions)?;
-    }
-
-    file.write_all(self.to_hex().as_bytes())?;
-    file.write_all(b"\n")?;
-    file.flush()?;
+    let content = format!("{}\n", self.to_hex());
+    crate::fs::write_private_file(path, content.as_bytes())?;
     Ok(())
   }
 }

@@ -9,10 +9,13 @@
 use std::collections::HashMap;
 
 use lycoris_core::ResourceScope;
-use lycoris_proto::node::{
-  MemoryBody, NodeBody, NodeInfo, Resource, ResourceKind, ResourceMetadata,
-  ResourceScope as ProtoResourceScope, RuleBody, SessionBody, SkillBody, WorkspaceBody,
-  resource::Body,
+use lycoris_proto::{
+  node::{
+    MemoryBody, NodeBody, NodeInfo, Resource, ResourceKind, ResourceMetadata,
+    ResourceScope as ProtoResourceScope, RuleBody, SessionBody, SkillBody, WorkspaceBody,
+    resource::Body,
+  },
+  scope_from_proto, scope_to_proto,
 };
 use lycoris_storage::{
   MemoryEntry, RuleRecord, Session, SkillRecord, VersionedResource, WorkspaceRecord,
@@ -23,23 +26,6 @@ use super::error::MapperError;
 /// Decode a wire resource kind; the single raw-`i32` decoding point.
 pub(crate) fn decode_kind(raw: i32) -> Result<ResourceKind, MapperError> {
   ResourceKind::try_from(raw).map_err(|_| MapperError::UnknownKind(raw))
-}
-
-/// The single wire-to-domain scope mapping: `UNSPECIFIED` normalizes to
-/// `NodeLocal`, because an unscoped resource must never be synchronized.
-pub(crate) fn scope_from_proto(scope: ProtoResourceScope) -> ResourceScope {
-  match scope {
-    ProtoResourceScope::ClusterShared => ResourceScope::ClusterShared,
-    ProtoResourceScope::Unspecified | ProtoResourceScope::NodeLocal => ResourceScope::NodeLocal,
-  }
-}
-
-/// The single domain-to-wire scope mapping.
-fn scope_to_proto(scope: ResourceScope) -> ProtoResourceScope {
-  match scope {
-    ResourceScope::ClusterShared => ProtoResourceScope::ClusterShared,
-    ResourceScope::NodeLocal => ProtoResourceScope::NodeLocal,
-  }
 }
 
 /// Scaffolding for the metadata block of an outgoing `Resource`.
@@ -284,26 +270,4 @@ pub(super) fn resource_to_workspace(
     created_at_ms: metadata.created_at_ms,
     updated_at_ms: metadata.updated_at_ms,
   })
-}
-
-#[cfg(test)]
-mod tests {
-  use super::*;
-
-  #[test]
-  fn scope_mapping_round_trip() {
-    for (proto, domain) in [
-      (
-        ProtoResourceScope::ClusterShared,
-        ResourceScope::ClusterShared,
-      ),
-      (ProtoResourceScope::NodeLocal, ResourceScope::NodeLocal),
-      (ProtoResourceScope::Unspecified, ResourceScope::NodeLocal),
-    ] {
-      assert_eq!(scope_from_proto(proto), domain);
-    }
-    for domain in [ResourceScope::ClusterShared, ResourceScope::NodeLocal] {
-      assert_eq!(scope_from_proto(scope_to_proto(domain)), domain);
-    }
-  }
 }

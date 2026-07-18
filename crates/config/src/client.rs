@@ -1,7 +1,4 @@
-use std::{
-  fs,
-  path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -35,9 +32,7 @@ pub struct ClientConfig {
 
 impl ClientConfig {
   pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
-    let content = fs::read_to_string(path.as_ref())?;
-    let config: ClientConfig = toml::from_str(&content)?;
-    Ok(config)
+    crate::toml_file::read(path.as_ref())
   }
 
   /// Load the client configuration from the default locations.
@@ -105,16 +100,14 @@ impl ClientConfig {
   /// Write the client configuration to a TOML file, creating parent directories
   /// if necessary.
   pub fn write_to_file<P: AsRef<Path>>(&self, path: P) -> Result<(), ConfigError> {
-    if let Some(parent) = path.as_ref().parent() {
-      fs::create_dir_all(parent)?;
-    }
-    fs::write(path.as_ref(), toml::to_string_pretty(self)?)?;
-    Ok(())
+    crate::toml_file::write(self, path.as_ref())
   }
 }
 
 #[cfg(test)]
 mod tests {
+  use std::fs;
+
   use tempfile::TempDir;
 
   use super::*;

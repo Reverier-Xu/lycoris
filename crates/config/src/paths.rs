@@ -1,13 +1,10 @@
 use std::path::PathBuf;
 
-use directories::{BaseDirs, ProjectDirs};
+use directories::BaseDirs;
+use lycoris_core::project_dirs;
 
 pub const DAEMON_CONFIG_FILE_NAME: &str = "lycoris.toml";
 pub(crate) const CLIENT_CONFIG_FILE_NAME: &str = "lycoris.client.conf";
-
-fn project_dirs() -> Option<ProjectDirs> {
-  ProjectDirs::from("", "", "lycoris")
-}
 
 /// Return the path to the user-specific configuration directory for lycoris.
 ///

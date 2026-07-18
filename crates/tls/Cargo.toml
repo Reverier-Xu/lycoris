@@ -12,12 +12,13 @@ rust-version.workspace = true
 version.workspace      = true
 
 [dependencies]
-rcgen     = { workspace = true }
-rustls    = { workspace = true }
-thiserror = { workspace = true }
-time      = { workspace = true }
-tonic     = { workspace = true }
-tracing   = { workspace = true }
+lycoris-core = { workspace = true }
+rcgen        = { workspace = true }
+rustls       = { workspace = true }
+thiserror    = { workspace = true }
+time         = { workspace = true }
+tonic        = { workspace = true }
+tracing      = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

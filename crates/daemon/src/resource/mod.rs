@@ -15,6 +15,6 @@ mod convert;
 mod error;
 mod mapper;
 
-pub(crate) use convert::{decode_kind, scope_from_proto};
+pub(crate) use convert::decode_kind;
 pub use error::MapperError;
 pub use mapper::ResourceMapper;

@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -34,8 +34,7 @@ fn default_data_dir_string() -> String {
 
 impl DaemonConfig {
   pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
-    let content = fs::read_to_string(path.as_ref())?;
-    let config: DaemonConfig = toml::from_str(&content)?;
+    let config: DaemonConfig = crate::toml_file::read(path.as_ref())?;
     config.validate()?;
     Ok(config)
   }
@@ -71,12 +70,7 @@ impl DaemonConfig {
   /// Write the daemon configuration to a TOML file, creating parent directories
   /// if necessary.
   pub fn write_to_file<P: AsRef<Path>>(&self, path: P) -> Result<(), ConfigError> {
-    let parent = path.as_ref().parent();
-    if let Some(parent) = parent {
-      std::fs::create_dir_all(parent)?;
-    }
-    fs::write(path.as_ref(), toml::to_string_pretty(self)?)?;
-    Ok(())
+    crate::toml_file::write(self, path.as_ref())
   }
 }
 
@@ -119,6 +113,8 @@ fn validate_cluster_address(address: &str) -> Result<(), InvalidAddressError> {
 
 #[cfg(test)]
 mod tests {
+  use std::fs;
+
   use super::*;
 
   const VALID_TOML: &str = r#"

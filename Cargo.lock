@@ -3918,6 +3918,7 @@ dependencies = [
 name = "lycoris-proto"
 version = "0.1.0"
 dependencies = [
+ "lycoris-core",
  "prost 0.13.5",
  "tonic",
  "tonic-build",
@@ -3946,6 +3947,7 @@ dependencies = [
 name = "lycoris-tls"
 version = "0.1.0"
 dependencies = [
+ "lycoris-core",
  "rcgen",
  "rustls",
  "tempfile",

@@ -12,8 +12,9 @@ rust-version.workspace = true
 version.workspace      = true
 
 [dependencies]
-prost.workspace = true
-tonic.workspace = true
+lycoris-core.workspace = true
+prost.workspace        = true
+tonic.workspace        = true
 
 [build-dependencies]
 tonic-build.workspace = true

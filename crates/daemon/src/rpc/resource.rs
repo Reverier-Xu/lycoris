@@ -5,10 +5,13 @@
 #![allow(clippy::result_large_err)]
 
 use lycoris_core::ResourceScope;
-use lycoris_proto::node::{ResourceKind, ResourceScope as ProtoResourceScope};
+use lycoris_proto::{
+  node::{ResourceKind, ResourceScope as ProtoResourceScope},
+  scope_from_proto,
+};
 use tonic::Status;
 
-use crate::resource::{decode_kind, scope_from_proto};
+use crate::resource::decode_kind;
 
 pub fn parse_kind(raw: i32) -> Result<ResourceKind, Status> {
   decode_kind(raw).map_err(Status::from)

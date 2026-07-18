@@ -5,6 +5,7 @@ mod client;
 mod daemon;
 mod error;
 mod paths;
+mod toml_file;
 mod validation;
 
 pub use client::ClientConfig;

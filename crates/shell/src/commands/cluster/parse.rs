@@ -36,7 +36,8 @@ pub(crate) fn resource_name(kind: ResourceKind) -> &'static str {
 /// Parse the CLI `--scope` value into the wire enum; absent means no filter.
 ///
 /// The `"shared"` / `"local"` spellings come from `lycoris_core` (the single
-/// codec source); only the enum mapping is local to this proto boundary.
+/// codec source) and the enum mapping from `lycoris_proto`; only CLI parsing
+/// is local.
 pub(crate) fn parse_scope(raw: Option<String>) -> Result<ProtoResourceScope, ShellError> {
   let Some(raw) = raw else {
     return Ok(ProtoResourceScope::Unspecified);
@@ -44,23 +45,15 @@ pub(crate) fn parse_scope(raw: Option<String>) -> Result<ProtoResourceScope, She
   let scope = raw
     .parse::<ResourceScope>()
     .map_err(|_| ShellError::UnknownScope(raw.clone()))?;
-  Ok(scope_to_proto(scope))
+  Ok(lycoris_proto::scope_to_proto(scope))
 }
 
 /// Map the wire scope to the domain scope for display purposes; unscoped or
 /// unknown values yield `None`.
 pub(crate) fn scope_from_proto(raw: i32) -> Option<ResourceScope> {
   match ProtoResourceScope::try_from(raw) {
-    Ok(ProtoResourceScope::ClusterShared) => Some(ResourceScope::ClusterShared),
-    Ok(ProtoResourceScope::NodeLocal) => Some(ResourceScope::NodeLocal),
-    _ => None,
-  }
-}
-
-fn scope_to_proto(scope: ResourceScope) -> ProtoResourceScope {
-  match scope {
-    ResourceScope::ClusterShared => ProtoResourceScope::ClusterShared,
-    ResourceScope::NodeLocal => ProtoResourceScope::NodeLocal,
+    Ok(ProtoResourceScope::Unspecified) | Err(_) => None,
+    Ok(scope) => Some(lycoris_proto::scope_from_proto(scope)),
   }
 }
 

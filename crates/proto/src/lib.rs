@@ -8,13 +8,36 @@ pub mod node {
   tonic::include_proto!("lycoris.daemon");
 }
 
-use node::{NodeInfo, NodeState};
+use lycoris_core::{ResourceScope, now_ms};
+use node::{NodeInfo, NodeState, ResourceScope as ProtoResourceScope};
 
 /// Metadata header carrying the cluster key that authorizes `Cluster` RPCs.
 ///
 /// This is the single source of truth for the header name; clients attach the
 /// key under this header and the daemon interceptor reads it back.
 pub const CLUSTER_KEY_HEADER: &str = "x-lycoris-cluster-key";
+
+/// Map a domain scope to its wire representation.
+///
+/// This is the single domain-to-wire scope mapping; the inverse is
+/// [`scope_from_proto`].
+pub fn scope_to_proto(scope: ResourceScope) -> ProtoResourceScope {
+  match scope {
+    ResourceScope::ClusterShared => ProtoResourceScope::ClusterShared,
+    ResourceScope::NodeLocal => ProtoResourceScope::NodeLocal,
+  }
+}
+
+/// Map a wire scope to the domain scope.
+///
+/// `UNSPECIFIED` normalizes to `NodeLocal`: an unscoped resource must never be
+/// synchronized.
+pub fn scope_from_proto(scope: ProtoResourceScope) -> ResourceScope {
+  match scope {
+    ProtoResourceScope::ClusterShared => ResourceScope::ClusterShared,
+    ProtoResourceScope::NodeLocal | ProtoResourceScope::Unspecified => ResourceScope::NodeLocal,
+  }
+}
 
 impl NodeInfo {
   /// Construct a fresh registration payload for a node: `active` state at
@@ -29,19 +52,37 @@ impl NodeInfo {
     labels: std::collections::HashMap<String, String>,
     annotations: std::collections::HashMap<String, String>,
   ) -> Self {
-    let last_heartbeat_unix_ms = std::time::SystemTime::now()
-      .duration_since(std::time::UNIX_EPOCH)
-      .map(|elapsed| elapsed.as_millis() as i64)
-      .unwrap_or(0);
     Self {
       id: id.into(),
       address: address.into(),
       labels,
       annotations,
-      last_heartbeat_unix_ms,
+      last_heartbeat_unix_ms: now_ms(),
       state: NodeState::Active as i32,
       incarnation: 1,
       heartbeat: 0,
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn scope_mapping_round_trip() {
+    for (proto, domain) in [
+      (
+        ProtoResourceScope::ClusterShared,
+        ResourceScope::ClusterShared,
+      ),
+      (ProtoResourceScope::NodeLocal, ResourceScope::NodeLocal),
+      (ProtoResourceScope::Unspecified, ResourceScope::NodeLocal),
+    ] {
+      assert_eq!(scope_from_proto(proto), domain);
+    }
+    for domain in [ResourceScope::ClusterShared, ResourceScope::NodeLocal] {
+      assert_eq!(scope_from_proto(scope_to_proto(domain)), domain);
     }
   }
 }
