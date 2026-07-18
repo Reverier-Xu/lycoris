@@ -20,6 +20,7 @@ enum ResourceKind {
   SKILL = 3;
   RULE = 4;
   WORKSPACE = 5;
+  PLUGIN = 6;
 }
 
 // Lifecycle state of a cluster member, mirroring the membership CRDT's
@@ -100,6 +101,27 @@ message WorkspaceBody {
   string content_hash = 5;
 }
 
+// A plugin package: the executable artifact plus its manifest (plugin system
+// design, section 4). `version` is the monotonic convergence version ordered
+// by anti-entropy; `content_hash` is the blake3 hex digest of `artifact`,
+// verified at ingest. `engine` is "wasm" or "lua"; `entry` is the exported
+// entry point ("invoke" unless overridden).
+//
+// `manifest` carries everything else as string keys with JSON values:
+// `semver` (human-facing SemVer string), `capabilities` (JSON array of
+// capability names), `hooks` (JSON array of hook points), `selector` (JSON
+// map of label terms deciding per-node activation) and `settings` (opaque
+// JSON passed to the plugin uninterpreted). Unknown keys are ignored so
+// newer manifests stay readable by older nodes.
+message PluginBody {
+  uint64 version = 1;
+  string content_hash = 2;
+  string engine = 3;
+  string entry = 4;
+  bytes artifact = 5;
+  map<string, string> manifest = 6;
+}
+
 message Resource {
   ResourceMetadata metadata = 1;
   oneof body {
@@ -109,6 +131,7 @@ message Resource {
     SkillBody skill = 5;
     RuleBody rule = 6;
     WorkspaceBody workspace = 7;
+    PluginBody plugin = 8;
   }
 }
 

@@ -156,6 +156,9 @@ impl ResourceMapper {
       }
       ResourceKind::Skill => self.list_versioned(VersionedKind::Skill, &selector, scope),
       ResourceKind::Rule => self.list_versioned(VersionedKind::Rule, &selector, scope),
+      // Nothing can store plugins until the storage domain lands; an empty
+      // listing is the only possible state.
+      ResourceKind::Plugin => Ok(Vec::new()),
       ResourceKind::Workspace => {
         let workspaces = self
           .list_workspaces(scope)
@@ -202,6 +205,8 @@ impl ResourceMapper {
       }
       ResourceKind::Skill => self.get_versioned(VersionedKind::Skill, id),
       ResourceKind::Rule => self.get_versioned(VersionedKind::Rule, id),
+      // See the `list` arm: no plugin can exist yet.
+      ResourceKind::Plugin => Err(MapperError::NotFound(id.to_string())),
       ResourceKind::Workspace => {
         let workspace = self
           .storage
