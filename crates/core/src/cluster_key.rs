@@ -140,4 +140,43 @@ mod tests {
       assert_ne!(key, ClusterKey::from_hex(&hex_of(bytes)).unwrap());
     }
   }
+
+  #[cfg(unix)]
+  #[test]
+  fn save_restricts_permissions_to_owner() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let key = ClusterKey::generate().unwrap();
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("cluster.key");
+    key.save(&path).unwrap();
+
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
+  }
+
+  #[test]
+  fn load_rejects_bad_hex() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("cluster.key");
+    std::fs::write(&path, "not-hex\n").unwrap();
+
+    let error = ClusterKey::load(&path).unwrap_err();
+    assert!(
+      matches!(error, ClusterKeyError::InvalidHex),
+      "expected InvalidHex, got {error}"
+    );
+  }
+
+  #[test]
+  fn load_reports_io_error_for_missing_file() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("missing.key");
+
+    let error = ClusterKey::load(&path).unwrap_err();
+    assert!(
+      matches!(error, ClusterKeyError::Io(_)),
+      "expected Io, got {error}"
+    );
+  }
 }

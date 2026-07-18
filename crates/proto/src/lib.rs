@@ -67,7 +67,30 @@ impl NodeInfo {
 
 #[cfg(test)]
 mod tests {
+  use std::collections::HashMap;
+
   use super::*;
+
+  #[test]
+  fn node_info_new_builds_active_registration() {
+    let before = now_ms();
+    let info = NodeInfo::new(
+      "node-1",
+      "https://127.0.0.1:5001",
+      HashMap::from([("zone".to_string(), "a".to_string())]),
+      HashMap::new(),
+    );
+    let after = now_ms();
+
+    assert_eq!(info.id, "node-1");
+    assert_eq!(info.address, "https://127.0.0.1:5001");
+    assert_eq!(info.state, NodeState::Active as i32);
+    assert_eq!(info.incarnation, 1);
+    assert_eq!(info.heartbeat, 0);
+    assert_eq!(info.labels.get("zone"), Some(&"a".to_string()));
+    assert!(info.annotations.is_empty());
+    assert!((before..=after).contains(&info.last_heartbeat_unix_ms));
+  }
 
   #[test]
   fn scope_mapping_round_trip() {

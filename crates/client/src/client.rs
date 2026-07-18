@@ -306,6 +306,41 @@ impl From<tonic::Status> for ClientError {
 mod tests {
   use super::*;
 
+  fn lazy_handle() -> ClusterClientHandle {
+    let channel = Channel::from_static("http://127.0.0.1:1").connect_lazy();
+    ClusterClientHandle::from_channel(channel)
+  }
+
+  #[tokio::test]
+  async fn attach_cluster_key_inserts_header() {
+    let client = lazy_handle().with_cluster_key("deadbeef");
+    let request = client.attach_cluster_key(Request::new(())).unwrap();
+    let value = request
+      .metadata()
+      .get(CLUSTER_KEY_HEADER)
+      .unwrap()
+      .to_str()
+      .unwrap();
+    assert_eq!(value, "deadbeef");
+  }
+
+  #[tokio::test]
+  async fn attach_cluster_key_without_key_leaves_metadata_empty() {
+    let client = lazy_handle();
+    let request = client.attach_cluster_key(Request::new(())).unwrap();
+    assert!(request.metadata().get(CLUSTER_KEY_HEADER).is_none());
+  }
+
+  #[tokio::test]
+  async fn attach_cluster_key_rejects_invalid_header_value() {
+    let client = lazy_handle().with_cluster_key("bad\nkey");
+    let error = client.attach_cluster_key(Request::new(())).unwrap_err();
+    assert!(
+      matches!(error, ClientError::InvalidClusterKey),
+      "expected InvalidClusterKey, got {error}"
+    );
+  }
+
   #[test]
   fn rejection_carries_server_reason() {
     let error = accepted("join", false, "cluster key mismatch".to_string()).unwrap_err();

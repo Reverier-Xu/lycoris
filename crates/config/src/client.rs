@@ -56,12 +56,20 @@ impl ClientConfig {
   /// the single implementation of the load-or-derive policy, shared by the
   /// CLI and anything else that needs a client configuration.
   pub fn load_default() -> Result<Self, ConfigError> {
-    if let Some(path) = default_client_config_path()
+    Self::load_or_derive(default_client_config_path().as_deref(), None)
+  }
+
+  /// The load-or-derive policy with the lookup locations made explicit, so
+  /// tests can exercise it without touching the real default directories.
+  fn load_or_derive(
+    client_path: Option<&Path>, daemon_path: Option<&Path>,
+  ) -> Result<Self, ConfigError> {
+    if let Some(path) = client_path
       && path.is_file()
     {
-      return Self::from_file(&path);
+      return Self::from_file(path);
     }
-    Ok(Self::from_daemon_config(&DaemonConfig::load(None)?))
+    Ok(Self::from_daemon_config(&DaemonConfig::load(daemon_path)?))
   }
 
   /// Derive a client configuration from a daemon configuration: the daemon's
@@ -95,15 +103,19 @@ impl ClientConfig {
   /// and convenient, since the key the user just initialized is found without
   /// extra configuration.
   pub fn resolve_cluster_key_path(&self) -> Option<PathBuf> {
+    self.resolve_cluster_key_path_with(&lycoris_core::default_cluster_key_path())
+  }
+
+  /// [`Self::resolve_cluster_key_path`] with the fallback location made
+  /// explicit, so tests can exercise the fallback without touching the real
+  /// default data directory.
+  fn resolve_cluster_key_path_with(&self, fallback: &Path) -> Option<PathBuf> {
     self
       .cluster_key_path
       .as_ref()
       .map(PathBuf::from)
       .filter(|path| path.is_file())
-      .or_else(|| {
-        let path = lycoris_core::default_cluster_key_path();
-        path.is_file().then_some(path)
-      })
+      .or_else(|| fallback.is_file().then(|| fallback.to_path_buf()))
   }
 
   /// Write the client configuration to a TOML file, creating parent directories
@@ -204,5 +216,67 @@ mod tests {
     let mut config = ClientConfig::from_daemon_config(&sample_daemon_config());
     config.cluster_key_path = Some(key_path.to_string_lossy().to_string());
     assert_eq!(config.resolve_cluster_key_path(), Some(key_path));
+  }
+
+  #[test]
+  fn resolve_cluster_key_path_falls_back_to_default_location() {
+    let dir = TempDir::new().unwrap();
+    let fallback = dir.path().join("default/cluster.key");
+    fs::create_dir_all(fallback.parent().unwrap()).unwrap();
+    fs::write(&fallback, "aa").unwrap();
+
+    // An explicit path that does not exist loses to the default location.
+    let mut config = ClientConfig::from_daemon_config(&sample_daemon_config());
+    config.cluster_key_path = Some(dir.path().join("missing.key").to_string_lossy().to_string());
+    assert_eq!(
+      config.resolve_cluster_key_path_with(&fallback),
+      Some(fallback.clone())
+    );
+
+    // No explicit path at all falls back the same way.
+    config.cluster_key_path = None;
+    assert_eq!(
+      config.resolve_cluster_key_path_with(&fallback),
+      Some(fallback)
+    );
+
+    // Neither source exists: nothing to resolve.
+    let missing = dir.path().join("none.key");
+    assert_eq!(config.resolve_cluster_key_path_with(&missing), None);
+  }
+
+  #[test]
+  fn load_or_derive_prefers_existing_client_file() {
+    let dir = TempDir::new().unwrap();
+    let client_path = dir.path().join("lycoris.client.conf");
+    let original = ClientConfig::from_daemon_config(&sample_daemon_config());
+    original.write_to_file(&client_path).unwrap();
+
+    let loaded = ClientConfig::load_or_derive(Some(&client_path), None).unwrap();
+    assert_eq!(loaded.api_address, original.api_address);
+  }
+
+  #[test]
+  fn load_or_derive_falls_back_to_daemon_config() {
+    let dir = TempDir::new().unwrap();
+    let daemon_path = dir.path().join("lycoris.toml");
+    sample_daemon_config().write_to_file(&daemon_path).unwrap();
+
+    let missing_client = dir.path().join("no-client.conf");
+    let loaded = ClientConfig::load_or_derive(Some(&missing_client), Some(&daemon_path)).unwrap();
+    assert_eq!(loaded.api_address, "https://127.0.0.1:5001");
+    assert_eq!(loaded.ca_cert, "ca.crt");
+
+    // A missing client path slot behaves the same as a missing file.
+    let loaded = ClientConfig::load_or_derive(None, Some(&daemon_path)).unwrap();
+    assert_eq!(loaded.api_address, "https://127.0.0.1:5001");
+  }
+
+  #[test]
+  fn load_or_derive_propagates_missing_daemon_config() {
+    let dir = TempDir::new().unwrap();
+    let missing = dir.path().join("missing.toml");
+    let error = ClientConfig::load_or_derive(Some(&missing), Some(&missing)).unwrap_err();
+    assert!(matches!(error, ConfigError::Io(_)));
   }
 }
