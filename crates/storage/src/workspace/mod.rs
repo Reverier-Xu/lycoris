@@ -33,8 +33,8 @@ pub enum WorkspaceStorageError {
   #[error("git command failed: {0}")]
   GitCommandFailed(String),
   /// A resource id that is not safe to use as a content-store file name.
-  #[error("invalid resource id: {0:?}")]
-  InvalidResourceId(String),
+  #[error(transparent)]
+  InvalidResourceId(#[from] crate::resource_id::InvalidResourceId),
 }
 
 impl From<std::io::Error> for WorkspaceStorageError {

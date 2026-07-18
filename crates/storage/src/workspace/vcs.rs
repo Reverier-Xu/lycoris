@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 
 use super::WorkspaceStorageError;
+use crate::resource_id;
 
 /// A content store backed by a version-control system.
 pub trait VersionedContentStore: std::fmt::Debug + Send + Sync {
@@ -59,29 +60,9 @@ impl GitContentStore {
   }
 }
 
-/// Validate a resource id before it is used to build a content file path.
-///
-/// Ids arrive from remote peers during anti-entropy; without this check a
-/// malicious id such as `../escape` would let a peer write outside the
-/// repository directory. Only non-empty ASCII alphanumeric ids with
-/// `-`/`_`/`.` are accepted; any `..` sequence or leading dot is rejected.
-fn validate_id(id: &str) -> Result<(), WorkspaceStorageError> {
-  let valid = !id.is_empty()
-    && !id.starts_with('.')
-    && !id.contains("..")
-    && id
-      .chars()
-      .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'));
-  if valid {
-    Ok(())
-  } else {
-    Err(WorkspaceStorageError::InvalidResourceId(id.to_string()))
-  }
-}
-
 impl VersionedContentStore for GitContentStore {
   fn write(&self, id: &str, content: &str, message: &str) -> Result<String, WorkspaceStorageError> {
-    validate_id(id)?;
+    resource_id::validate(id)?;
     self.initialize()?;
     let relative_path = format!("{id}.toml");
     std::fs::write(self.repo_path.join(&relative_path), content)?;
@@ -117,7 +98,7 @@ impl VersionedContentStore for GitContentStore {
   }
 
   fn read(&self, id: &str) -> Result<Option<String>, WorkspaceStorageError> {
-    validate_id(id)?;
+    resource_id::validate(id)?;
     match std::fs::read_to_string(self.repo_path.join(format!("{id}.toml"))) {
       Ok(content) => Ok(Some(content)),
       Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
