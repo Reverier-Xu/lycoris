@@ -225,6 +225,7 @@ mod tests {
       content_hash: format!("hash-{id}"),
       scope,
       source_node_id: None,
+      created_at_ms: now_ms(),
       updated_at_ms: now_ms(),
       metadata: [("lang".to_string(), "rust".to_string())]
         .into_iter()
@@ -240,6 +241,7 @@ mod tests {
       content_hash: format!("hash-{id}"),
       scope,
       source_node_id: None,
+      created_at_ms: now_ms(),
       updated_at_ms: now_ms(),
       metadata: [("severity".to_string(), "high".to_string())]
         .into_iter()

@@ -515,7 +515,8 @@ async fn shared_skills_replicate_via_anti_entropy() {
       content_hash: content_hash.clone(),
       scope: ResourceScope::ClusterShared,
       source_node_id: Some("node-0".to_string()),
-      updated_at_ms: now_ms(),
+      created_at_ms: 1_000,
+      updated_at_ms: 2_000,
       metadata: Default::default(),
     };
     storage
@@ -569,7 +570,7 @@ async fn shared_skills_replicate_via_anti_entropy() {
     .with_cluster_key(key_hex.clone());
 
   let start = std::time::Instant::now();
-  loop {
+  let replicated = loop {
     let resources = client
       .list_resources(
         ResourceKind::Skill,
@@ -578,21 +579,27 @@ async fn shared_skills_replicate_via_anti_entropy() {
       )
       .await
       .expect("list skills failed");
-    let found = resources.iter().any(|resource| {
+    let found = resources.into_iter().find(|resource| {
       resource
         .metadata
         .as_ref()
         .map(|metadata| metadata.id == "shared-skill")
         .unwrap_or(false)
     });
-    if found {
-      break;
+    if let Some(resource) = found {
+      break resource;
     }
     if start.elapsed() >= Duration::from_secs(10) {
       panic!("timed out waiting for shared skill to replicate to node-2");
     }
     time::sleep(Duration::from_millis(200)).await;
-  }
+  };
+
+  // The stored timestamps must reach the wire verbatim: created_at_ms is the
+  // origin's creation time, not a copy of updated_at_ms.
+  let metadata = replicated.metadata.expect("replicated skill metadata");
+  assert_eq!(metadata.created_at_ms, 1_000);
+  assert_eq!(metadata.updated_at_ms, 2_000);
 }
 
 async fn wait_for_resource(
@@ -634,6 +641,7 @@ fn memory_entry(
       .collect(),
     scope,
     source_node_id: Some("node-0".to_string()),
+    created_at_ms: updated_at_ms,
     updated_at_ms,
     content_hash,
     version: updated_at_ms as u64,
@@ -1187,6 +1195,7 @@ async fn memory_recall_works_after_replication() {
   let cluster_key = ClusterKey::generate().expect("generate cluster key");
   let key_hex = cluster_key.to_hex();
 
+  let stored_at = now_ms();
   {
     let storage =
       Storage::open(data_dirs[0].path().join("lycoris.redb")).expect("open node-0 storage");
@@ -1197,7 +1206,7 @@ async fn memory_recall_works_after_replication() {
       "recall-target",
       near,
       ResourceScope::ClusterShared,
-      now_ms(),
+      stored_at,
     );
     storage
       .agent()
@@ -1250,6 +1259,11 @@ async fn memory_recall_works_after_replication() {
     .await
     .expect("get memory failed")
     .expect("memory not found");
+  // The stored creation time must reach the wire verbatim instead of the
+  // previous hardcoded 0.
+  let metadata = resource.metadata.expect("memory metadata");
+  assert_eq!(metadata.created_at_ms, stored_at);
+  assert_eq!(metadata.updated_at_ms, stored_at);
   let body = match resource.body {
     Some(lycoris_proto::node::resource::Body::Memory(body)) => body,
     _ => panic!("unexpected resource body"),

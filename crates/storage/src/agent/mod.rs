@@ -55,6 +55,10 @@ pub struct MemoryEntry {
   pub scope: ResourceScope,
   /// `None` means this memory originated on the local node.
   pub source_node_id: Option<String>,
+  /// Creation time of the first version: set by the origin node when the
+  /// memory is first written and preserved across updates. Anti-entropy
+  /// applies take the wire value as authoritative.
+  pub created_at_ms: i64,
   pub updated_at_ms: i64,
   pub content_hash: String,
   pub version: u64,
@@ -228,6 +232,7 @@ impl LanceDbMemoryStorage {
       ),
       Field::new("scope", DataType::Utf8, false),
       Field::new("source_node_id", DataType::Utf8, true),
+      Field::new("created_at_ms", DataType::Int64, false),
       Field::new("updated_at_ms", DataType::Int64, false),
       Field::new("content_hash", DataType::Utf8, false),
       Field::new("version", DataType::UInt64, false),
@@ -313,6 +318,8 @@ impl LanceDbMemoryStorage {
         .map(|entry| entry.source_node_id.as_deref())
         .collect::<Vec<_>>(),
     );
+    let created_at_ms =
+      Int64Array::from_iter_values(entries.iter().map(|entry| entry.created_at_ms));
     let updated_at_ms =
       Int64Array::from_iter_values(entries.iter().map(|entry| entry.updated_at_ms));
     let content_hashes =
@@ -329,6 +336,7 @@ impl LanceDbMemoryStorage {
         Arc::new(embeddings),
         Arc::new(scopes),
         Arc::new(source_node_ids),
+        Arc::new(created_at_ms),
         Arc::new(updated_at_ms),
         Arc::new(content_hashes),
         Arc::new(versions),
@@ -440,6 +448,9 @@ fn parse_memory_batch(batch: &RecordBatch) -> Result<Vec<MemoryEntry>, AgentStor
   let source_node_id_col = batch
     .column_by_name("source_node_id")
     .ok_or_else(|| AgentStorageError::Backend("missing source_node_id column".to_string()))?;
+  let created_at_ms_col = batch
+    .column_by_name("created_at_ms")
+    .ok_or_else(|| AgentStorageError::Backend("missing created_at_ms column".to_string()))?;
   let updated_at_ms_col = batch
     .column_by_name("updated_at_ms")
     .ok_or_else(|| AgentStorageError::Backend("missing updated_at_ms column".to_string()))?;
@@ -476,6 +487,10 @@ fn parse_memory_batch(batch: &RecordBatch) -> Result<Vec<MemoryEntry>, AgentStor
     .ok_or_else(|| {
       AgentStorageError::Backend("source_node_id column has wrong type".to_string())
     })?;
+  let created_at_ms = created_at_ms_col
+    .as_any()
+    .downcast_ref::<Int64Array>()
+    .ok_or_else(|| AgentStorageError::Backend("created_at_ms column has wrong type".to_string()))?;
   let updated_at_ms = updated_at_ms_col
     .as_any()
     .downcast_ref::<Int64Array>()
@@ -519,6 +534,7 @@ fn parse_memory_batch(batch: &RecordBatch) -> Result<Vec<MemoryEntry>, AgentStor
       metadata,
       scope,
       source_node_id,
+      created_at_ms: created_at_ms.value(i),
       updated_at_ms: updated_at_ms.value(i),
       content_hash: content_hashes.value(i).to_string(),
       version: versions.value(i),
@@ -609,6 +625,7 @@ mod tests {
         .collect(),
       scope,
       source_node_id: None,
+      created_at_ms: updated_at_ms,
       updated_at_ms,
       content_hash,
       version: updated_at_ms as u64,
@@ -755,17 +772,19 @@ mod tests {
     let memory = agent.memory();
     let dim = DEFAULT_EMBEDDING_DIM;
 
-    let entry = memory_entry(
+    let mut entry = memory_entry(
       "entry-1",
       vec![0.5_f32; dim],
       ResourceScope::ClusterShared,
       42,
     );
+    entry.created_at_ms = 7;
     memory.store(&entry).await.unwrap();
 
     let loaded = memory.get("entry-1").await.unwrap().unwrap();
     assert_eq!(loaded.id, "entry-1");
     assert_eq!(loaded.scope, ResourceScope::ClusterShared);
+    assert_eq!(loaded.created_at_ms, 7);
     assert_eq!(loaded.updated_at_ms, 42);
     assert_eq!(loaded.content_hash, entry.content_hash);
   }

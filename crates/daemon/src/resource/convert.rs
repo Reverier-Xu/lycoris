@@ -123,7 +123,7 @@ pub(super) fn memory_to_resource(entry: MemoryEntry, full: bool) -> Resource {
       MetadataBuilder::new(&entry.id, &entry.id, ResourceKind::Memory)
         .labels(entry.metadata.clone())
         .scope(entry.scope, entry.source_node_id.as_deref())
-        .timestamps(0, entry.updated_at_ms)
+        .timestamps(entry.created_at_ms, entry.updated_at_ms)
         .build(),
     ),
     body: Some(Body::Memory(MemoryBody {
@@ -163,7 +163,7 @@ pub(super) fn versioned_to_resource(
   let metadata = MetadataBuilder::new(&record.id, &record.name, kind.resource_kind())
     .labels(record.metadata.clone().into_iter().collect())
     .scope(record.scope, record.source_node_id.as_deref())
-    .timestamps(record.updated_at_ms, record.updated_at_ms)
+    .timestamps(record.created_at_ms, record.updated_at_ms)
     .build();
   let (version, content_hash, content, labels) = (
     record.version,
@@ -232,6 +232,7 @@ pub(super) fn resource_to_memory(
     metadata: body.metadata.clone(),
     scope: metadata_scope(metadata)?,
     source_node_id: metadata_source_node_id(metadata),
+    created_at_ms: metadata.created_at_ms,
     updated_at_ms: metadata.updated_at_ms,
     content_hash: body.content_hash.clone(),
     version: body.version,
@@ -250,6 +251,7 @@ fn resource_to_versioned(
     content_hash: content_hash.to_string(),
     scope: metadata_scope(metadata)?,
     source_node_id: metadata_source_node_id(metadata),
+    created_at_ms: metadata.created_at_ms,
     updated_at_ms: metadata.updated_at_ms,
     metadata: metadata.labels.clone().into_iter().collect(),
   })

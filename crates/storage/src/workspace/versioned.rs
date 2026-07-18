@@ -23,6 +23,10 @@ pub struct VersionedResource {
   pub scope: ResourceScope,
   /// `None` means this resource originated on the local node.
   pub source_node_id: Option<String>,
+  /// Creation time of the first version: set by the origin node when the
+  /// resource is first written and preserved across updates. Anti-entropy
+  /// applies take the wire value as authoritative.
+  pub created_at_ms: i64,
   pub updated_at_ms: i64,
   /// `BTreeMap` keeps the postcard encoding deterministic across processes.
   pub metadata: BTreeMap<String, String>,
