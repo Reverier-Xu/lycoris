@@ -45,6 +45,7 @@ lycoris-proto     = { path = "crates/proto" }
 lycoris-storage   = { path = "crates/storage" }
 lycoris-tls       = { path = "crates/tls" }
 blake3        = "1.8"
+mlua          = { version = "0.12", features = ["lua54", "vendored", "serialize", "send"] }
 owo-colors    = "4.3"
 postcard      = { version = "1.0", features = ["use-std"] }
 prost         = "0.13"

@@ -14,10 +14,12 @@ version.workspace      = true
 [dependencies]
 async-trait = { workspace = true }
 blake3      = { workspace = true }
+mlua        = { workspace = true }
 semver      = { workspace = true }
 serde       = { workspace = true }
 serde_json  = { workspace = true }
 thiserror   = { workspace = true }
+tokio       = { workspace = true }
 
 [lints]
 workspace = true
