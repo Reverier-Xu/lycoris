@@ -68,16 +68,16 @@ impl ClusterSync {
   /// recorded by `sync_with_peer` (`mark_seen`); failure is recorded here
   /// (`mark_attempt`) so the selection policy backs off from recently-failed
   /// endpoints.
+  ///
+  /// There is deliberately no timeout around the whole exchange: every peer
+  /// RPC inside `sync_with_peer` carries its own `RPC_TIMEOUT`, and an outer
+  /// bound would fire before the inner ones, making the per-RPC fallback
+  /// branches (e.g. Merkle timeout -> full sync) unreachable.
   async fn sync_attempt(&self, peer: &str) -> bool {
-    match timeout(RPC_TIMEOUT, self.sync_with_peer(peer)).await {
-      Ok(Ok(())) => true,
-      Ok(Err(error)) => {
+    match self.sync_with_peer(peer).await {
+      Ok(()) => true,
+      Err(error) => {
         tracing::warn!(%peer, %error, "peer sync failed");
-        self.record_peer_failure(peer).await;
-        false
-      }
-      Err(_) => {
-        tracing::warn!(%peer, "peer sync timed out");
         self.record_peer_failure(peer).await;
         false
       }
@@ -160,10 +160,15 @@ impl ClusterSync {
     let fetched = if diff.need_from_remote.is_empty() {
       Vec::new()
     } else {
-      client
-        .membership
-        .fetch_registers(diff.need_from_remote)
-        .await?
+      match timeout(
+        RPC_TIMEOUT,
+        client.membership.fetch_registers(diff.need_from_remote),
+      )
+      .await
+      {
+        Ok(result) => result?,
+        Err(_) => return Err(crate::peer_timeout("fetch registers")),
+      }
     };
 
     let local_registers = self
@@ -178,10 +183,19 @@ impl ClusterSync {
       .await;
     let local_registers: Vec<_> = local_registers.iter().map(register_to_proto).collect();
 
-    if !local_registers.is_empty()
-      && let Err(error) = client.membership.push_registers(local_registers).await
-    {
-      tracing::warn!(%peer, %error, "failed to push local registers");
+    if !local_registers.is_empty() {
+      // Pushing is best-effort: the peer pulls the same registers on its next
+      // diff round, so a failure only costs propagation delay.
+      match timeout(
+        RPC_TIMEOUT,
+        client.membership.push_registers(local_registers),
+      )
+      .await
+      {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(%peer, %error, "failed to push local registers"),
+        Err(_) => tracing::warn!(%peer, "pushing local registers timed out"),
+      }
     }
 
     if !fetched.is_empty() {

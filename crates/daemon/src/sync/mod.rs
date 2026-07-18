@@ -30,7 +30,10 @@ use tokio::{
 use self::gossip::{DedupSet, MAX_SEEN_PUSHES, MAX_SEEN_STATES, PersistedSequence};
 use crate::{membership::MembershipService, transport::PeerPool};
 
-/// Timeout applied to every peer RPC driven by this module tree.
+/// Timeout applied to each individual peer RPC call driven by this module
+/// tree. Exchange flows (a Merkle anti-entropy round, a gossip send) wrap
+/// every call separately and never the exchange as a whole, so per-call
+/// fallback branches stay reachable.
 const RPC_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Orchestrates peer-to-peer membership synchronization.
