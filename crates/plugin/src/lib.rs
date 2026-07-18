@@ -13,9 +13,11 @@ mod error;
 mod lua;
 mod manifest;
 mod package;
+mod wasm;
 
 pub use engine::{EngineKind, EngineLimits, PluginEngine, PluginInstance};
 pub use error::{PluginError, Result};
 pub use lua::LuaEngine;
 pub use manifest::{DEFAULT_ENTRY, HookDecl, HookErrorPolicy, PluginManifest};
 pub use package::PluginPackage;
+pub use wasm::WasmEngine;
