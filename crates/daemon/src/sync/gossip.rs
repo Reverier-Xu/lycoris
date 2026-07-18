@@ -113,14 +113,28 @@ impl ClusterSync {
   pub(super) async fn broadcast_push(&self, info: ProtoNodeInfo, origin: String, sequence: u64) {
     let local_address = self.local_address().await.unwrap_or_default();
     let targets = targets(&self.node, &local_address, now_ms());
+    // Fan out concurrently: a sequential loop costs up to N x RPC_TIMEOUT per
+    // round, which stalls the dispatching task and lets work pile up while a
+    // partition makes targets time out one by one.
+    let mut fanout = tokio::task::JoinSet::new();
     for peer in targets {
-      self
-        .send_with_bookkeeping(
-          &peer,
-          "push",
-          self.push_to_peer(&peer, info.clone(), origin.clone(), sequence),
-        )
-        .await;
+      let sync = self.clone();
+      let info = info.clone();
+      let origin = origin.clone();
+      fanout.spawn(async move {
+        sync
+          .send_with_bookkeeping(
+            &peer,
+            "push",
+            sync.push_to_peer(&peer, info, origin, sequence),
+          )
+          .await;
+      });
+    }
+    while let Some(result) = fanout.join_next().await {
+      if let Err(error) = result {
+        tracing::warn!(%error, "gossip fan-out task failed");
+      }
     }
   }
 
@@ -156,14 +170,25 @@ impl ClusterSync {
   pub(super) async fn broadcast_state_message(&self, message: StateMessage) {
     let local_address = self.local_address().await.unwrap_or_default();
     let targets = targets(&self.node, &local_address, now_ms());
+    // Concurrent fan-out, same as `broadcast_push`.
+    let mut fanout = tokio::task::JoinSet::new();
     for peer in targets {
-      self
-        .send_with_bookkeeping(
-          &peer,
-          "state message",
-          self.send_state_message_to_peer(&peer, message.clone()),
-        )
-        .await;
+      let sync = self.clone();
+      let message = message.clone();
+      fanout.spawn(async move {
+        sync
+          .send_with_bookkeeping(
+            &peer,
+            "state message",
+            sync.send_state_message_to_peer(&peer, message),
+          )
+          .await;
+      });
+    }
+    while let Some(result) = fanout.join_next().await {
+      if let Err(error) = result {
+        tracing::warn!(%error, "gossip fan-out task failed");
+      }
     }
   }
 

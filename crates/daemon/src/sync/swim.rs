@@ -127,6 +127,11 @@ impl ClusterSync {
       .await;
   }
 
+  /// Send one SWIM probe to a member. Failures share the reachability
+  /// bookkeeping of every other peer RPC in this module tree (failed attempt
+  /// mark + channel eviction): probe targets and sync endpoints are the same
+  /// addresses, and the single selection policy (D9) should back off from a
+  /// member that probes cannot reach either.
   async fn send_probe_to(&self, target_id: &str, seq: u64) -> bool {
     let address = match self.resolve_address(target_id).await {
       Some(addr) => addr,
@@ -136,7 +141,7 @@ impl ClusterSync {
     let mut client = match self.pool.connect(&address).await {
       Ok(client) => client,
       Err(_) => {
-        self.pool.remove(&address).await;
+        self.record_peer_failure(&address).await;
         return false;
       }
     };
@@ -153,12 +158,12 @@ impl ClusterSync {
       }
       Ok(Err(error)) => {
         tracing::warn!(%target_id, %error, "probe failed");
-        self.pool.remove(&address).await;
+        self.record_peer_failure(&address).await;
         false
       }
       Err(_) => {
         tracing::warn!(%target_id, "probe timed out");
-        self.pool.remove(&address).await;
+        self.record_peer_failure(&address).await;
         false
       }
     }
