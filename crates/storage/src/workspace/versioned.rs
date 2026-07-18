@@ -37,6 +37,10 @@ impl crate::versioned::VersionedRecord for VersionedResource {
     self.updated_at_ms
   }
 
+  fn content_hash(&self) -> &str {
+    &self.content_hash
+  }
+
   fn scope(&self) -> ResourceScope {
     self.scope
   }
