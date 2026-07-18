@@ -23,7 +23,7 @@ pub use table::RedbTableStorage;
 pub use versioned::{ContentHashMismatch, VersionedRecord, should_apply_versioned};
 pub use workspace::{
   RedbRuleStorage, RedbSkillStorage, RedbWorkspaceStorage, RuleRecord, RuleStorage, SkillRecord,
-  SkillStorage, VersionedContentStore, VersionedResource, WorkspaceDomain,
+  SkillStorage, VersionedContentStore, VersionedResource, VersionedStorage, WorkspaceDomain,
   WorkspaceMetadataStorage, WorkspaceRecord, WorkspaceStorageError,
 };
 

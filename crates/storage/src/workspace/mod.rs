@@ -21,7 +21,7 @@ pub use rule::{RedbRuleStorage, RuleContentStore, RuleRecord, RuleStorage};
 pub use skill::{RedbSkillStorage, SkillContentStore, SkillRecord, SkillStorage};
 pub use store::{RedbWorkspaceStorage, WorkspaceMetadataStorage, WorkspaceRecord};
 pub use vcs::VersionedContentStore;
-pub use versioned::VersionedResource;
+pub use versioned::{VersionedResource, VersionedStorage};
 
 /// Errors that can occur in workspace storage backends.
 #[derive(Debug, thiserror::Error)]

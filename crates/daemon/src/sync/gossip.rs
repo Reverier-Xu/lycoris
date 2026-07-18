@@ -202,6 +202,11 @@ impl ClusterSync {
 
   /// Handle an incoming node push: deduplicate on `(origin, sequence)`, merge,
   /// and forward to our own targets in the background.
+  ///
+  /// The rpc layer answers every well-formed push with `accepted: true`: the
+  /// flag only means the request was received — deduplication and the merge
+  /// decision happen here, so a duplicate or stale push is silently dropped
+  /// after the ack.
   pub async fn serve_push_node(&self, info: ProtoNodeInfo, origin: String, sequence: u64) {
     let is_new = self
       .seen_pushes

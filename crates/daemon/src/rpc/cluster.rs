@@ -17,12 +17,9 @@ use tonic::{Request, Response, Status};
 
 use crate::sync::ClusterSync;
 
-pub type SyncServerHandle = SyncServer<ClusterSync>;
-pub type MembershipServerHandle = MembershipServer<ClusterSync>;
-
 impl ClusterSync {
   /// Build the tonic server handles serving this instance.
-  pub fn servers(&self) -> (SyncServerHandle, MembershipServerHandle) {
+  pub fn servers(&self) -> (SyncServer<ClusterSync>, MembershipServer<ClusterSync>) {
     (
       SyncServer::new(self.clone())
         .max_decoding_message_size(lycoris_client::MAX_RPC_MESSAGE_BYTES)

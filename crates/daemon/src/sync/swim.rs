@@ -191,6 +191,10 @@ impl ClusterSync {
   }
 
   /// Handle an incoming state message (Suspect/Leave rumor).
+  ///
+  /// As with `serve_push_node`, the rpc layer reports `accepted: true` for
+  /// every well-formed message; deduplication and the merge decision happen
+  /// here, so `accepted` does not imply the rumor was merged.
   pub async fn serve_state_message(&self, message: StateMessage) {
     let from = self.local_node_id.clone();
 
