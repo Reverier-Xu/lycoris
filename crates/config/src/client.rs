@@ -3,8 +3,10 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-  daemon::DaemonConfig, error::ConfigError, paths::default_client_config_path,
-  validation::non_empty_string,
+  daemon::DaemonConfig,
+  error::ConfigError,
+  paths::default_client_config_path,
+  validation::{non_empty_string, validate_https_address},
 };
 
 /// Client configuration used by the `lycoris` CLI to talk to a daemon node.
@@ -32,7 +34,14 @@ pub struct ClientConfig {
 
 impl ClientConfig {
   pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
-    crate::toml_file::read(path.as_ref())
+    let config: ClientConfig = crate::toml_file::read(path.as_ref())?;
+    config.validate()?;
+    Ok(config)
+  }
+
+  fn validate(&self) -> Result<(), ConfigError> {
+    validate_https_address(&self.api_address)?;
+    Ok(())
   }
 
   /// Load the client configuration from the default locations.
@@ -163,6 +172,27 @@ mod tests {
     "#;
     let result: Result<ClientConfig, _> = toml::from_str(toml);
     assert!(result.is_err());
+  }
+
+  #[test]
+  fn reject_non_https_api_address() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("lycoris.client.conf");
+    fs::write(
+      &path,
+      r#"
+        api_address = "http://127.0.0.1:5001"
+        ca_cert = "ca.crt"
+        cert = "node.crt"
+        key = "node.key"
+      "#,
+    )
+    .unwrap();
+    let error = ClientConfig::from_file(&path).unwrap_err();
+    assert!(
+      matches!(error, ConfigError::InvalidNodeAddress { .. }),
+      "expected InvalidNodeAddress, got {error}"
+    );
   }
 
   #[test]

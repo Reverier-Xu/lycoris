@@ -3,9 +3,9 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-  error::{ConfigError, InvalidAddressError},
+  error::ConfigError,
   paths::{default_daemon_config_path, default_data_dir},
-  validation::non_empty_string,
+  validation::{non_empty_string, validate_https_address},
 };
 
 /// Node bootstrap configuration.
@@ -59,9 +59,9 @@ impl DaemonConfig {
   }
 
   fn validate(&self) -> Result<(), ConfigError> {
-    validate_cluster_address(&self.node.address)?;
+    validate_https_address(&self.node.address)?;
     for (index, peer) in self.cluster.bootstrap_peers.iter().enumerate() {
-      validate_cluster_address(peer)
+      validate_https_address(peer)
         .map_err(|source| ConfigError::InvalidPeerAddress { index, source })?;
     }
     Ok(())
@@ -75,6 +75,7 @@ impl DaemonConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeConfig {
   #[serde(deserialize_with = "non_empty_string")]
   pub id: String,
@@ -83,6 +84,7 @@ pub struct NodeConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClusterConfig {
   #[serde(deserialize_with = "non_empty_string")]
   pub listen_address: String,
@@ -92,6 +94,7 @@ pub struct ClusterConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct TlsConfig {
   #[serde(deserialize_with = "non_empty_string")]
   pub ca_cert: String,
@@ -101,14 +104,6 @@ pub struct TlsConfig {
   pub cert: String,
   #[serde(deserialize_with = "non_empty_string")]
   pub key: String,
-}
-
-fn validate_cluster_address(address: &str) -> Result<(), InvalidAddressError> {
-  if address.starts_with("https://") {
-    Ok(())
-  } else {
-    Err(InvalidAddressError(address.to_string()))
-  }
 }
 
 #[cfg(test)]
@@ -155,6 +150,19 @@ mod tests {
     let toml = VALID_TOML.replace("certs/ca.key", "");
     let result: Result<DaemonConfig, _> = toml::from_str(&toml);
     assert!(result.is_err());
+  }
+
+  #[test]
+  fn reject_unknown_field_in_nested_sections() {
+    for (anchor, unknown) in [
+      ("id = \"node-01\"", "node_typo = 1"),
+      ("listen_address = \"0.0.0.0:5001\"", "peer = 1"),
+      ("ca_cert = \"certs/ca.crt\"", "ca_certt = 1"),
+    ] {
+      let toml = VALID_TOML.replace(anchor, &format!("{anchor}\n{unknown}"));
+      let result: Result<DaemonConfig, _> = toml::from_str(&toml);
+      assert!(result.is_err(), "unknown field '{unknown}' was accepted");
+    }
   }
 
   #[test]
