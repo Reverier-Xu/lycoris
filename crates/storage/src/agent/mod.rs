@@ -245,11 +245,15 @@ impl LanceDbMemoryStorage {
   }
 
   /// Open the memory table, returning `None` when it has not been created yet.
+  ///
+  /// Only a genuine missing table yields `None`; every other open failure is
+  /// propagated instead of being mistaken for an empty store.
   async fn memory_table(&self) -> Result<Option<lancedb::Table>, AgentStorageError> {
     let conn = self.connection().await?;
     match conn.open_table(MEMORY_TABLE).execute().await {
       Ok(table) => Ok(Some(table)),
-      Err(_) => Ok(None),
+      Err(lancedb::Error::TableNotFound { .. }) => Ok(None),
+      Err(error) => Err(backend_err(error)),
     }
   }
 
@@ -357,13 +361,16 @@ impl MemoryStorage for LanceDbMemoryStorage {
           .await
           .map_err(backend_err)?;
       }
-      Err(_) => {
+      Err(lancedb::Error::TableNotFound { .. }) => {
         conn
           .create_table(MEMORY_TABLE, batch)
           .execute()
           .await
           .map_err(backend_err)?;
       }
+      // Any other open failure is a real error, not a missing table; creating
+      // the table here would mask it.
+      Err(error) => return Err(backend_err(error)),
     }
     Ok(())
   }
@@ -649,6 +656,20 @@ mod tests {
     let list = domain.sessions().list().unwrap();
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].id, "session-b");
+  }
+
+  #[tokio::test]
+  async fn memory_queries_on_fresh_store_are_empty() {
+    let dir = TempDir::new().unwrap();
+    let storage = Storage::open(dir.path().join("agent.redb")).unwrap();
+    let agent = storage.agent();
+
+    // The table does not exist yet; only a genuine TableNotFound may be
+    // treated as an empty store.
+    assert!(agent.memory().list().await.unwrap().is_empty());
+    assert!(agent.memory().list_shared().await.unwrap().is_empty());
+    assert!(agent.memory().list_local().await.unwrap().is_empty());
+    assert!(agent.memory().get("missing").await.unwrap().is_none());
   }
 
   #[tokio::test]
