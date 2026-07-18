@@ -11,11 +11,21 @@ use tonic::transport::{Certificate, ClientTlsConfig, Identity, ServerTlsConfig};
 
 /// Install the rustls ring crypto provider as the process default.
 ///
-/// This must be called before any TLS connection is established. Subsequent
-/// calls return the already-installed provider and can be ignored by callers
-/// that only need to ensure the provider is present.
+/// This must be called before any TLS connection is established. The call is
+/// idempotent: a provider that is already installed — by an earlier call or
+/// by the embedding process — is kept and reported as success, so callers
+/// can (and should) treat any returned error as fatal.
 pub fn install_crypto_provider() -> Result<(), std::sync::Arc<rustls::crypto::CryptoProvider>> {
-  rustls::crypto::ring::default_provider().install_default()
+  if rustls::crypto::CryptoProvider::get_default().is_some() {
+    return Ok(());
+  }
+  match rustls::crypto::ring::default_provider().install_default() {
+    Ok(()) => Ok(()),
+    // A concurrent installation won the race: a provider is present, which is
+    // all this function guarantees.
+    Err(_) if rustls::crypto::CryptoProvider::get_default().is_some() => Ok(()),
+    Err(provider) => Err(provider),
+  }
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +80,12 @@ mod tests {
 
   use super::*;
   use crate::generate::ensure_tls_bundle;
+
+  #[test]
+  fn install_crypto_provider_is_idempotent() {
+    install_crypto_provider().unwrap();
+    install_crypto_provider().unwrap();
+  }
 
   #[test]
   fn load_tls_bundle_round_trip() {

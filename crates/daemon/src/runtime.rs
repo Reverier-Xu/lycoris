@@ -35,6 +35,8 @@ pub enum RuntimeError {
   InvalidAddress(#[from] std::net::AddrParseError),
   #[error("transport error: {0}")]
   Transport(#[from] tonic::transport::Error),
+  #[error("failed to install crypto provider")]
+  CryptoProvider,
 }
 
 /// Process shutdown signal streams, registered synchronously at startup.
@@ -93,7 +95,10 @@ fn spawn_shutdown_watcher(shutdown_tx: watch::Sender<bool>) -> Result<(), Runtim
 
 /// Run the daemon until the process is interrupted.
 pub async fn run(config: DaemonConfig) -> Result<(), RuntimeError> {
-  let _ = install_crypto_provider();
+  // Fail startup fast when the provider cannot be installed: every TLS
+  // connection depends on it, so continuing would surface as obscure
+  // handshake errors much later (same policy as the shell).
+  install_crypto_provider().map_err(|_| RuntimeError::CryptoProvider)?;
   let cluster_key = load_cluster_key(&config.data_dir);
   write_client_config(&config, cluster_key.as_ref());
 
