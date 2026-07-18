@@ -12,8 +12,28 @@ const KEY_LENGTH: usize = 32;
 
 /// A 32-byte cluster-shared key used to authorize new members joining the
 /// cluster.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, Eq)]
 pub struct ClusterKey([u8; KEY_LENGTH]);
+
+/// Constant-time equality: keys are compared at the rpc admission boundary,
+/// so the comparison must not leak key material through timing.
+impl PartialEq for ClusterKey {
+  fn eq(&self, other: &Self) -> bool {
+    let mut diff = 0u8;
+    for (left, right) in self.0.iter().zip(other.0.iter()) {
+      diff |= left ^ right;
+    }
+    diff == 0
+  }
+}
+
+/// Redacted output: the key is a 32-byte shared secret and must never reach
+/// logs through `Debug` formatting.
+impl std::fmt::Debug for ClusterKey {
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    formatter.write_str("ClusterKey([redacted])")
+  }
+}
 
 impl ClusterKey {
   /// Generate a new random cluster key.
@@ -130,5 +150,24 @@ mod tests {
   fn from_hex_rejects_invalid_length() {
     let hex = "a".repeat(KEY_LENGTH * 2 - 2);
     assert!(ClusterKey::from_hex(&hex).is_err());
+  }
+
+  #[test]
+  fn debug_output_is_redacted() {
+    let key = ClusterKey::generate().unwrap();
+    let rendered = format!("{key:?}");
+    assert_eq!(rendered, "ClusterKey([redacted])");
+    assert!(!rendered.contains(&key.to_hex()));
+  }
+
+  #[test]
+  fn equality_compares_every_byte() {
+    let key = ClusterKey::from_bytes([0xAA; KEY_LENGTH]);
+    assert_eq!(key, ClusterKey::from_bytes([0xAA; KEY_LENGTH]));
+    for index in [0, KEY_LENGTH - 1] {
+      let mut bytes = [0xAA; KEY_LENGTH];
+      bytes[index] ^= 0x01;
+      assert_ne!(key, ClusterKey::from_bytes(bytes));
+    }
   }
 }

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use lycoris_core::ClusterKey;
+use lycoris_core::{ClusterKey, ClusterKeyError};
 use lycoris_proto::CLUSTER_KEY_HEADER;
 use tonic::{Request, Status};
 
@@ -11,18 +11,21 @@ use tonic::{Request, Status};
 ///   server-side precondition is unmet, unlike the caller-side auth failures
 ///   below), or
 /// - the caller did not supply a cluster key, or
-/// - the supplied key is malformed, or
+/// - the supplied key cannot be used: malformed hex, or a header value that is
+///   not a valid header string — both are "supplied but unusable" and take the
+///   same `permission_denied` path, never the missing-key path, or
 /// - the supplied key does not match the expected key.
 #[allow(clippy::result_large_err)]
 pub fn cluster_key_interceptor(
   expected: Option<Arc<ClusterKey>>,
 ) -> impl Fn(Request<()>) -> Result<Request<()>, Status> + Clone {
   move |request: Request<()>| {
-    let provided = request
-      .metadata()
-      .get(CLUSTER_KEY_HEADER)
-      .and_then(|value| value.to_str().ok())
-      .map(ClusterKey::from_hex);
+    let provided = request.metadata().get(CLUSTER_KEY_HEADER).map(|value| {
+      value
+        .to_str()
+        .map_err(|_| ClusterKeyError::InvalidHex)
+        .and_then(ClusterKey::from_hex)
+    });
 
     match (&expected, provided) {
       (Some(expected), Some(Ok(provided))) if provided == **expected => Ok(request),
@@ -33,5 +36,60 @@ pub fn cluster_key_interceptor(
         "this node has not initialized a cluster key; run 'lycoris cluster init' first",
       )),
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use tonic::{Code, metadata::MetadataValue};
+
+  use super::*;
+
+  fn key() -> ClusterKey {
+    ClusterKey::from_bytes([0xAB; 32])
+  }
+
+  fn request_with_key(value: &str) -> Request<()> {
+    let mut request = Request::new(());
+    request
+      .metadata_mut()
+      .insert(CLUSTER_KEY_HEADER, MetadataValue::try_from(value).unwrap());
+    request
+  }
+
+  #[test]
+  fn accepts_matching_key() {
+    let expected = Arc::new(key());
+    let interceptor = cluster_key_interceptor(Some(expected.clone()));
+    assert!(interceptor(request_with_key(&expected.to_hex())).is_ok());
+  }
+
+  #[test]
+  fn rejects_mismatched_key() {
+    let interceptor = cluster_key_interceptor(Some(Arc::new(key())));
+    let other = ClusterKey::from_bytes([0xCD; 32]);
+    let status = interceptor(request_with_key(&other.to_hex())).unwrap_err();
+    assert_eq!(status.code(), Code::PermissionDenied);
+  }
+
+  #[test]
+  fn rejects_malformed_key() {
+    let interceptor = cluster_key_interceptor(Some(Arc::new(key())));
+    let status = interceptor(request_with_key("not-hex")).unwrap_err();
+    assert_eq!(status.code(), Code::PermissionDenied);
+  }
+
+  #[test]
+  fn rejects_missing_key() {
+    let interceptor = cluster_key_interceptor(Some(Arc::new(key())));
+    let status = interceptor(Request::new(())).unwrap_err();
+    assert_eq!(status.code(), Code::Unauthenticated);
+  }
+
+  #[test]
+  fn rejects_when_node_has_no_key() {
+    let interceptor = cluster_key_interceptor(None);
+    let status = interceptor(request_with_key(&key().to_hex())).unwrap_err();
+    assert_eq!(status.code(), Code::FailedPrecondition);
   }
 }

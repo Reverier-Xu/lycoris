@@ -213,6 +213,11 @@ pub async fn run_with_shutdown(
   tracing::info!(%addr, "node api server listening");
 
   let server_shutdown = shutdown.clone();
+  // Authentication boundary (deliberate layering): the cluster-key
+  // interceptor guards only the Cluster service — the admission plane reached
+  // by operators and joining members. The Sync and Membership services are
+  // node-to-node; node identity there comes from the mTLS handshake against
+  // the cluster CA, so they carry no cluster-key check.
   // The message limits live on `ClusterServer`, so they are applied before
   // wrapping it into the intercepted service (`with_interceptor` only takes
   // the raw inner service).
