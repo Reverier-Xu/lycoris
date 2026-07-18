@@ -11,14 +11,14 @@ use std::collections::HashMap;
 use lycoris_core::ResourceScope;
 use lycoris_proto::{
   node::{
-    MemoryBody, NodeBody, NodeInfo, Resource, ResourceKind, ResourceMetadata,
+    MemoryBody, NodeBody, NodeInfo, PluginBody, Resource, ResourceKind, ResourceMetadata,
     ResourceScope as ProtoResourceScope, RuleBody, SessionBody, SkillBody, WorkspaceBody,
     resource::Body,
   },
   scope_from_proto, scope_to_proto,
 };
 use lycoris_storage::{
-  MemoryEntry, RuleRecord, Session, SkillRecord, VersionedResource, WorkspaceRecord,
+  MemoryEntry, PluginRecord, RuleRecord, Session, SkillRecord, VersionedResource, WorkspaceRecord,
 };
 
 use super::error::MapperError;
@@ -196,6 +196,31 @@ pub(super) fn workspace_to_resource(workspace: WorkspaceRecord) -> Resource {
   }
 }
 
+/// Convert a stored plugin record into the wire resource.
+///
+/// Plugin configuration lives in the manifest (design section 4), so plugin
+/// metadata carries no labels. Listings pass `None` for the artifact to keep
+/// list responses small; `get` and the anti-entropy snapshot carry the full
+/// artifact bytes.
+pub(super) fn plugin_to_resource(record: PluginRecord, artifact: Option<Vec<u8>>) -> Resource {
+  Resource {
+    metadata: Some(
+      MetadataBuilder::new(&record.id, &record.name, ResourceKind::Plugin)
+        .scope(record.scope, record.source_node_id.as_deref())
+        .timestamps(record.created_at_ms, record.updated_at_ms)
+        .build(),
+    ),
+    body: Some(Body::Plugin(PluginBody {
+      version: record.version,
+      content_hash: record.content_hash,
+      engine: record.engine,
+      entry: record.entry,
+      artifact: artifact.unwrap_or_default(),
+      manifest: record.manifest.into_iter().collect(),
+    })),
+  }
+}
+
 /// Decode the scope carried by resource metadata into the domain type.
 pub(super) fn metadata_scope(metadata: &ResourceMetadata) -> Result<ResourceScope, MapperError> {
   let scope = ProtoResourceScope::try_from(metadata.scope)
@@ -270,4 +295,103 @@ pub(super) fn resource_to_workspace(
     created_at_ms: metadata.created_at_ms,
     updated_at_ms: metadata.updated_at_ms,
   })
+}
+
+pub(super) fn resource_to_plugin(
+  metadata: &ResourceMetadata, body: &PluginBody,
+) -> Result<PluginRecord, MapperError> {
+  Ok(PluginRecord {
+    id: metadata.id.clone(),
+    name: metadata.name.clone(),
+    version: body.version,
+    engine: body.engine.clone(),
+    entry: body.entry.clone(),
+    content_hash: body.content_hash.clone(),
+    scope: metadata_scope(metadata)?,
+    source_node_id: metadata_source_node_id(metadata),
+    created_at_ms: metadata.created_at_ms,
+    updated_at_ms: metadata.updated_at_ms,
+    manifest: body.manifest.clone().into_iter().collect(),
+  })
+}
+
+#[cfg(test)]
+mod tests {
+  use std::collections::BTreeMap;
+
+  use super::*;
+
+  fn plugin_record(manifest: BTreeMap<String, String>) -> PluginRecord {
+    PluginRecord {
+      id: "plug-1".to_string(),
+      name: "echo".to_string(),
+      version: 7,
+      engine: "lua".to_string(),
+      entry: "invoke".to_string(),
+      content_hash: "abc123".to_string(),
+      scope: ResourceScope::ClusterShared,
+      source_node_id: Some("node-a".to_string()),
+      created_at_ms: 11,
+      updated_at_ms: 22,
+      manifest,
+    }
+  }
+
+  fn small_manifest() -> BTreeMap<String, String> {
+    BTreeMap::from([
+      ("semver".to_string(), "1.2.3".to_string()),
+      ("selector".to_string(), r#"{"gpu":"true"}"#.to_string()),
+    ])
+  }
+
+  /// Extract back the (metadata, plugin body) pair of a wire resource.
+  fn split(resource: &Resource) -> (&ResourceMetadata, &PluginBody) {
+    let metadata = resource.metadata.as_ref().expect("metadata");
+    let Some(Body::Plugin(body)) = resource.body.as_ref() else {
+      panic!("expected a plugin body");
+    };
+    (metadata, body)
+  }
+
+  #[test]
+  fn plugin_conversion_round_trip() {
+    let record = plugin_record(small_manifest());
+    let artifact = b"return {}".to_vec();
+
+    let resource = plugin_to_resource(record.clone(), Some(artifact.clone()));
+    let (metadata, body) = split(&resource);
+
+    assert_eq!(metadata.kind, ResourceKind::Plugin as i32);
+    assert!(metadata.labels.is_empty());
+    assert_eq!(body.artifact, artifact);
+    let restored = resource_to_plugin(metadata, body).expect("convert back");
+    assert_eq!(restored, record);
+  }
+
+  #[test]
+  fn plugin_conversion_round_trip_without_artifact() {
+    let record = plugin_record(BTreeMap::new());
+
+    let resource = plugin_to_resource(record.clone(), None);
+    let (metadata, body) = split(&resource);
+
+    assert!(body.artifact.is_empty());
+    let restored = resource_to_plugin(metadata, body).expect("convert back");
+    assert_eq!(restored, record);
+  }
+
+  #[test]
+  fn plugin_conversion_round_trip_with_large_manifest() {
+    let manifest: BTreeMap<String, String> = (0..2048)
+      .map(|index| (format!("key-{index}"), format!("value-{index}")))
+      .collect();
+    let record = plugin_record(manifest);
+
+    let resource = plugin_to_resource(record.clone(), Some(vec![0xAB; 4096]));
+    let (metadata, body) = split(&resource);
+
+    assert_eq!(body.manifest.len(), 2048);
+    let restored = resource_to_plugin(metadata, body).expect("convert back");
+    assert_eq!(restored, record);
+  }
 }

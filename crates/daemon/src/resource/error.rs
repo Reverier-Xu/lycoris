@@ -6,7 +6,7 @@
 
 use lycoris_core::ResourceScope;
 use lycoris_proto::node::ResourceKind;
-use lycoris_storage::{AgentStorageError, WorkspaceStorageError};
+use lycoris_storage::{AgentStorageError, PluginStorageError, WorkspaceStorageError};
 
 /// Errors produced by the resource facade.
 #[derive(Debug, thiserror::Error)]
@@ -47,6 +47,12 @@ pub enum MapperError {
     context: &'static str,
     source: WorkspaceStorageError,
   },
+  /// Plugin-domain storage failure, with the failing operation as context.
+  #[error("{context}: {source}")]
+  Plugin {
+    context: &'static str,
+    source: PluginStorageError,
+  },
 }
 
 impl MapperError {
@@ -56,5 +62,9 @@ impl MapperError {
 
   pub(crate) fn workspace(context: &'static str) -> impl Fn(WorkspaceStorageError) -> Self {
     move |source| Self::Workspace { context, source }
+  }
+
+  pub(crate) fn plugin(context: &'static str) -> impl Fn(PluginStorageError) -> Self {
+    move |source| Self::Plugin { context, source }
   }
 }

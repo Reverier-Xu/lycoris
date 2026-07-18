@@ -6,20 +6,24 @@
 //! (`crate::sync::resource`); the wire/domain converters live in
 //! [`super::convert`].
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+  collections::{BTreeMap, HashMap},
+  sync::Arc,
+};
 
 use lycoris_core::ResourceScope;
 use lycoris_proto::node::{Resource, ResourceKind, resource::Body};
 use lycoris_storage::{
-  AgentStorageError, MemoryEntry, Storage, VersionedContentStore, VersionedStorage,
-  WorkspaceRecord, WorkspaceStorageError,
+  AgentStorageError, MemoryEntry, PluginRecord, PluginStorageError, Storage, VersionedContentStore,
+  VersionedStorage, WorkspaceRecord, WorkspaceStorageError,
 };
 
 use super::{
   convert::{
     VersionedKind, decode_kind, memory_to_resource, metadata_scope, node_to_resource,
-    resource_to_memory, resource_to_rule, resource_to_skill, resource_to_workspace,
-    session_to_resource, versioned_to_resource, workspace_to_resource,
+    plugin_to_resource, resource_to_memory, resource_to_plugin, resource_to_rule,
+    resource_to_skill, resource_to_workspace, session_to_resource, versioned_to_resource,
+    workspace_to_resource,
   },
   error::MapperError,
 };
@@ -96,6 +100,11 @@ where
   }
 }
 
+/// Plugin records carry no user labels — plugin configuration lives in the
+/// manifest (design section 4) — so label selectors match plugins only when
+/// empty.
+static EMPTY_LABELS: BTreeMap<String, String> = BTreeMap::new();
+
 /// Filter stored records by the label selector and map them onto resources.
 fn collect_matching<T, M>(
   records: Vec<T>, selector: &HashMap<String, String>, metadata: impl Fn(&T) -> &M,
@@ -156,9 +165,17 @@ impl ResourceMapper {
       }
       ResourceKind::Skill => self.list_versioned(VersionedKind::Skill, &selector, scope),
       ResourceKind::Rule => self.list_versioned(VersionedKind::Rule, &selector, scope),
-      // Nothing can store plugins until the storage domain lands; an empty
-      // listing is the only possible state.
-      ResourceKind::Plugin => Ok(Vec::new()),
+      ResourceKind::Plugin => {
+        let plugins = self
+          .list_plugins(scope)
+          .map_err(MapperError::plugin("failed to list plugins"))?;
+        Ok(collect_matching(
+          plugins,
+          &selector,
+          |_| &EMPTY_LABELS,
+          |record| plugin_to_resource(record, None),
+        ))
+      }
       ResourceKind::Workspace => {
         let workspaces = self
           .list_workspaces(scope)
@@ -205,8 +222,21 @@ impl ResourceMapper {
       }
       ResourceKind::Skill => self.get_versioned(VersionedKind::Skill, id),
       ResourceKind::Rule => self.get_versioned(VersionedKind::Rule, id),
-      // See the `list` arm: no plugin can exist yet.
-      ResourceKind::Plugin => Err(MapperError::NotFound(id.to_string())),
+      ResourceKind::Plugin => {
+        let record = self
+          .storage
+          .plugins()
+          .get(id)
+          .map_err(MapperError::plugin("failed to get plugin"))?
+          .ok_or_else(|| MapperError::NotFound(id.to_string()))?;
+        let artifact = self
+          .storage
+          .plugins()
+          .blobs()
+          .read(id)
+          .map_err(MapperError::plugin("failed to read plugin artifact"))?;
+        Ok(plugin_to_resource(record, artifact))
+      }
       ResourceKind::Workspace => {
         let workspace = self
           .storage
@@ -243,6 +273,18 @@ impl ResourceMapper {
       || workspaces.list_shared(),
       || workspaces.list_local(),
       || workspaces.list(),
+    )
+  }
+
+  fn list_plugins(
+    &self, scope: Option<ResourceScope>,
+  ) -> Result<Vec<PluginRecord>, PluginStorageError> {
+    let plugins = self.storage.plugins();
+    list_by_scope(
+      scope,
+      || plugins.list_shared(),
+      || plugins.list_local(),
+      || plugins.list(),
     )
   }
 
@@ -340,6 +382,14 @@ impl ResourceMapper {
           .apply_remote_workspace(record)
           .map_err(MapperError::workspace("failed to apply remote workspace"))?;
       }
+      (ResourceKind::Plugin, Some(Body::Plugin(body))) => {
+        let record = resource_to_plugin(metadata, body)?;
+        self
+          .storage
+          .plugins()
+          .apply_remote_plugin(record, &body.artifact)
+          .map_err(MapperError::plugin("failed to apply remote plugin"))?;
+      }
       (ResourceKind::Node | ResourceKind::Session, _) => {
         return Err(MapperError::NotSynchronized { kind });
       }
@@ -397,6 +447,21 @@ impl ResourceMapper {
       }
     }
 
+    let plugins = self
+      .storage
+      .plugins()
+      .list_shared()
+      .map_err(MapperError::plugin("failed to list shared plugins"))?;
+    for record in plugins {
+      let artifact = self
+        .storage
+        .plugins()
+        .blobs()
+        .read(&record.id)
+        .map_err(MapperError::plugin("failed to read plugin artifact"))?;
+      resources.push(plugin_to_resource(record, artifact));
+    }
+
     Ok(resources)
   }
 }
@@ -405,7 +470,7 @@ impl ResourceMapper {
 mod tests {
   use lycoris_membership::SwimConfig;
   use lycoris_proto::node::{
-    MemoryBody, ResourceMetadata, ResourceScope as ProtoResourceScope, WorkspaceBody,
+    MemoryBody, PluginBody, ResourceMetadata, ResourceScope as ProtoResourceScope, WorkspaceBody,
   };
   use lycoris_storage::DEFAULT_EMBEDDING_DIM;
   use tempfile::TempDir;
@@ -505,5 +570,177 @@ mod tests {
       .await
       .expect("get memory");
     assert!(matches!(stored.body, Some(Body::Memory(_))));
+  }
+
+  fn plugin_resource(id: &str, scope: ProtoResourceScope, artifact: &[u8]) -> Resource {
+    Resource {
+      metadata: Some(ResourceMetadata {
+        id: id.to_string(),
+        name: format!("plugin-{id}"),
+        kind: ResourceKind::Plugin as i32,
+        scope: scope as i32,
+        source_node_id: "peer".to_string(),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        ..ResourceMetadata::default()
+      }),
+      body: Some(Body::Plugin(PluginBody {
+        version: 1,
+        content_hash: blake3::hash(artifact).to_hex().to_string(),
+        engine: "lua".to_string(),
+        entry: "invoke".to_string(),
+        artifact: artifact.to_vec(),
+        manifest: HashMap::from([("semver".to_string(), "0.1.0".to_string())]),
+      })),
+    }
+  }
+
+  fn plugin_body(resource: &Resource) -> &PluginBody {
+    let Some(Body::Plugin(body)) = resource.body.as_ref() else {
+      panic!("expected a plugin body");
+    };
+    body
+  }
+
+  #[tokio::test]
+  async fn apply_resource_stores_valid_shared_plugin() {
+    let (_dir, mapper) = test_mapper();
+    let artifact = b"return { echo = true }";
+    mapper
+      .apply_resource(&plugin_resource(
+        "plug-1",
+        ProtoResourceScope::ClusterShared,
+        artifact,
+      ))
+      .await
+      .unwrap();
+
+    let stored = mapper
+      .get(ResourceKind::Plugin, "plug-1")
+      .await
+      .expect("get plugin");
+    let metadata = stored.metadata.as_ref().expect("metadata");
+    assert_eq!(metadata.name, "plugin-plug-1");
+    assert_eq!(metadata.created_at_ms, 1);
+    assert_eq!(metadata.source_node_id, "peer");
+    let body = plugin_body(&stored);
+    assert_eq!(body.artifact, artifact);
+    assert_eq!(body.engine, "lua");
+    assert_eq!(body.entry, "invoke");
+    assert_eq!(body.manifest.get("semver"), Some(&"0.1.0".to_string()));
+  }
+
+  #[tokio::test]
+  async fn apply_resource_rejects_non_shared_plugin() {
+    let (_dir, mapper) = test_mapper();
+    for scope in [
+      ProtoResourceScope::NodeLocal,
+      ProtoResourceScope::Unspecified,
+    ] {
+      let error = mapper
+        .apply_resource(&plugin_resource("plug-local", scope, b"x"))
+        .await
+        .unwrap_err();
+      assert!(
+        matches!(error, MapperError::NotShared { .. }),
+        "scope: {scope:?}"
+      );
+    }
+  }
+
+  #[tokio::test]
+  async fn apply_resource_rejects_plugin_hash_mismatch() {
+    let (_dir, mapper) = test_mapper();
+    let mut resource = plugin_resource("plug-hash", ProtoResourceScope::ClusterShared, b"real");
+    plugin_body_mut(&mut resource).content_hash = "wrong-hash".to_string();
+
+    let error = mapper.apply_resource(&resource).await.unwrap_err();
+    assert!(matches!(error, MapperError::Plugin { .. }));
+    assert!(matches!(
+      mapper.get(ResourceKind::Plugin, "plug-hash").await,
+      Err(MapperError::NotFound(_))
+    ));
+  }
+
+  fn plugin_body_mut(resource: &mut Resource) -> &mut PluginBody {
+    let Some(Body::Plugin(body)) = resource.body.as_mut() else {
+      panic!("expected a plugin body");
+    };
+    body
+  }
+
+  #[tokio::test]
+  async fn list_plugins_filters_by_scope_and_selector() {
+    let (_dir, mapper) = test_mapper();
+    for (id, artifact) in [("plug-a", b"a" as &[u8]), ("plug-b", b"b")] {
+      mapper
+        .apply_resource(&plugin_resource(
+          id,
+          ProtoResourceScope::ClusterShared,
+          artifact,
+        ))
+        .await
+        .unwrap();
+    }
+
+    let all = mapper
+      .list(ResourceKind::Plugin, HashMap::new(), None)
+      .await
+      .unwrap();
+    assert_eq!(all.len(), 2);
+    // Listings stay artifact-free; `get` carries the full artifact.
+    for resource in &all {
+      assert!(plugin_body(resource).artifact.is_empty());
+    }
+
+    let shared = mapper
+      .list(
+        ResourceKind::Plugin,
+        HashMap::new(),
+        Some(ResourceScope::ClusterShared),
+      )
+      .await
+      .unwrap();
+    assert_eq!(shared.len(), 2);
+    let local = mapper
+      .list(
+        ResourceKind::Plugin,
+        HashMap::new(),
+        Some(ResourceScope::NodeLocal),
+      )
+      .await
+      .unwrap();
+    assert!(local.is_empty());
+
+    // Plugins carry no labels, so a non-empty selector matches nothing.
+    let selected = mapper
+      .list(
+        ResourceKind::Plugin,
+        HashMap::from([("a".to_string(), "b".to_string())]),
+        None,
+      )
+      .await
+      .unwrap();
+    assert!(selected.is_empty());
+  }
+
+  #[tokio::test]
+  async fn local_shared_resources_include_plugin_artifacts() {
+    let (_dir, mapper) = test_mapper();
+    mapper
+      .apply_resource(&plugin_resource(
+        "plug-sync",
+        ProtoResourceScope::ClusterShared,
+        b"sync-me",
+      ))
+      .await
+      .unwrap();
+
+    let resources = mapper.local_shared_resources().await.unwrap();
+    let plugin = resources
+      .iter()
+      .find(|resource| matches!(resource.body, Some(Body::Plugin(_))))
+      .expect("a plugin resource");
+    assert_eq!(plugin_body(plugin).artifact, b"sync-me");
   }
 }

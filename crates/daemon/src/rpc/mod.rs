@@ -26,6 +26,7 @@ impl From<MapperError> for Status {
       MapperError::NotFound(_) => Status::not_found(error.to_string()),
       MapperError::Agent { context, source } => agent_storage_status(context, source),
       MapperError::Workspace { context, source } => workspace_storage_status(context, source),
+      MapperError::Plugin { context, source } => plugin_storage_status(context, source),
     }
   }
 }
@@ -60,6 +61,20 @@ pub(crate) fn workspace_storage_status(
     Error::Storage(_) | Error::GitCommandFailed(_) => {
       Status::internal(format!("{context}: {error}"))
     }
+  }
+}
+
+/// Map a plugin-domain storage failure to a gRPC status; see
+/// [`agent_storage_status`] for the mapping rationale.
+pub(crate) fn plugin_storage_status(
+  context: &str, error: lycoris_storage::PluginStorageError,
+) -> Status {
+  use lycoris_storage::PluginStorageError as Error;
+  match &error {
+    Error::HashMismatch(_) | Error::InvalidResourceId(_) => {
+      Status::invalid_argument(format!("{context}: {error}"))
+    }
+    Error::Storage(_) => Status::internal(format!("{context}: {error}")),
   }
 }
 
@@ -116,6 +131,15 @@ mod tests {
         },
         Code::Internal,
       ),
+      (
+        MapperError::Plugin {
+          context: "failed to apply remote plugin",
+          source: lycoris_storage::PluginStorageError::HashMismatch(
+            lycoris_storage::ContentHashMismatch,
+          ),
+        },
+        Code::InvalidArgument,
+      ),
     ];
     for (error, expected) in cases {
       assert_eq!(Status::from(error).code(), expected, "error: {expected:?}");
@@ -138,5 +162,30 @@ mod tests {
       },
     );
     assert_eq!(dim_mismatch.code(), Code::InvalidArgument);
+  }
+
+  #[test]
+  fn plugin_storage_status_mapping() {
+    let hash_mismatch = plugin_storage_status(
+      "ctx",
+      lycoris_storage::PluginStorageError::HashMismatch(lycoris_storage::ContentHashMismatch),
+    );
+    assert_eq!(hash_mismatch.code(), Code::InvalidArgument);
+
+    let invalid_id = plugin_storage_status(
+      "ctx",
+      lycoris_storage::PluginStorageError::InvalidResourceId(lycoris_storage::InvalidResourceId(
+        "a/b".to_string(),
+      )),
+    );
+    assert_eq!(invalid_id.code(), Code::InvalidArgument);
+
+    let storage = plugin_storage_status(
+      "ctx",
+      lycoris_storage::PluginStorageError::Storage(lycoris_storage::StorageError::Io(
+        std::io::Error::other("boom"),
+      )),
+    );
+    assert_eq!(storage.code(), Code::Internal);
   }
 }
