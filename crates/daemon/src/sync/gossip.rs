@@ -264,4 +264,59 @@ mod tests {
       assert_eq!(sequence.next(), 3);
     }
   }
+
+  #[test]
+  fn dedup_set_insert_reports_new_vs_duplicate() {
+    let mut set = DedupSet::new(2);
+
+    assert!(set.insert("a"), "first insert of a key must report new");
+    assert!(!set.insert("a"), "re-insert must report duplicate");
+    assert!(set.insert("b"));
+    assert!(set.inner.contains("a") && set.inner.contains("b"));
+  }
+
+  #[test]
+  fn dedup_set_holds_exactly_capacity_entries() {
+    let mut set = DedupSet::new(2);
+
+    // At exactly capacity nothing is evicted yet.
+    set.insert("a");
+    set.insert("b");
+    assert_eq!(set.inner.len(), 2);
+    assert_eq!(set.order.len(), 2);
+  }
+
+  #[test]
+  fn dedup_set_evicts_oldest_first_over_capacity() {
+    let mut set = DedupSet::new(2);
+    set.insert("a");
+    set.insert("b");
+
+    // The third insert evicts "a", the oldest; "b" survives.
+    set.insert("c");
+    assert!(!set.inner.contains("a"));
+    assert!(set.inner.contains("b") && set.inner.contains("c"));
+    assert_eq!(set.inner.len(), 2);
+
+    // An evicted key is fully forgotten: inserting it again reports new.
+    assert!(set.insert("a"));
+  }
+
+  #[test]
+  fn dedup_set_duplicate_insert_keeps_fifo_position() {
+    let mut set = DedupSet::new(2);
+    set.insert("a");
+    set.insert("b");
+
+    // Re-inserting the oldest key must not refresh its position: the set is a
+    // strict FIFO, so "a" stays the next eviction victim.
+    assert!(!set.insert("a"));
+    set.insert("c");
+
+    assert!(
+      !set.inner.contains("a"),
+      "duplicate insert must not protect \"a\" from eviction"
+    );
+    assert!(set.inner.contains("b") && set.inner.contains("c"));
+  }
 }

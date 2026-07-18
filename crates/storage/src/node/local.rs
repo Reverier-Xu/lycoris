@@ -45,3 +45,56 @@ impl LocalStorage {
     Ok(self.annotations.entries()?.into_iter().collect())
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use tempfile::TempDir;
+
+  use super::*;
+
+  fn test_local() -> (TempDir, LocalStorage) {
+    let dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::create(dir.path().join("test.redb")).unwrap());
+    (dir, LocalStorage::new(db))
+  }
+
+  #[test]
+  fn labels_and_annotations_start_empty() {
+    let (_dir, local) = test_local();
+
+    assert!(local.labels().unwrap().is_empty());
+    assert!(local.annotations().unwrap().is_empty());
+  }
+
+  #[test]
+  fn labels_round_trip_and_overwrite() {
+    let (_dir, local) = test_local();
+
+    local.set_label("role", "worker").unwrap();
+    local.set_label("zone", "a").unwrap();
+    // Setting an existing key overwrites instead of duplicating.
+    local.set_label("role", "scheduler").unwrap();
+
+    let labels = local.labels().unwrap();
+    assert_eq!(labels.len(), 2);
+    assert_eq!(labels.get("role").map(String::as_str), Some("scheduler"));
+    assert_eq!(labels.get("zone").map(String::as_str), Some("a"));
+  }
+
+  #[test]
+  fn annotations_round_trip_independently_of_labels() {
+    let (_dir, local) = test_local();
+
+    local.set_annotation("note", "hello").unwrap();
+    // The same key in the label table must not leak into annotations.
+    local.set_label("note", "label-value").unwrap();
+
+    let annotations = local.annotations().unwrap();
+    assert_eq!(annotations.len(), 1);
+    assert_eq!(annotations.get("note").map(String::as_str), Some("hello"));
+    assert_eq!(
+      local.labels().unwrap().get("note").map(String::as_str),
+      Some("label-value")
+    );
+  }
+}

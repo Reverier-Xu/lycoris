@@ -444,3 +444,93 @@ fn remote_nodes(
     })
     .collect()
 }
+
+#[cfg(test)]
+mod tests {
+  use lycoris_proto::node::{MerkleLeafEntry, MerkleNodeRef, MerkleNodeResult};
+
+  use super::*;
+
+  fn wire_result(depth: u32, index: u64, hash_len: usize) -> MerkleNodeResult {
+    MerkleNodeResult {
+      node: Some(MerkleNodeRef { depth, index }),
+      hash: vec![7; hash_len],
+      entries: Vec::new(),
+    }
+  }
+
+  #[test]
+  fn remote_nodes_converts_well_formed_results() {
+    let nodes = remote_nodes(vec![wire_result(3, 5, 32)], "peer");
+
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0].depth, 3);
+    assert_eq!(nodes[0].index, 5);
+    assert_eq!(nodes[0].hash, [7; 32]);
+    assert_eq!(
+      nodes[0].entries, None,
+      "entries are only kept at leaf depth"
+    );
+  }
+
+  #[test]
+  fn remote_nodes_drops_result_without_ref() {
+    let result = MerkleNodeResult {
+      node: None,
+      hash: vec![7; 32],
+      entries: Vec::new(),
+    };
+
+    assert!(remote_nodes(vec![result], "peer").is_empty());
+  }
+
+  #[test]
+  fn remote_nodes_drops_depth_that_does_not_fit_u8() {
+    let nodes = remote_nodes(vec![wire_result(300, 0, 32)], "peer");
+
+    assert!(nodes.is_empty());
+  }
+
+  #[test]
+  fn remote_nodes_drops_non_32_byte_hash() {
+    for hash_len in [0, 31, 33] {
+      let nodes = remote_nodes(vec![wire_result(1, 0, hash_len)], "peer");
+      assert!(nodes.is_empty(), "hash length {hash_len} must be dropped");
+    }
+  }
+
+  #[test]
+  fn remote_nodes_keeps_leaf_but_drops_malformed_entries() {
+    let mut result = wire_result(u32::from(MERKLE_TREE_DEPTH), 42, 32);
+    result.entries = vec![
+      MerkleLeafEntry {
+        node_id: "good".to_string(),
+        hash: vec![9; 32],
+      },
+      MerkleLeafEntry {
+        node_id: "bad".to_string(),
+        hash: vec![9; 3],
+      },
+    ];
+
+    let nodes = remote_nodes(vec![result], "peer");
+
+    assert_eq!(nodes.len(), 1);
+    let entries = nodes[0].entries.clone().unwrap_or_default();
+    assert_eq!(entries, vec![("good".to_string(), [9; 32])]);
+  }
+
+  #[test]
+  fn remote_nodes_ignores_entries_below_leaf_depth() {
+    let mut result = wire_result(2, 0, 32);
+    result.entries = vec![MerkleLeafEntry {
+      node_id: "stray".to_string(),
+      hash: vec![9; 32],
+    }];
+
+    let nodes = remote_nodes(vec![result], "peer");
+
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0].entries, None);
+  }
+}
