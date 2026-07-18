@@ -37,30 +37,58 @@ pub enum RuntimeError {
   Transport(#[from] tonic::transport::Error),
 }
 
-/// Wait for the process shutdown signal: SIGTERM or SIGINT on unix.
+/// Process shutdown signal streams, registered synchronously at startup.
+///
+/// Registering the handlers is separated from waiting on them so that a
+/// registration failure aborts startup (`RuntimeError`) instead of leaving
+/// the daemon running with no graceful shutdown path: the watcher task flips
+/// the shutdown channel unconditionally once its wait returns, so a silent
+/// early return would read as an immediate shutdown request.
 #[cfg(unix)]
-async fn wait_for_shutdown_signal() {
-  use tokio::signal::unix::{SignalKind, signal};
+struct ShutdownSignals {
+  terminate: tokio::signal::unix::Signal,
+  interrupt: tokio::signal::unix::Signal,
+}
 
-  let mut terminate = match signal(SignalKind::terminate()) {
-    Ok(signal) => signal,
-    Err(_) => return,
-  };
-  let mut interrupt = match signal(SignalKind::interrupt()) {
-    Ok(signal) => signal,
-    Err(_) => return,
-  };
+#[cfg(unix)]
+impl ShutdownSignals {
+  fn register() -> Result<Self, RuntimeError> {
+    use tokio::signal::unix::{SignalKind, signal};
+    Ok(Self {
+      terminate: signal(SignalKind::terminate())?,
+      interrupt: signal(SignalKind::interrupt())?,
+    })
+  }
 
-  tokio::select! {
-    _ = terminate.recv() => {}
-    _ = interrupt.recv() => {}
+  /// Wait for SIGTERM or SIGINT.
+  async fn wait(mut self) {
+    tokio::select! {
+      _ = self.terminate.recv() => {}
+      _ = self.interrupt.recv() => {}
+    }
   }
 }
 
-/// Wait for the process shutdown signal: Ctrl+C on non-unix platforms.
-#[cfg(not(unix))]
-async fn wait_for_shutdown_signal() {
-  let _ = tokio::signal::ctrl_c().await;
+/// Spawn the shutdown-signal watcher: it flips the shutdown channel once the
+/// process is interrupted. Handlers are registered synchronously before this
+/// returns, so a registration failure fails startup fast.
+fn spawn_shutdown_watcher(shutdown_tx: watch::Sender<bool>) -> Result<(), RuntimeError> {
+  #[cfg(unix)]
+  {
+    let signals = ShutdownSignals::register()?;
+    tokio::spawn(async move {
+      signals.wait().await;
+      let _ = shutdown_tx.send(true);
+    });
+  }
+  #[cfg(not(unix))]
+  {
+    tokio::spawn(async move {
+      let _ = tokio::signal::ctrl_c().await;
+      let _ = shutdown_tx.send(true);
+    });
+  }
+  Ok(())
 }
 
 /// Run the daemon until the process is interrupted.
@@ -72,10 +100,7 @@ pub async fn run(config: DaemonConfig) -> Result<(), RuntimeError> {
   let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
   let shutdown_tx_signal = shutdown_tx.clone();
-  tokio::spawn(async move {
-    wait_for_shutdown_signal().await;
-    let _ = shutdown_tx_signal.send(true);
-  });
+  spawn_shutdown_watcher(shutdown_tx_signal)?;
 
   run_with_shutdown(config, shutdown_tx, shutdown_rx, cluster_key).await
 }
