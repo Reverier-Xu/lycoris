@@ -104,11 +104,14 @@ impl Cluster for ClusterService {
 
     // The self-primary rule is enforced by the storage node domain (D8); the
     // rpc layer only translates the domain error into the response reason.
+    // That check compares against the local node's own address, so a missing
+    // local register must fail the request outright: falling back to an empty
+    // address would silently disable the check.
     let local_address = self
       .service
       .member_address(self.local_node_id())
       .await
-      .unwrap_or_default();
+      .ok_or_else(|| Status::failed_precondition("local node is not registered in membership"))?;
     match self
       .storage
       .node()
@@ -193,5 +196,44 @@ impl Cluster for ClusterService {
     let kind = crate::rpc::resource::parse_kind(request.kind)?;
     let resource = self.mapper.get(kind, &request.id).await?;
     Ok(Response::new(resource))
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use tempfile::TempDir;
+
+  use super::*;
+  use crate::membership::{MemberRegister, SwimConfig};
+
+  /// Build a cluster service whose local node id is `local_id` while
+  /// membership only seeds `seed_id`; differing ids simulate a local register
+  /// that never made it into membership.
+  fn test_service(local_id: &str, seed_id: &str) -> (TempDir, ClusterService) {
+    let dir = TempDir::new().unwrap();
+    let storage = Storage::open(dir.path().join("lycoris.redb")).unwrap();
+    let service = Arc::new(MembershipService::new(
+      local_id,
+      SwimConfig::default(),
+      MemberRegister::new(seed_id, "127.0.0.1:1", 1, 0),
+    ));
+    let mapper = ResourceMapper::new(storage.clone(), service.clone());
+    (dir, ClusterService::new(service, storage, mapper))
+  }
+
+  #[tokio::test]
+  async fn set_primary_endpoint_fails_when_local_address_unknown() {
+    // The local register is missing, so the self-primary check has no local
+    // address to compare against; the request must fail instead of slipping
+    // past the check on an empty address.
+    let (_dir, service) = test_service("ghost", "local");
+    let status = service
+      .set_primary_endpoint(Request::new(SetPrimaryEndpointRequest {
+        address: "https://127.0.0.1:2".to_string(),
+      }))
+      .await
+      .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(status.message().contains("not registered"));
   }
 }
