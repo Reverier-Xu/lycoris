@@ -59,9 +59,10 @@ pub(crate) enum ClusterCommand {
     /// Node address in host:port form.
     #[arg(long)]
     address: String,
-    /// Cluster shared key in hex.
+    /// Cluster shared key in hex. Falls back to the local cluster key file
+    /// when omitted, so the key does not have to appear on the command line.
     #[arg(long)]
-    key: String,
+    key: Option<String>,
   },
 
   /// Initialize this machine as a new cluster, generating or storing a
@@ -78,9 +79,10 @@ pub(crate) enum ClusterCommand {
     /// Address of an existing cluster member.
     #[arg(long)]
     peer: String,
-    /// Cluster shared key in hex.
+    /// Cluster shared key in hex. Falls back to the local cluster key file
+    /// when omitted, so the key does not have to appear on the command line.
     #[arg(long)]
-    key: String,
+    key: Option<String>,
   },
 
   /// Leave the cluster.

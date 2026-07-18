@@ -59,9 +59,9 @@ pub(crate) async fn get_resources(
 }
 
 pub(crate) async fn register(
-  client_config: &ClientConfig, id: String, address: String, key: String,
+  client_config: &ClientConfig, id: String, address: String, key: Option<String>,
 ) -> Result<(), ShellError> {
-  let key = key.trim().to_string();
+  let key = resolve_key(client_config, key)?;
   let mut client = connect_cluster(client_config).await?.with_cluster_key(key);
   let node = NodeInfo::new(
     id.clone(),
@@ -91,9 +91,9 @@ pub(crate) fn init_cluster(key: Option<String>) -> Result<(), ShellError> {
 }
 
 pub(crate) async fn join_cluster(
-  client_config: &ClientConfig, peer: String, key: String,
+  client_config: &ClientConfig, peer: String, key: Option<String>,
 ) -> Result<(), ShellError> {
-  let key = key.trim().to_string();
+  let key = resolve_key(client_config, key)?;
   let daemon_config = DaemonConfig::load(None)?;
   let tls = lycoris_tls::load_tls_bundle(
     &client_config.cert,
@@ -157,9 +157,18 @@ pub(crate) fn show_key() -> Result<(), ShellError> {
 }
 
 async fn connect_cluster(client_config: &ClientConfig) -> Result<ClusterClient, ShellError> {
-  // A missing key is not fatal here: commands like `join` authenticate with
-  // an explicit `--key`, and the server rejects unauthenticated calls anyway.
-  let key = load_cluster_key(client_config).ok();
+  // A missing key is not fatal here: the server rejects unauthenticated
+  // calls anyway. A key that exists but fails to load (e.g. corrupted) is
+  // suspicious though, so surface it instead of silently degrading to "no
+  // key".
+  let key = match load_cluster_key(client_config) {
+    Ok(key) => Some(key),
+    Err(ShellError::ClusterKeyNotFound) => None,
+    Err(error) => {
+      tracing::warn!("failed to load cluster key, continuing without one: {error}");
+      None
+    }
+  };
   let tls = lycoris_tls::load_tls_bundle(
     &client_config.cert,
     &client_config.key,
@@ -175,6 +184,16 @@ async fn connect_cluster(client_config: &ClientConfig) -> Result<ClusterClient, 
     Some(key) => client.with_cluster_key(key),
     None => client,
   })
+}
+
+/// Resolve the cluster key for commands that authenticate with one: an
+/// explicit `--key` wins, otherwise the local cluster key file is used so the
+/// secret stays out of shell history and process listings.
+fn resolve_key(client_config: &ClientConfig, key: Option<String>) -> Result<String, ShellError> {
+  match key {
+    Some(key) => Ok(key.trim().to_string()),
+    None => load_cluster_key(client_config),
+  }
 }
 
 fn load_cluster_key(client_config: &ClientConfig) -> Result<String, ShellError> {
