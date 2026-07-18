@@ -447,7 +447,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn local_incarnation_survives_restart() {
+  async fn local_incarnation_advances_on_restart() {
     let dir = tempfile::TempDir::new().unwrap();
     let db_path = dir.path().join("test.redb");
     {
@@ -466,17 +466,18 @@ mod tests {
     }
 
     // Reopen the same database (simulated restart) and rebuild the local
-    // register the way the runtime does: the incarnation must resume at 2,
-    // not rewind to 1.
+    // register the way the runtime does: rejoining resumes the persisted
+    // incarnation and bumps it, so the fresh register refutes stale rumors
+    // instead of rewinding or merely replaying the old value.
     let storage = lycoris_storage::Storage::open(&db_path).unwrap();
     let persisted = crate::persisted_counter(storage.node().meta(), LOCAL_INCARNATION_KEY);
     assert_eq!(persisted, Some(2));
 
-    let register =
-      MemberRegister::new("local", "127.0.0.1:1", persisted.unwrap_or(1), 0).with_updated_at_ms(0);
+    let mut register = MemberRegister::new("local", "127.0.0.1:1", persisted.unwrap_or(0), 0);
+    register.rejoin("127.0.0.1:1", 0);
     let service = MembershipService::new("local", SwimConfig::default(), register);
     let nodes = service.list_nodes(&HashMap::new()).await;
     let local = nodes.iter().find(|node| node.node_id() == "local").unwrap();
-    assert_eq!(local.incarnation(), 2);
+    assert_eq!(local.incarnation(), 3);
   }
 }

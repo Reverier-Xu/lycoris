@@ -274,7 +274,12 @@ impl MemberRegister {
     self.updated_at_ms = now_ms;
   }
 
-  /// Rejoin with a higher incarnation.
+  /// Rejoin the cluster with the next incarnation.
+  ///
+  /// The single restart path: bumping the persisted incarnation makes the
+  /// fresh `Active` register dominate — and thereby refute — any suspect or
+  /// offline rumor the cluster still holds about this node from before the
+  /// restart, without waiting for a refutation round trip.
   pub fn rejoin(&mut self, address: impl Into<String>, now_ms: i64) {
     self.incarnation = self.incarnation.saturating_add(1);
     self.heartbeat = 0;

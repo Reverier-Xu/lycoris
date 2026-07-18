@@ -139,15 +139,31 @@ pub async fn run_with_shutdown(
     node.peers().set_primary(first_peer, &config.node.address)?;
   }
 
-  // The local incarnation is persisted across restarts (P5b): resuming it
-  // keeps the merge dominance this node already earned, so stale rumors
-  // echoed back after a restart cannot bury its fresh state.
-  let local_incarnation = crate::persisted_counter(node.meta(), LOCAL_INCARNATION_KEY).unwrap_or(1);
-  let mut local_register =
-    MemberRegister::new(&config.node.id, &config.node.address, local_incarnation, 0);
+  // The local incarnation is persisted across restarts (P5b) and bumped on
+  // every boot: rejoining with the next incarnation makes the fresh Active
+  // register dominate — and thereby refute — any suspect/offline rumor the
+  // cluster still holds about this node from before the restart. A fresh node
+  // resumes at 0, so its first rejoin lands on incarnation 1.
+  let resumed_incarnation =
+    crate::persisted_counter(node.meta(), LOCAL_INCARNATION_KEY).unwrap_or(0);
+  let mut local_register = MemberRegister::new(
+    &config.node.id,
+    &config.node.address,
+    resumed_incarnation,
+    0,
+  );
+  local_register.rejoin(&config.node.address, now_ms());
   local_register.set_labels(node.local().labels().unwrap_or_default());
   local_register.set_annotations(node.local().annotations().unwrap_or_default());
-  local_register.set_updated_at_ms(now_ms());
+  // Persist the rejoined incarnation immediately: the in-service persist hook
+  // only writes on later changes, and crash-looping must keep advancing the
+  // incarnation instead of reusing the same one on every boot.
+  if let Err(error) = node.meta().set(
+    LOCAL_INCARNATION_KEY,
+    &local_register.incarnation().to_string(),
+  ) {
+    tracing::warn!(%error, "failed to persist rejoined local incarnation");
+  }
 
   let membership_service = Arc::new(
     MembershipService::new(&config.node.id, SwimConfig::default(), local_register)
