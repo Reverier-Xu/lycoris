@@ -1,19 +1,19 @@
 # lycoris-daemon
 
-`lycoris-daemon` 实现 Lycoris 集群节点的运行时。
+`lycoris-daemon` implements the runtime of a Lycoris cluster node.
 
-## 职责
+## Responsibilities
 
-- 启动 gRPC server，处理来自客户端与其他节点的 RPC 请求；cluster-key 通过 tonic interceptor 统一校验。
-- 维护 SWIM 风格的成员关系：探测邻居、传播疑似失效、处理 Join/Leave/Ping/PingReq。
-- 通过 Merkle tree 与版本向量对共享资源进行反熵同步。
-- 管理节点生命周期：注册、启动、关闭、优雅离开集群。
+- Starts the gRPC server and handles RPC requests from clients and other nodes; the cluster key is uniformly verified through a tonic interceptor.
+- Maintains SWIM-style membership: probing neighbors, propagating suspected failures, and handling Join/Leave/Ping/PingReq.
+- Performs anti-entropy synchronization of shared resources via Merkle trees and version vectors.
+- Manages the node lifecycle: registration, startup, shutdown, and graceful cluster departure.
 
-## 主要模块
+## Main Modules
 
-- `runtime`：节点生命周期与任务调度。
-- `transport`：Peer 连接池、健康跟踪与目标选择。
-- `membership`：成员状态机、SWIM 探测、Merkle 同步服务。
-- `resource_sync`：共享资源反熵引擎。
-- `rpc`：gRPC server、资源 handler 与 cluster-key interceptor。
-- `cluster_sync`：集群级共享状态同步逻辑。
+- `runtime`: node lifecycle and task scheduling.
+- `transport`: peer connection pool, health tracking, and target selection.
+- `membership`: membership state machine, SWIM probing, and Merkle sync service.
+- `resource_sync`: shared-resource anti-entropy engine.
+- `rpc`: gRPC server, resource handlers, and the cluster-key interceptor.
+- `cluster_sync`: cluster-wide shared-state synchronization logic.

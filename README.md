@@ -1,43 +1,45 @@
+English | [中文](README.cn.md)
+
 # Lycoris
 
-Lycoris 是一个面向 LLM Agent 的去中心化集群系统。每个节点既是服务提供者也是集群成员，从任意节点的 API 都可以访问整个集群。
+Lycoris is a decentralized cluster system for LLM agents. Every node is both a service provider and a cluster member, and the entire cluster is accessible through any node's API.
 
-## 核心设计
+## Core Design
 
-- 去中心化：集群是无向有环稀疏图，节点通过 SWIM 风格的成员协议相互探测、传播状态。
-- 分区容忍：网络分区期间，各分区可继续独立运行；重新连通后通过反熵同步合并共享状态。
-- 共享与隔离：每个节点保存共享的集群基础信息、共享 skill/rule、共享工作区元数据索引，同时拥有专属的 memory 与专属工作区。
+- Decentralized: the cluster is an undirected, cyclic, sparse graph; nodes probe each other and propagate state through a SWIM-style membership protocol.
+- Partition tolerant: during a network partition, each partition keeps operating independently; once connectivity is restored, shared state is merged through anti-entropy synchronization.
+- Shared and isolated: each node stores shared cluster base information, shared skills/rules, and a shared workspace metadata index, while owning its private memory and private workspace.
 
-## 代码组织
+## Code Organization
 
 ```
 crates/
-  client      gRPC 客户端句柄：统一连接装配、cluster key 注入，用于节点间以及 CLI 与节点通信
-  config      守护进程与客户端配置解析、校验、默认值与回退加载策略
-  core        共享核心原语：cluster key、ResourceScope、time、路径约定
-  daemon      集群节点运行时：transport 连接池、sync/（SWIM 派发、gossip、merkle 反熵编排、peer 选择）、
-              membership 桥接（领域类型边界）、resource 资源外观、rpc/（tonic 边界与 cluster-key 拦截器）
-  membership  成员 CRDT（确定性全序 merge）、SWIM 状态机、Merkle 树与反熵 diff（独立于 tonic，无 transport）
-  proto       protobuf/gRPC 定义，附协议常量与 NodeInfo 构造辅助
-  shell       统一二进制入口 `lycoris`，提供 daemon、cluster 等子命令
-  storage     持久化层：redb 泛型表存储承载节点元数据/workspace/skill/rule，LanceDB 承载 agent memory；
-              统一版本模型与反熵 apply 管线
-  tls         TLS 证书生成、加载与自动续期（SAN 含节点 advertise 地址）
+  client      gRPC client handle: unified connection assembly and cluster key injection, used for node-to-node and CLI-to-node communication
+  config      Daemon and client configuration parsing, validation, defaults, and fallback loading strategy
+  core        Shared core primitives: cluster key, ResourceScope, time, and path conventions
+  daemon      Cluster node runtime: transport connection pool, sync/ (SWIM dispatch, gossip, Merkle anti-entropy orchestration, peer selection),
+              membership bridging (domain type boundary), resource facade, rpc/ (tonic boundary and cluster-key interceptor)
+  membership  Membership CRDT (deterministic total-order merge), SWIM state machine, Merkle tree and anti-entropy diff (independent of tonic, no transport)
+  proto       protobuf/gRPC definitions, with protocol constants and NodeInfo construction helpers
+  shell       Unified binary entry point `lycoris`, providing subcommands such as daemon and cluster
+  storage     Persistence layer: redb generic table storage for node metadata/workspace/skill/rule, LanceDB for agent memory;
+              unified version model and anti-entropy apply pipeline
+  tls         TLS certificate generation, loading, and automatic renewal (SAN includes the node advertise address)
 ```
 
-## 构建
+## Build
 
 ```bash
 cargo build --release -p lycoris
 ```
 
-## 运行节点
+## Run a Node
 
 ```bash
 lycoris daemon --config /path/to/lycoris.toml
 ```
 
-## 测试
+## Test
 
 ```bash
 cargo test --workspace --all-features
