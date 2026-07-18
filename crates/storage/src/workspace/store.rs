@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::BTreeMap, path::PathBuf};
 
 use lycoris_core::ResourceScope;
 use redb::TableDefinition;
@@ -17,7 +17,9 @@ pub struct WorkspaceRecord {
   pub root: PathBuf,
   /// Sessions currently associated with this workspace.
   pub session_ids: Vec<String>,
-  pub metadata: HashMap<String, String>,
+  /// `BTreeMap` keeps the postcard encoding deterministic so
+  /// [`Self::compute_content_hash`] is stable across processes.
+  pub metadata: BTreeMap<String, String>,
   pub scope: ResourceScope,
   /// `None` means this workspace originated on the local node.
   pub source_node_id: Option<String>,
@@ -117,5 +119,42 @@ impl WorkspaceMetadataStorage for RedbTableStorage<WorkspaceRecord> {
 
   fn delete(&self, id: &str) -> Result<(), WorkspaceStorageError> {
     RedbTableStorage::delete(self, id).map_err(Into::into)
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use lycoris_core::ResourceScope;
+
+  use super::*;
+
+  fn workspace_with_metadata(entries: &[(&str, &str)]) -> WorkspaceRecord {
+    WorkspaceRecord {
+      id: "ws-1".to_string(),
+      root: PathBuf::from("/tmp/ws-1"),
+      session_ids: vec!["session-1".to_string()],
+      metadata: entries
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect(),
+      scope: ResourceScope::ClusterShared,
+      source_node_id: Some("node-1".to_string()),
+      version: 7,
+      content_hash: String::new(),
+      created_at_ms: 1000,
+      updated_at_ms: 2000,
+    }
+  }
+
+  #[test]
+  fn content_hash_is_stable_across_metadata_insertion_orders() {
+    let forward = workspace_with_metadata(&[("a", "1"), ("b", "2"), ("c", "3")]);
+    let reverse = workspace_with_metadata(&[("c", "3"), ("b", "2"), ("a", "1")]);
+
+    let forward_hash = forward.compute_content_hash().unwrap();
+    let reverse_hash = reverse.compute_content_hash().unwrap();
+
+    assert!(!forward_hash.is_empty());
+    assert_eq!(forward_hash, reverse_hash);
   }
 }

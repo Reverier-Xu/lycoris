@@ -549,7 +549,7 @@ fn memory_to_resource(entry: MemoryEntry, full: bool) -> Resource {
 /// records).
 fn versioned_metadata(record: &VersionedResource, kind: ResourceKind) -> ResourceMetadata {
   MetadataBuilder::new(&record.id, &record.name, kind)
-    .labels(record.metadata.clone())
+    .labels(record.metadata.clone().into_iter().collect())
     .scope(record.scope, record.source_node_id.as_deref())
     .timestamps(record.updated_at_ms, record.updated_at_ms)
     .build()
@@ -562,7 +562,7 @@ fn skill_to_resource(skill: SkillRecord, content: Option<String>) -> Resource {
       version: skill.version,
       content_hash: skill.content_hash,
       content: content.unwrap_or_default(),
-      metadata: skill.metadata,
+      metadata: skill.metadata.into_iter().collect(),
     })),
   }
 }
@@ -574,7 +574,7 @@ fn rule_to_resource(rule: RuleRecord, content: Option<String>) -> Resource {
       version: rule.version,
       content_hash: rule.content_hash,
       content: content.unwrap_or_default(),
-      metadata: rule.metadata,
+      metadata: rule.metadata.into_iter().collect(),
     })),
   }
 }
@@ -583,7 +583,7 @@ fn workspace_to_resource(workspace: WorkspaceRecord) -> Resource {
   Resource {
     metadata: Some(
       MetadataBuilder::new(&workspace.id, &workspace.id, ResourceKind::Workspace)
-        .labels(workspace.metadata.clone())
+        .labels(workspace.metadata.clone().into_iter().collect())
         .scope(workspace.scope, workspace.source_node_id.as_deref())
         .timestamps(workspace.created_at_ms, workspace.updated_at_ms)
         .build(),
@@ -591,7 +591,7 @@ fn workspace_to_resource(workspace: WorkspaceRecord) -> Resource {
     body: Some(Body::Workspace(WorkspaceBody {
       root: workspace.root.to_string_lossy().to_string(),
       session_ids: workspace.session_ids,
-      metadata: workspace.metadata,
+      metadata: workspace.metadata.into_iter().collect(),
       version: workspace.version,
       content_hash: workspace.content_hash,
     })),
@@ -647,7 +647,7 @@ fn resource_to_versioned(
     scope: metadata_scope(metadata)?,
     source_node_id: metadata_source_node_id(metadata),
     updated_at_ms: metadata.updated_at_ms,
-    metadata: metadata.labels.clone(),
+    metadata: metadata.labels.clone().into_iter().collect(),
   })
 }
 
@@ -670,7 +670,7 @@ fn resource_to_workspace(
     id: metadata.id.clone(),
     root: body.root.clone().into(),
     session_ids: body.session_ids.clone(),
-    metadata: body.metadata.clone(),
+    metadata: body.metadata.clone().into_iter().collect(),
     scope: metadata_scope(metadata)?,
     source_node_id: metadata_source_node_id(metadata),
     version: body.version,

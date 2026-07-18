@@ -5,7 +5,7 @@
 //! storage trait once; `skill.rs` and `rule.rs` re-export aliases so callers
 //! keep their domain vocabulary.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use lycoris_core::ResourceScope;
 use serde::{Deserialize, Serialize};
@@ -24,7 +24,8 @@ pub struct VersionedResource {
   /// `None` means this resource originated on the local node.
   pub source_node_id: Option<String>,
   pub updated_at_ms: i64,
-  pub metadata: HashMap<String, String>,
+  /// `BTreeMap` keeps the postcard encoding deterministic across processes.
+  pub metadata: BTreeMap<String, String>,
 }
 
 impl crate::versioned::VersionedRecord for VersionedResource {

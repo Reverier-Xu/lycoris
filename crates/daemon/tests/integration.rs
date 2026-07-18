@@ -516,7 +516,7 @@ async fn shared_skills_replicate_via_anti_entropy() {
       scope: ResourceScope::ClusterShared,
       source_node_id: Some("node-0".to_string()),
       updated_at_ms: now_ms(),
-      metadata: HashMap::new(),
+      metadata: Default::default(),
     };
     storage
       .workspace()

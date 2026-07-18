@@ -2,16 +2,16 @@ use std::collections::HashMap;
 
 /// Return true if `metadata` matches all key/value pairs in `selector`.
 ///
-/// An empty selector matches everything.
-pub fn matches_selector(
-  metadata: &HashMap<String, String>, selector: &HashMap<String, String>,
-) -> bool {
-  if selector.is_empty() {
-    return true;
-  }
-  selector
-    .iter()
-    .all(|(key, value)| metadata.get(key) == Some(value))
+/// `metadata` accepts any string map used by the domain records (`HashMap` or
+/// `BTreeMap`). An empty selector matches everything.
+pub fn matches_selector<M>(metadata: &M, selector: &HashMap<String, String>) -> bool
+where
+  for<'a> &'a M: IntoIterator<Item = (&'a String, &'a String)>, {
+  selector.iter().all(|(key, value)| {
+    metadata
+      .into_iter()
+      .any(|(meta_key, meta_value)| meta_key == key && meta_value == value)
+  })
 }
 
 #[cfg(test)]
