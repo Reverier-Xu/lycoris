@@ -49,8 +49,6 @@ pub(crate) enum ShellError {
   ClusterKeyNotFound,
   #[error("invalid selector '{0}', expected key=value")]
   InvalidSelector(String),
-  #[error("failed to spawn daemon process: {0}")]
-  DaemonSpawn(String),
   #[error("daemon runtime failed: {0}")]
   DaemonRuntime(#[from] lycoris_daemon::runtime::RuntimeError),
   #[error("setup error: {0}")]

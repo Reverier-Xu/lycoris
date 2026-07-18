@@ -6,7 +6,9 @@
 
 - `lycoris daemon`: starts the cluster node daemon.
 - `lycoris cluster`: inspects and operates on cluster membership state.
-- `lycoris setup`: initializes node configuration, TLS certificates, and the cluster key.
+- `lycoris setup`: installs the platform service unit (systemd user service on linux, launchd agent on macOS) for the daemon. It does not generate node configuration, TLS certificates, or the cluster key — create those separately (see `lycoris cluster init`).
+
+To run the daemon in the background, prefer `lycoris setup` plus the platform service manager (`systemctl --user`, `launchctl`) over hand-rolled backgrounding.
 
 ## Design Notes
 

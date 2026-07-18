@@ -21,15 +21,12 @@ pub(crate) struct ConfigArg {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum Command {
-  /// Query cluster information.
+  /// Inspect and manage cluster resources and membership.
   #[command(subcommand)]
   Cluster(ClusterCommand),
 
   /// Run the lycoris daemon in the foreground.
   Daemon(ConfigArg),
-
-  /// Start the lycoris daemon as a background child process.
-  Start(ConfigArg),
 
   /// Install lycoris as a user-mode background service.
   Setup,

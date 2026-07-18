@@ -34,11 +34,6 @@ async fn dispatch(command: Command) -> Result<(), ShellError> {
   match command {
     Command::Cluster(cluster) => dispatch_cluster(cluster).await,
     Command::Daemon(args) => commands::daemon::run(args.config).await,
-    Command::Start(args) => {
-      let child = commands::daemon::spawn(args.config)?;
-      println!("daemon started with pid {}", child.id());
-      Ok(())
-    }
     Command::Setup => commands::setup::run(),
   }
 }
