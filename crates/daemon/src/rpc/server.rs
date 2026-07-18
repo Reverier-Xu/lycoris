@@ -236,4 +236,95 @@ mod tests {
     assert_eq!(status.code(), tonic::Code::FailedPrecondition);
     assert!(status.message().contains("not registered"));
   }
+
+  #[tokio::test]
+  async fn register_rejects_empty_node_id() {
+    // An empty node id is an application-level rejection, not a protocol
+    // error: the peer reads the reason from the response body.
+    let (_dir, service) = test_service("local", "local");
+    let response = service
+      .register(Request::new(RegisterRequest {
+        info: Some(ProtoNodeInfo {
+          id: String::new(),
+          ..ProtoNodeInfo::default()
+        }),
+      }))
+      .await
+      .unwrap();
+    let response = response.into_inner();
+    assert!(!response.accepted);
+    assert!(response.reason.contains("empty"));
+  }
+
+  #[tokio::test]
+  async fn register_rejects_missing_node_info() {
+    let (_dir, service) = test_service("local", "local");
+    let status = service
+      .register(Request::new(RegisterRequest { info: None }))
+      .await
+      .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+  }
+
+  #[tokio::test]
+  async fn set_primary_endpoint_rejects_empty_address() {
+    let (_dir, service) = test_service("local", "local");
+    let response = service
+      .set_primary_endpoint(Request::new(SetPrimaryEndpointRequest {
+        address: String::new(),
+      }))
+      .await
+      .unwrap();
+    let response = response.into_inner();
+    assert!(!response.accepted);
+    assert!(response.reason.contains("empty"));
+  }
+
+  #[tokio::test]
+  async fn set_primary_endpoint_rejects_local_address() {
+    // The seeded local register listens on 127.0.0.1:1; pointing primary at
+    // the node's own address must be rejected by the storage node domain (D8).
+    let (_dir, service) = test_service("local", "local");
+    let response = service
+      .set_primary_endpoint(Request::new(SetPrimaryEndpointRequest {
+        address: "127.0.0.1:1".to_string(),
+      }))
+      .await
+      .unwrap();
+    let response = response.into_inner();
+    assert!(!response.accepted);
+    assert!(response.reason.contains("own address"));
+  }
+
+  #[tokio::test]
+  async fn leave_self_triggers_shutdown() {
+    let (_dir, service) = test_service("local", "local");
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let service = service.with_shutdown(shutdown_tx);
+
+    let response = service
+      .leave(Request::new(LeaveRequest {
+        node_id: "local".to_string(),
+      }))
+      .await
+      .unwrap();
+    assert!(response.into_inner().accepted);
+    assert!(*shutdown_rx.borrow());
+  }
+
+  #[tokio::test]
+  async fn leave_other_node_does_not_trigger_shutdown() {
+    let (_dir, service) = test_service("local", "local");
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let service = service.with_shutdown(shutdown_tx);
+
+    let response = service
+      .leave(Request::new(LeaveRequest {
+        node_id: "peer".to_string(),
+      }))
+      .await
+      .unwrap();
+    assert!(response.into_inner().accepted);
+    assert!(!*shutdown_rx.borrow());
+  }
 }

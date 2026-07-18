@@ -1271,3 +1271,53 @@ async fn memory_recall_works_after_replication() {
   assert_eq!(body.content, b"recall-target");
   assert!(!body.embedding.is_empty());
 }
+
+#[tokio::test]
+async fn wrong_cluster_key_is_rejected() {
+  let _ = lycoris_tls::install_crypto_provider();
+
+  let (node_count, base_port) = (1, alloc_base_port());
+  let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
+  let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
+
+  let cluster_key = ClusterKey::generate().expect("generate cluster key");
+
+  let config = build_config(
+    "node-0",
+    base_port,
+    vec![],
+    data_dirs[0].path().to_path_buf(),
+    &ca_cert_path,
+    &ca_key_path,
+    &cert_paths[0],
+    &key_paths[0],
+  );
+  spawn_runtime(config, cluster_key.clone());
+
+  time::sleep(Duration::from_millis(300)).await;
+
+  // The mTLS handshake succeeds (the client cert is valid), but a mismatched
+  // cluster key must be rejected at the Cluster admission boundary.
+  let node0_url = format!("https://127.0.0.1:{base_port}");
+  let client_tls = client_tls_bundle(&cert_paths[0], &key_paths[0], &ca_cert_path);
+  let wrong_key = ClusterKey::generate().expect("generate wrong cluster key");
+  let mut client = ClusterClient::connect(&node0_url, &client_tls)
+    .await
+    .expect("failed to connect to node-0")
+    .with_cluster_key(wrong_key.to_hex());
+
+  let error = client
+    .list_resources(
+      ResourceKind::Node,
+      HashMap::new(),
+      ProtoResourceScope::Unspecified,
+    )
+    .await
+    .expect_err("a wrong cluster key must be rejected");
+  match error {
+    lycoris_client::ClientError::Status(status) => {
+      assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    }
+    other => panic!("expected an rpc status error, got {other:?}"),
+  }
+}

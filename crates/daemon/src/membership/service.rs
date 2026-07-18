@@ -292,6 +292,76 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn leave_known_peer_marks_leaving_and_broadcasts() {
+    let service = MembershipService::new("local", SwimConfig::default(), register("local"));
+    let _ = service.register(register("peer")).await;
+
+    let actions = service.leave("peer", 1_000).await;
+
+    assert_eq!(
+      actions,
+      vec![SwimAction::Broadcast(SwimMessage::Leave {
+        node_id: "peer".to_string(),
+        incarnation: 1,
+      })]
+    );
+    // A leaving peer drops out of the active listing.
+    let nodes = service.list_nodes(&HashMap::new()).await;
+    assert!(nodes.iter().all(|n| n.node_id() != "peer"));
+  }
+
+  #[tokio::test]
+  async fn leave_unknown_node_broadcasts_with_fallback_incarnation() {
+    let service = MembershipService::new("local", SwimConfig::default(), register("local"));
+
+    // The node is unknown, so the incarnation falls back to 1; the leave is
+    // still broadcast so the rumor reaches whoever does know the node.
+    let actions = service.leave("ghost", 1_000).await;
+
+    assert_eq!(
+      actions,
+      vec![SwimAction::Broadcast(SwimMessage::Leave {
+        node_id: "ghost".to_string(),
+        incarnation: 1,
+      })]
+    );
+    assert!(service.member_address("ghost").await.is_none());
+  }
+
+  #[tokio::test]
+  async fn leave_local_node_marks_leaving_and_broadcasts() {
+    let service = MembershipService::new("local", SwimConfig::default(), register("local"));
+
+    let actions = service.leave("local", 1_000).await;
+
+    assert_eq!(
+      actions,
+      vec![SwimAction::Broadcast(SwimMessage::Leave {
+        node_id: "local".to_string(),
+        incarnation: 1,
+      })]
+    );
+    let nodes = service.list_nodes(&HashMap::new()).await;
+    assert!(nodes.iter().all(|n| n.node_id() != "local"));
+  }
+
+  #[tokio::test]
+  async fn member_address_returns_registered_address() {
+    let service = MembershipService::new("local", SwimConfig::default(), register("local"));
+    let _ = service.register(register("peer")).await;
+
+    assert_eq!(
+      service.member_address("local").await.as_deref(),
+      Some("127.0.0.1:1")
+    );
+    assert_eq!(
+      service.member_address("peer").await.as_deref(),
+      Some("127.0.0.1:1")
+    );
+    assert_eq!(service.member_address("ghost").await, None);
+  }
+
+  #[tokio::test]
   async fn list_nodes_filters_by_selector() {
     let service = MembershipService::new("local", SwimConfig::default(), register("local"));
     let mut peer = register("peer");
