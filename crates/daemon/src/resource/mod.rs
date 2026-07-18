@@ -341,7 +341,7 @@ impl ResourceMapper {
         self
           .storage
           .agent()
-          .apply_remote_memory(record, &body.content)
+          .apply_remote_memory(record)
           .await
           .map_err(MapperError::agent("failed to apply remote memory"))?;
       }

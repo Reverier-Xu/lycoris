@@ -60,6 +60,11 @@ pub struct WorkspaceDomain {
   rules: Arc<dyn RuleStorage>,
   skill_content: SkillContentStore,
   rule_content: RuleContentStore,
+  /// Serializes the read-check-write apply pipeline so concurrent applies of
+  /// the same resource cannot interleave and let an older version win the
+  /// final write. The critical sections are fully synchronous, so a standard
+  /// mutex is sufficient.
+  apply_lock: Arc<std::sync::Mutex<()>>,
 }
 
 impl WorkspaceDomain {
@@ -70,6 +75,7 @@ impl WorkspaceDomain {
       rules: Arc::new(RedbRuleStorage::new(db, rule::RULES)),
       skill_content: SkillContentStore::new(data_dir.join("skills")),
       rule_content: RuleContentStore::new(data_dir.join("rules")),
+      apply_lock: Arc::new(std::sync::Mutex::new(())),
     }
   }
 
@@ -104,6 +110,7 @@ impl WorkspaceDomain {
   pub fn apply_remote_skill(
     &self, record: VersionedResource, content: &str,
   ) -> Result<bool, WorkspaceStorageError> {
+    let _guard = self.lock_apply();
     apply_remote_resource(&record, content, self.skills(), self.skill_content())
   }
 
@@ -113,6 +120,7 @@ impl WorkspaceDomain {
   pub fn apply_remote_rule(
     &self, record: VersionedResource, content: &str,
   ) -> Result<bool, WorkspaceStorageError> {
+    let _guard = self.lock_apply();
     apply_remote_resource(&record, content, self.rules(), self.rule_content())
   }
 
@@ -123,6 +131,7 @@ impl WorkspaceDomain {
     &self, record: WorkspaceRecord,
   ) -> Result<bool, WorkspaceStorageError> {
     crate::versioned::verify_content_hash(&record.compute_content_hash()?, &record.content_hash)?;
+    let _guard = self.lock_apply();
     let local = self.workspaces().get(&record.id)?;
     if !crate::versioned::should_apply_versioned(local.as_ref(), &record) {
       return Ok(false);
@@ -130,12 +139,28 @@ impl WorkspaceDomain {
     self.workspaces().upsert(&record)?;
     Ok(true)
   }
+
+  /// Serialize the whole apply pipeline (read local, decide, write back).
+  ///
+  /// Poisoning only means a previous apply panicked mid-write; the stores are
+  /// left in their last committed state, so applying may safely continue.
+  fn lock_apply(&self) -> std::sync::MutexGuard<'_, ()> {
+    self
+      .apply_lock
+      .lock()
+      .unwrap_or_else(std::sync::PoisonError::into_inner)
+  }
 }
 
 /// Shared apply pipeline for content-backed versioned resources (skills and
 /// rules): verify content integrity, win the version/scope conflict check,
-/// then persist the metadata record and rewrite the content only when it
-/// actually changed.
+/// rewrite the content when it actually changed, and only then persist the
+/// metadata record.
+///
+/// Content is written before metadata: if the content write fails, the stored
+/// metadata still points at the previous content hash and a retry of the same
+/// record is not skipped, so the pipeline converges. The reverse order would
+/// strand the metadata on a hash whose content was never written.
 fn apply_remote_resource(
   record: &VersionedResource, content: &str, storage: &dyn versioned::VersionedStorage,
   content_store: &dyn VersionedContentStore,
@@ -151,13 +176,13 @@ fn apply_remote_resource(
   if !crate::versioned::should_apply_versioned(local.as_ref(), record) {
     return Ok(false);
   }
-  storage.upsert(record)?;
   if local
     .as_ref()
     .is_none_or(|local| local.content_hash != record.content_hash)
   {
     content_store.write(&record.id, content, &record.content_hash)?;
   }
+  storage.upsert(record)?;
   Ok(true)
 }
 
@@ -524,5 +549,61 @@ mod tests {
 
     let error = domain.apply_remote_workspace(record).unwrap_err();
     assert!(error.to_string().contains("content hash mismatch"));
+  }
+
+  /// Content store whose writes always fail, to exercise the apply pipeline's
+  /// failure path.
+  #[derive(Debug)]
+  struct FailingContentStore;
+
+  impl VersionedContentStore for FailingContentStore {
+    fn write(
+      &self, _id: &str, _content: &str, _message: &str,
+    ) -> Result<String, WorkspaceStorageError> {
+      Err(WorkspaceStorageError::GitCommandFailed(
+        "injected failure".to_string(),
+      ))
+    }
+
+    fn read(&self, _id: &str) -> Result<Option<String>, WorkspaceStorageError> {
+      Ok(None)
+    }
+  }
+
+  #[test]
+  fn apply_remote_resource_persists_no_metadata_when_content_write_fails() {
+    let (_dir, domain) = test_domain();
+    let content = "name = 'fragile'";
+    let record = shared_skill("skill-fragile", content, 1);
+
+    let error =
+      apply_remote_resource(&record, content, domain.skills(), &FailingContentStore).unwrap_err();
+    assert!(matches!(error, WorkspaceStorageError::GitCommandFailed(_)));
+
+    // The metadata must not point at content that was never written; a retry
+    // of the same record has to be applied instead of skipped.
+    assert!(domain.skills().get("skill-fragile").unwrap().is_none());
+  }
+
+  #[test]
+  fn concurrent_applies_converge_to_highest_version() {
+    let (_dir, domain) = test_domain();
+    let mut handles = Vec::new();
+    for version in 1..=8_u64 {
+      let domain = domain.clone();
+      handles.push(std::thread::spawn(move || {
+        let content = format!("skill v{version}");
+        let record = shared_skill("skill-race", &content, version);
+        domain.apply_remote_skill(record, &content).unwrap();
+      }));
+    }
+    for handle in handles {
+      handle.join().unwrap();
+    }
+
+    let loaded = domain.skills().get("skill-race").unwrap().unwrap();
+    assert_eq!(loaded.version, 8);
+    let content = domain.skill_content().read("skill-race").unwrap().unwrap();
+    assert_eq!(content, "skill v8");
   }
 }

@@ -525,6 +525,10 @@ fn parse_memory_batch(batch: &RecordBatch) -> Result<Vec<MemoryEntry>, AgentStor
 pub struct AgentDomain {
   sessions: Arc<dyn SessionStorage>,
   memory: Arc<dyn MemoryStorage>,
+  /// Serializes the read-check-write apply pipeline so concurrent applies of
+  /// the same memory cannot interleave and let an older version win the final
+  /// write. `tokio` because the critical section spans `.await` points.
+  apply_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AgentDomain {
@@ -533,6 +537,7 @@ impl AgentDomain {
     Self {
       sessions: Arc::new(RedbTableStorage::new(db, SESSIONS)),
       memory: Arc::new(LanceDbMemoryStorage::new(memory_uri)),
+      apply_lock: Arc::new(tokio::sync::Mutex::new(())),
     }
   }
 
@@ -548,14 +553,18 @@ impl AgentDomain {
 
   /// Apply a remote memory entry if it wins the version/scope conflict check.
   ///
-  /// Returns `true` when the entry was stored, `false` when it was skipped.
-  pub async fn apply_remote_memory(
-    &self, entry: MemoryEntry, content: &[u8],
-  ) -> Result<bool, AgentStorageError> {
-    if content.is_empty() {
+  /// The entry is the single source of truth: its own `content` is verified
+  /// against its declared `content_hash`. Returns `true` when the entry was
+  /// stored, `false` when it was skipped.
+  pub async fn apply_remote_memory(&self, entry: MemoryEntry) -> Result<bool, AgentStorageError> {
+    if entry.content.is_empty() {
       return Ok(false);
     }
-    crate::versioned::verify_content_hash(&crate::hash_content(content), &entry.content_hash)?;
+    crate::versioned::verify_content_hash(
+      &crate::hash_content(&entry.content),
+      &entry.content_hash,
+    )?;
+    let _guard = self.apply_lock.lock().await;
     let local = self.memory.get(&entry.id).await?;
     if !crate::versioned::should_apply_versioned(local.as_ref(), &entry) {
       return Ok(false);
@@ -790,7 +799,7 @@ mod tests {
     v1.content = v1_content.to_vec();
     v1.content_hash = MemoryEntry::compute_content_hash(v1_content);
     v1.version = 1;
-    assert!(agent.apply_remote_memory(v1, v1_content).await.unwrap());
+    assert!(agent.apply_remote_memory(v1).await.unwrap());
 
     let v2_content = b"remote v2";
     let mut v2 = memory_entry(
@@ -802,7 +811,7 @@ mod tests {
     v2.content = v2_content.to_vec();
     v2.content_hash = MemoryEntry::compute_content_hash(v2_content);
     v2.version = 2;
-    assert!(agent.apply_remote_memory(v2, v2_content).await.unwrap());
+    assert!(agent.apply_remote_memory(v2).await.unwrap());
 
     let loaded = agent.memory().get("remote-dup").await.unwrap().unwrap();
     assert_eq!(loaded.content, v2_content.to_vec());
@@ -831,10 +840,7 @@ mod tests {
     entry.content_hash = MemoryEntry::compute_content_hash(content);
     entry.version = 1;
 
-    let applied = agent
-      .apply_remote_memory(entry.clone(), content)
-      .await
-      .unwrap();
+    let applied = agent.apply_remote_memory(entry.clone()).await.unwrap();
     assert!(applied);
 
     let loaded = agent.memory().get("remote-1").await.unwrap().unwrap();
@@ -871,10 +877,7 @@ mod tests {
     remote.content_hash = MemoryEntry::compute_content_hash(remote_content);
     remote.version = 1;
 
-    let applied = agent
-      .apply_remote_memory(remote, remote_content)
-      .await
-      .unwrap();
+    let applied = agent.apply_remote_memory(remote).await.unwrap();
     assert!(!applied);
 
     let loaded = agent.memory().get("conflict").await.unwrap().unwrap();
@@ -899,7 +902,7 @@ mod tests {
     entry.content_hash = MemoryEntry::compute_content_hash(content);
     entry.version = 1;
 
-    let applied = agent.apply_remote_memory(entry, content).await.unwrap();
+    let applied = agent.apply_remote_memory(entry).await.unwrap();
     assert!(!applied);
   }
 
@@ -921,7 +924,7 @@ mod tests {
     entry.content_hash = "wrong-hash".to_string();
     entry.version = 1;
 
-    let error = agent.apply_remote_memory(entry, content).await.unwrap_err();
+    let error = agent.apply_remote_memory(entry).await.unwrap_err();
     assert!(error.to_string().contains("content hash mismatch"));
   }
 
@@ -942,7 +945,39 @@ mod tests {
     entry.content_hash = MemoryEntry::compute_content_hash(&[]);
     entry.version = 1;
 
-    let applied = agent.apply_remote_memory(entry, &[]).await.unwrap();
+    let applied = agent.apply_remote_memory(entry).await.unwrap();
     assert!(!applied);
+  }
+
+  #[tokio::test]
+  async fn concurrent_memory_applies_converge_to_highest_version() {
+    let dir = TempDir::new().unwrap();
+    let storage = Storage::open(dir.path().join("agent.redb")).unwrap();
+    let agent = storage.agent().clone();
+    let dim = DEFAULT_EMBEDDING_DIM;
+
+    let mut handles = Vec::new();
+    for version in 1..=8_u64 {
+      let agent = agent.clone();
+      handles.push(tokio::spawn(async move {
+        let mut entry = memory_entry(
+          "mem-race",
+          vec![0.1_f32; dim],
+          ResourceScope::ClusterShared,
+          version as i64,
+        );
+        entry.content = format!("v{version}").into_bytes();
+        entry.content_hash = MemoryEntry::compute_content_hash(&entry.content);
+        entry.version = version;
+        agent.apply_remote_memory(entry).await.unwrap();
+      }));
+    }
+    for handle in handles {
+      handle.await.unwrap();
+    }
+
+    let loaded = agent.memory().get("mem-race").await.unwrap().unwrap();
+    assert_eq!(loaded.version, 8);
+    assert_eq!(loaded.content, b"v8".to_vec());
   }
 }
