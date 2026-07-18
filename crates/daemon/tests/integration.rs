@@ -321,6 +321,13 @@ async fn primary_failure_falls_back_and_promotes() {
   )
   .await;
 
+  // The external node reaches node-1 through the register gossip push, but
+  // node-0 only promotes the reachable fallback to primary on its next
+  // anti-entropy tick (DEFAULT_SYNC_INTERVAL = 5s), and there is no RPC to
+  // observe the stored primary. Shutting node-0 down before that tick loses
+  // the promotion, so wait out one full sync interval first.
+  time::sleep(Duration::from_secs(6)).await;
+
   // Stop node-0 so that its redb database is closed and can be reopened.
   node0_shutdown_tx
     .send(true)
