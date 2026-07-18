@@ -59,8 +59,29 @@ impl GitContentStore {
   }
 }
 
+/// Validate a resource id before it is used to build a content file path.
+///
+/// Ids arrive from remote peers during anti-entropy; without this check a
+/// malicious id such as `../escape` would let a peer write outside the
+/// repository directory. Only non-empty ASCII alphanumeric ids with
+/// `-`/`_`/`.` are accepted; any `..` sequence or leading dot is rejected.
+fn validate_id(id: &str) -> Result<(), WorkspaceStorageError> {
+  let valid = !id.is_empty()
+    && !id.starts_with('.')
+    && !id.contains("..")
+    && id
+      .chars()
+      .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'));
+  if valid {
+    Ok(())
+  } else {
+    Err(WorkspaceStorageError::InvalidResourceId(id.to_string()))
+  }
+}
+
 impl VersionedContentStore for GitContentStore {
   fn write(&self, id: &str, content: &str, message: &str) -> Result<String, WorkspaceStorageError> {
+    validate_id(id)?;
     self.initialize()?;
     let relative_path = format!("{id}.toml");
     std::fs::write(self.repo_path.join(&relative_path), content)?;
@@ -96,6 +117,7 @@ impl VersionedContentStore for GitContentStore {
   }
 
   fn read(&self, id: &str) -> Result<Option<String>, WorkspaceStorageError> {
+    validate_id(id)?;
     match std::fs::read_to_string(self.repo_path.join(format!("{id}.toml"))) {
       Ok(content) => Ok(Some(content)),
       Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -129,5 +151,33 @@ mod tests {
     store.write("skill-1", "v1", "initial").unwrap();
     store.write("skill-1", "v2", "update").unwrap();
     assert_eq!(store.read("skill-1").unwrap().unwrap(), "v2");
+  }
+
+  #[test]
+  fn rejects_ids_that_escape_the_repository() {
+    let (dir, store) = test_store();
+    for id in ["../escape", "a/b", "", ".hidden", "a..b", "a\\b", "a b"] {
+      let error = store.write(id, "content", "msg").unwrap_err();
+      assert!(
+        matches!(error, WorkspaceStorageError::InvalidResourceId(_)),
+        "write id: {id:?}"
+      );
+      let error = store.read(id).unwrap_err();
+      assert!(
+        matches!(error, WorkspaceStorageError::InvalidResourceId(_)),
+        "read id: {id:?}"
+      );
+    }
+    // No file may have been created anywhere for the rejected ids.
+    assert!(!dir.path().join("escape.toml").exists());
+  }
+
+  #[test]
+  fn accepts_ids_within_the_whitelist() {
+    let (_dir, store) = test_store();
+    for id in ["skill-1", "a_b.C", "UPPER.lower-9", "x"] {
+      store.write(id, "content", "msg").unwrap();
+      assert_eq!(store.read(id).unwrap().unwrap(), "content");
+    }
   }
 }

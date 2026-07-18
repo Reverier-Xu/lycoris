@@ -54,7 +54,9 @@ pub(crate) fn workspace_storage_status(
 ) -> Status {
   use lycoris_storage::WorkspaceStorageError as Error;
   match &error {
-    Error::HashMismatch(_) => Status::invalid_argument(format!("{context}: {error}")),
+    Error::HashMismatch(_) | Error::InvalidResourceId(_) => {
+      Status::invalid_argument(format!("{context}: {error}"))
+    }
     Error::Storage(_) | Error::GitCommandFailed(_) => {
       Status::internal(format!("{context}: {error}"))
     }
