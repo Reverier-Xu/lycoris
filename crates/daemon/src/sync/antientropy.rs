@@ -447,9 +447,28 @@ fn remote_nodes(
 
 #[cfg(test)]
 mod tests {
-  use lycoris_proto::node::{MerkleLeafEntry, MerkleNodeRef, MerkleNodeResult};
+  use std::{sync::Arc, time::Duration};
+
+  use lycoris_membership::{MemberRegister, SwimConfig};
+  use lycoris_proto::node::{
+    FetchRegistersRequest, FetchRegistersResponse, MerkleLeafEntry, MerkleNodeRef,
+    MerkleNodeResult, MerkleNodesRequest, MerkleNodesResponse, MerkleRootRequest,
+    MerkleRootResponse, ProbeRequest, ProbeResponse, PushNodeRequest, PushNodeResponse,
+    PushRegistersRequest, PushRegistersResponse, StateMessage, StateResponse, SyncNodesRequest,
+    SyncNodesResponse, SyncResourcesRequest, SyncResourcesResponse,
+    membership_server::{Membership, MembershipServer},
+    sync_server::{Sync, SyncServer},
+  };
+  use lycoris_storage::{NodeDomain, Storage};
+  use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+  use tempfile::TempDir;
+  use tonic::{Request, Response, Status};
 
   use super::*;
+  use crate::{
+    membership::MembershipService, resource::ResourceMapper, sync::ResourceSync,
+    transport::PeerPool,
+  };
 
   fn wire_result(depth: u32, index: u64, hash_len: usize) -> MerkleNodeResult {
     MerkleNodeResult {
@@ -532,5 +551,224 @@ mod tests {
 
     assert_eq!(nodes.len(), 1);
     assert_eq!(nodes[0].entries, None);
+  }
+
+  /// A peer that predates the Merkle protocol: Merkle RPCs fail or hang while
+  /// the legacy full-sync exchange keeps working.
+  #[derive(Debug, Clone)]
+  struct LegacyPeer {
+    hang_on_merkle: bool,
+    snapshot: Vec<ProtoNodeInfo>,
+  }
+
+  #[tonic::async_trait]
+  #[allow(clippy::result_large_err)]
+  impl Membership for LegacyPeer {
+    async fn merkle_root(
+      &self, _request: Request<MerkleRootRequest>,
+    ) -> Result<Response<MerkleRootResponse>, Status> {
+      if self.hang_on_merkle {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+      }
+      Err(Status::unimplemented("merkle protocol not supported"))
+    }
+
+    async fn merkle_nodes(
+      &self, _request: Request<MerkleNodesRequest>,
+    ) -> Result<Response<MerkleNodesResponse>, Status> {
+      Err(Status::unimplemented("merkle protocol not supported"))
+    }
+
+    async fn fetch_registers(
+      &self, _request: Request<FetchRegistersRequest>,
+    ) -> Result<Response<FetchRegistersResponse>, Status> {
+      Err(Status::unimplemented("merkle protocol not supported"))
+    }
+
+    async fn push_registers(
+      &self, _request: Request<PushRegistersRequest>,
+    ) -> Result<Response<PushRegistersResponse>, Status> {
+      Err(Status::unimplemented("merkle protocol not supported"))
+    }
+
+    async fn probe(
+      &self, _request: Request<ProbeRequest>,
+    ) -> Result<Response<ProbeResponse>, Status> {
+      Err(Status::unimplemented("swim not supported"))
+    }
+
+    async fn state(
+      &self, _request: Request<StateMessage>,
+    ) -> Result<Response<StateResponse>, Status> {
+      Err(Status::unimplemented("swim not supported"))
+    }
+  }
+
+  #[tonic::async_trait]
+  #[allow(clippy::result_large_err)]
+  impl Sync for LegacyPeer {
+    async fn sync_nodes(
+      &self, _request: Request<SyncNodesRequest>,
+    ) -> Result<Response<SyncNodesResponse>, Status> {
+      Ok(Response::new(SyncNodesResponse {
+        nodes: self.snapshot.clone(),
+      }))
+    }
+
+    async fn push_node(
+      &self, _request: Request<PushNodeRequest>,
+    ) -> Result<Response<PushNodeResponse>, Status> {
+      Err(Status::unimplemented("gossip not supported"))
+    }
+
+    async fn sync_resources(
+      &self, _request: Request<SyncResourcesRequest>,
+    ) -> Result<Response<SyncResourcesResponse>, Status> {
+      Ok(Response::new(SyncResourcesResponse {
+        resources: Vec::new(),
+      }))
+    }
+  }
+
+  /// Generate a test CA and one node identity; the returned bundle serves as
+  /// both server and client credentials since both ends trust the same CA.
+  fn test_tls(dir: &std::path::Path) -> lycoris_tls::TlsBundle {
+    let ca_key = KeyPair::generate().unwrap();
+    let mut ca_params = CertificateParams::new(vec!["lycoris-test-ca".to_string()]).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+    let ca_path = dir.join("ca.crt");
+    std::fs::write(&ca_path, ca_cert.pem()).unwrap();
+
+    let key = KeyPair::generate().unwrap();
+    let params = CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
+    let cert = params.signed_by(&key, &ca_cert, &ca_key).unwrap();
+    let cert_path = dir.join("node.crt");
+    let key_path = dir.join("node.key");
+    std::fs::write(&cert_path, cert.pem()).unwrap();
+    std::fs::write(&key_path, key.serialize_pem()).unwrap();
+
+    lycoris_tls::load_tls_bundle(&cert_path, &key_path, &ca_path).unwrap()
+  }
+
+  /// Serve `peer` over mTLS on an ephemeral loopback port, polling until the
+  /// listener accepts connections instead of assuming a fixed startup delay.
+  async fn serve_legacy_peer(
+    peer: LegacyPeer, tls: &lycoris_tls::TlsBundle,
+  ) -> (String, tokio::task::JoinHandle<()>) {
+    // Reserve an ephemeral port, then release it for the tonic server; the
+    // readiness probe below covers the small rebind race.
+    let addr = std::net::TcpListener::bind("127.0.0.1:0")
+      .unwrap()
+      .local_addr()
+      .unwrap();
+    let server_tls = tls.server_config();
+    let handle = tokio::spawn(async move {
+      let result = tonic::transport::Server::builder()
+        .tls_config(server_tls)
+        .unwrap()
+        .add_service(SyncServer::new(peer.clone()))
+        .add_service(MembershipServer::new(peer))
+        .serve(addr)
+        .await;
+      if let Err(error) = result {
+        eprintln!("legacy peer server failed: {error}");
+      }
+    });
+
+    let address = format!("https://{addr}");
+    let start = std::time::Instant::now();
+    loop {
+      match lycoris_client::PeerClient::connect(&address, tls).await {
+        Ok(_) => return (address, handle),
+        Err(error) if start.elapsed() >= Duration::from_secs(10) => {
+          panic!("legacy peer never came up: {error}");
+        }
+        Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+      }
+    }
+  }
+
+  /// A real `ClusterSync` wired against temporary storage, mirroring the
+  /// assembly in `crate::runtime`.
+  struct TestNode {
+    _dir: TempDir,
+    sync: ClusterSync,
+    service: Arc<MembershipService>,
+    node: NodeDomain,
+  }
+
+  fn test_node(tls: &lycoris_tls::TlsBundle) -> TestNode {
+    let dir = TempDir::new().unwrap();
+    let storage = Storage::open(dir.path().join("test.redb")).unwrap();
+    let node = storage.node().clone();
+    let local = MemberRegister::new("local", "https://127.0.0.1:1", 1, 0);
+    let service = Arc::new(MembershipService::new(
+      "local",
+      SwimConfig::default(),
+      local,
+    ));
+    let mapper = ResourceMapper::new(storage.clone(), service.clone());
+    let pool = PeerPool::new(tls);
+    let resources = ResourceSync::new(mapper, node.clone(), pool.clone());
+    let sync = ClusterSync::new(
+      "local".to_string(),
+      service.clone(),
+      node.clone(),
+      pool,
+      resources,
+    );
+    TestNode {
+      _dir: dir,
+      sync,
+      service,
+      node,
+    }
+  }
+
+  async fn run_full_sync_fallback(hang_on_merkle: bool) {
+    let _ = lycoris_tls::install_crypto_provider();
+    let tls_dir = TempDir::new().unwrap();
+    let tls = test_tls(tls_dir.path());
+
+    let legacy = LegacyPeer {
+      hang_on_merkle,
+      snapshot: vec![ProtoNodeInfo::new(
+        "legacy-node",
+        "https://127.0.0.1:9",
+        HashMap::new(),
+        HashMap::new(),
+      )],
+    };
+    let (address, server) = serve_legacy_peer(legacy, &tls).await;
+
+    let node = test_node(&tls);
+    node.sync.sync_with_peer(&address).await.unwrap();
+
+    // The full-sync fallback merges the legacy peer's snapshot...
+    assert_eq!(
+      node.service.member_address("legacy-node").await.as_deref(),
+      Some("https://127.0.0.1:9")
+    );
+    // ...and the exchange counts as a successful contact for the peer
+    // bookkeeping.
+    let records = node.node.peers().records().unwrap();
+    let record = records
+      .iter()
+      .find(|record| record.address == address)
+      .unwrap();
+    assert!(record.online);
+
+    server.abort();
+  }
+
+  #[tokio::test]
+  async fn merkle_unsupported_falls_back_to_full_sync() {
+    run_full_sync_fallback(false).await;
+  }
+
+  #[tokio::test]
+  async fn merkle_timeout_falls_back_to_full_sync() {
+    run_full_sync_fallback(true).await;
   }
 }
