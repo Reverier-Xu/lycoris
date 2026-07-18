@@ -88,3 +88,15 @@ pub(crate) enum ClusterCommand {
   /// Print the current cluster key.
   Key,
 }
+
+#[cfg(test)]
+mod tests {
+  use clap::CommandFactory;
+
+  use super::Cli;
+
+  #[test]
+  fn cli_definition_is_valid() {
+    Cli::command().debug_assert();
+  }
+}

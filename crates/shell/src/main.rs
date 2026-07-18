@@ -20,7 +20,15 @@ fn main() {
 
 fn run() -> Result<(), ShellError> {
   lycoris_tls::install_crypto_provider().map_err(ShellError::CryptoProvider)?;
-  tracing_subscriber::fmt::init();
+  // Logs go to stderr so stdout stays reserved for command output (which may
+  // be piped). The default level is quiet; RUST_LOG overrides it.
+  tracing_subscriber::fmt()
+    .with_writer(std::io::stderr)
+    .with_env_filter(
+      tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+    )
+    .init();
 
   let command = Cli::parse().command;
   tokio::runtime::Runtime::new()

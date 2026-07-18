@@ -25,10 +25,11 @@ pub(crate) fn run() -> Result<(), ShellError> {
 /// Return the server binary path inside `bin_dir`, verifying it exists.
 ///
 /// The daemon and the CLI ship as a single binary, so the server binary must
-/// sit next to the running executable.
+/// sit next to the running executable. The platform executable suffix matters
+/// here: on windows the binary is `lycoris.exe`.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn server_binary_path(bin_dir: &std::path::Path) -> Result<std::path::PathBuf, ShellError> {
-  let server_binary = bin_dir.join("lycoris");
+  let server_binary = bin_dir.join(format!("lycoris{}", env::consts::EXE_SUFFIX));
   if !server_binary.is_file() {
     return Err(ShellError::setup(format!(
       "server binary not found at {}; ensure 'lycoris' is in the same directory as the lycoris binary",
@@ -39,7 +40,7 @@ fn server_binary_path(bin_dir: &std::path::Path) -> Result<std::path::PathBuf, S
 }
 
 /// Create `path` and all missing parents, with the shared setup error shape.
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn ensure_dir(path: &std::path::Path) -> Result<(), ShellError> {
   std::fs::create_dir_all(path)
     .map_err(|error| ShellError::setup(format!("failed to create {}: {error}", path.display())))
@@ -144,7 +145,7 @@ mod platform {
        [Service]\n\
        Type=exec\n\
        ExecStart={exec_start}\n\
-       WorkingDirectory={}\n\n\
+       WorkingDirectory=\"{}\"\n\n\
        Restart=on-failure\n\
        RestartSec=5s\n\
        StartLimitInterval=60s\n\
@@ -220,7 +221,7 @@ mod platform {
 
       let content = fs::read_to_string(systemd_dir.join("lycoris.service")).unwrap();
       assert!(content.contains(&format!("ExecStart=\"{}\" daemon", server_binary.display())));
-      assert!(content.contains(&format!("WorkingDirectory={}", data_dir.display())));
+      assert!(content.contains(&format!("WorkingDirectory=\"{}\"", data_dir.display())));
     }
 
     #[test]
@@ -344,12 +345,23 @@ mod platform {
          <string>{}/lycoris.log</string>\n\
        </dict>\n\
        </plist>\n",
-      server_binary.to_string_lossy(),
-      config_path.display(),
-      data_dir.display(),
-      data_dir.display(),
-      data_dir.display()
+      xml_escape(&server_binary.to_string_lossy()),
+      xml_escape(&config_path.to_string_lossy()),
+      xml_escape(&data_dir.to_string_lossy()),
+      xml_escape(&data_dir.to_string_lossy()),
+      xml_escape(&data_dir.to_string_lossy())
     )
+  }
+
+  /// Escape the XML predefined entities so paths containing `&`, `<`, quotes
+  /// or similar characters still produce a valid plist.
+  fn xml_escape(raw: &str) -> String {
+    raw
+      .replace('&', "&amp;")
+      .replace('<', "&lt;")
+      .replace('>', "&gt;")
+      .replace('"', "&quot;")
+      .replace('\'', "&apos;")
   }
 
   fn load_launchd_agent(launchd_dir: &Path) -> Result<(), ShellError> {
@@ -377,7 +389,7 @@ mod platform {
 
   use lycoris_config::DAEMON_CONFIG_FILE_NAME;
 
-  use super::{SERVICE_NAME, ensure_dir, server_binary_path};
+  use super::{SERVICE_NAME, server_binary_path};
   use crate::error::ShellError;
 
   pub(crate) fn install(bin_dir: &Path) -> Result<(), ShellError> {
@@ -385,32 +397,21 @@ mod platform {
 
     let config_dir = lycoris_config::user_config_dir()
       .ok_or_else(|| ShellError::setup("failed to determine user config directory"))?;
-    let data_dir = lycoris_config::user_data_dir()
-      .ok_or_else(|| ShellError::setup("failed to determine user data directory"))?;
+    let config_path = config_dir.join(DAEMON_CONFIG_FILE_NAME);
 
-    ensure_dir(&config_dir)?;
-    ensure_dir(&data_dir)?;
-
-    println!("windows service setup is not yet automated.");
-    println!();
-    println!("prepared directories:");
-    println!("  config: {}", config_dir.display());
-    println!("  data:   {}", data_dir.display());
-    println!();
-    println!("next steps:");
-    println!(
-      "  1. create {}",
-      config_dir.join(DAEMON_CONFIG_FILE_NAME).display()
-    );
-    println!("  2. register {} as a windows service, e.g.:", SERVICE_NAME);
-    println!(
-      "     sc create {SERVICE_NAME} binPath= \"{} daemon --config \\\"{}\\\"\" start= auto",
+    // Registering a windows service requires elevated rights and sc.exe
+    // syntax that is error-prone to automate; fail loudly with the manual
+    // steps instead of pretending the setup succeeded.
+    Err(ShellError::setup(format!(
+      "windows service setup is not automated; nothing was installed.\n\
+       to run lycoris as a windows service manually:\n\
+       \x20 1. create {}\n\
+       \x20 2. register the service: sc create {SERVICE_NAME} binPath= \"{} daemon --config \\\"{}\\\"\" start= auto\n\
+       \x20 3. start the service: sc start {SERVICE_NAME}",
+      config_path.display(),
       server_binary.display(),
-      config_dir.join(DAEMON_CONFIG_FILE_NAME).display()
-    );
-    println!("  3. start the service: sc start {SERVICE_NAME}");
-
-    Ok(())
+      config_path.display()
+    )))
   }
 }
 

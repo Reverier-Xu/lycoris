@@ -13,9 +13,12 @@ pub(crate) async fn get_resources(
   client_config: &ClientConfig, resource: &str, name: Option<String>, selectors: &[String],
   scope: Option<String>,
 ) -> Result<(), ShellError> {
-  let mut client = connect_cluster(client_config).await?;
+  // Validate every argument before touching the network: a malformed kind,
+  // selector, or scope must fail fast without opening a connection.
   let kind = parse::parse_resource_kind(resource)?;
   let kind_name = parse::resource_name(kind);
+  let selector = parse::parse_selectors(selectors)?;
+  let scope = parse::parse_scope(scope)?;
   // The local node marker is only rendered for node listings; other kinds
   // skip the daemon-config read (and its warning) entirely.
   let local_id = if kind == ResourceKind::Node {
@@ -24,6 +27,7 @@ pub(crate) async fn get_resources(
     String::new()
   };
 
+  let mut client = connect_cluster(client_config).await?;
   match name {
     Some(id) => {
       let resource = client
@@ -41,8 +45,6 @@ pub(crate) async fn get_resources(
       render::render_resource(&resource, kind, &local_id);
     }
     None => {
-      let selector = parse::parse_selectors(selectors)?;
-      let scope = parse::parse_scope(scope)?;
       let resources = client
         .list_resources(kind, selector, scope)
         .await

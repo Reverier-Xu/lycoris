@@ -19,8 +19,10 @@ fn render_node_list(resources: &[ProtoResource], local_id: &str) {
     "STATE".bold().underline(),
   );
 
+  let mut skipped = 0usize;
   for resource in resources {
     let Some(Body::Node(NodeBody { node: Some(node) })) = resource.body.as_ref() else {
+      skipped += 1;
       continue;
     };
     let marker = if node.id == local_id {
@@ -35,6 +37,9 @@ fn render_node_list(resources: &[ProtoResource], local_id: &str) {
     };
     println!("{}{}  {}", marker, id, state_display(node.state),);
     println!("  address: {}", node.address);
+  }
+  if skipped > 0 {
+    eprintln!("note: {skipped} resource(s) had no node body and were not displayed");
   }
 }
 
@@ -55,7 +60,7 @@ fn render_generic_list(resources: &[ProtoResource]) {
     println!(
       "{}  {}  {}  {}",
       metadata.name,
-      resource_name(ResourceKind::try_from(metadata.kind).unwrap_or(ResourceKind::Node)),
+      kind_display(metadata.kind),
       scope_display(metadata.scope),
       metadata.source_node_id.as_str(),
     );
@@ -71,6 +76,7 @@ pub(crate) fn render_resource(resource: &ProtoResource, kind: ResourceKind, loca
 
 fn render_node(resource: &ProtoResource, local_id: &str) {
   let Some(Body::Node(NodeBody { node: Some(node) })) = resource.body.as_ref() else {
+    eprintln!("note: the returned resource has no node body; nothing to display");
     return;
   };
 
@@ -100,10 +106,7 @@ fn render_generic(resource: &ProtoResource) {
   };
 
   println!("{}", metadata.name.bold());
-  println!(
-    "  kind:           {}",
-    resource_name(ResourceKind::try_from(metadata.kind).unwrap_or(ResourceKind::Node))
-  );
+  println!("  kind:           {}", kind_display(metadata.kind));
   println!("  id:             {}", metadata.id);
   println!("  scope:          {}", scope_display(metadata.scope));
   println!("  source node:    {}", metadata.source_node_id);
@@ -145,6 +148,12 @@ fn render_generic(resource: &ProtoResource) {
     }
     Some(Body::Node(_)) | None => {}
   }
+}
+
+/// Display form of a raw wire kind value; values outside the known kinds
+/// render as "unknown" instead of being guessed as nodes.
+fn kind_display(raw: i32) -> &'static str {
+  ResourceKind::try_from(raw).map_or("unknown", resource_name)
 }
 
 /// Display form of a node state; unset or unknown wire values render as
