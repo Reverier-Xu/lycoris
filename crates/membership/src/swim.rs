@@ -750,6 +750,142 @@ mod tests {
   }
 
   #[test]
+  fn leave_rumor_marks_peer_leaving() {
+    let mut swim = Swim::new("local", SwimConfig::default(), local_register("local"));
+    swim.membership.merge_register(&peer_register("peer"));
+
+    let actions = swim.on_message(
+      "peer",
+      SwimMessage::Leave {
+        node_id: "peer".to_string(),
+        incarnation: 1,
+      },
+      1_000,
+    );
+
+    assert!(actions.is_empty());
+    assert_eq!(
+      swim.membership.get("peer").unwrap().state(),
+      MemberState::Leaving
+    );
+  }
+
+  #[test]
+  fn leave_rumor_with_older_incarnation_is_ignored() {
+    let mut swim = Swim::new("local", SwimConfig::default(), local_register("local"));
+    let mut peer = peer_register("peer");
+    peer.set_incarnation(2);
+    swim.membership.merge_register(&peer);
+
+    let actions = swim.on_message(
+      "peer",
+      SwimMessage::Leave {
+        node_id: "peer".to_string(),
+        incarnation: 1,
+      },
+      1_000,
+    );
+
+    assert!(actions.is_empty());
+    let peer = swim.membership.get("peer").unwrap();
+    assert_eq!(peer.state(), MemberState::Active);
+    assert_eq!(peer.incarnation(), 2);
+  }
+
+  #[test]
+  fn leave_rumor_does_not_revive_offline_peer() {
+    let mut swim = Swim::new("local", SwimConfig::default(), local_register("local"));
+    let mut peer = peer_register("peer");
+    peer.offline(500);
+    swim.membership.merge_register(&peer);
+
+    let _ = swim.on_message(
+      "peer",
+      SwimMessage::Leave {
+        node_id: "peer".to_string(),
+        incarnation: 1,
+      },
+      1_000,
+    );
+
+    // D1: Offline outranks Leaving at the same incarnation, so the merge is a
+    // no-op and the failed node stays Offline.
+    assert_eq!(
+      swim.membership.get("peer").unwrap().state(),
+      MemberState::Offline
+    );
+  }
+
+  #[test]
+  fn leave_rumor_about_unknown_or_local_node_is_ignored() {
+    let mut swim = Swim::new("local", SwimConfig::default(), local_register("local"));
+
+    let _ = swim.on_message(
+      "peer",
+      SwimMessage::Leave {
+        node_id: "ghost".to_string(),
+        incarnation: 1,
+      },
+      1_000,
+    );
+    assert!(swim.membership.get("ghost").is_none());
+
+    // A Leave rumor about the local node changes nothing: only the node
+    // itself declares its own leaving.
+    let _ = swim.on_message(
+      "peer",
+      SwimMessage::Leave {
+        node_id: "local".to_string(),
+        incarnation: 1,
+      },
+      1_000,
+    );
+    assert_eq!(
+      swim.membership.get("local").unwrap().state(),
+      MemberState::Active
+    );
+  }
+
+  #[test]
+  fn leaving_local_node_never_refutes_rumors() {
+    let mut swim = Swim::new("local", SwimConfig::default(), local_register("local"));
+    swim.membership_mut().leave("local", 500);
+    assert_eq!(
+      swim.membership.get("local").unwrap().state(),
+      MemberState::Leaving
+    );
+
+    // A suspect rumor about the local node is met with silence: leaving is
+    // the node's own choice, so there is nothing to refute.
+    let actions = swim.on_message(
+      "peer",
+      SwimMessage::Suspect {
+        node_id: "local".to_string(),
+        incarnation: 5,
+      },
+      1_000,
+    );
+    assert!(actions.is_empty());
+    assert_eq!(
+      swim.membership.get("local").unwrap().state(),
+      MemberState::Leaving
+    );
+    assert_eq!(swim.membership.get("local").unwrap().incarnation(), 1);
+
+    // An Offline rumor carried by an Alive message must not be refuted either.
+    let mut rumor = local_register("local");
+    rumor.set_incarnation(5);
+    rumor.offline(1_000);
+    let actions = swim.on_message("peer", SwimMessage::Alive { register: rumor }, 2_000);
+    assert!(actions.is_empty());
+    assert_eq!(
+      swim.membership.get("local").unwrap().state(),
+      MemberState::Leaving
+    );
+    assert_eq!(swim.membership.get("local").unwrap().incarnation(), 1);
+  }
+
+  #[test]
   fn partition_heals_after_reconnect() {
     // Partition A declares X offline; X lives on in partition B, bumping its
     // own heartbeat. After the partitions reconnect, X refutes the Offline
