@@ -26,12 +26,63 @@ run_in_node() {
 
 wait_for_file() {
   local path="$1"
-  local attempts=30
-  while [[ ! -f "${path}" && ${attempts} -gt 0 ]]; do
+  local timeout_secs="${2:-15}"
+  local deadline=$((SECONDS + timeout_secs))
+  while (( SECONDS < deadline )); do
+    [[ -f "${path}" ]] && return 0
     sleep 0.2
-    attempts=$((attempts - 1))
   done
   [[ -f "${path}" ]]
+}
+
+# Poll until the daemon inside a container answers CLI queries again (used
+# after container restarts).
+wait_until_ready() {
+  local node="$1"
+  local timeout_secs="${2:-30}"
+  local deadline=$((SECONDS + timeout_secs))
+  while (( SECONDS < deadline )); do
+    if run_in_node "${node}" lycoris cluster get nodes 2>/dev/null | grep -q "node-${node}"; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+# Poll until the observer sees every node in the cluster.
+wait_until_nodes_visible() {
+  local observer="$1"
+  local timeout_secs="${2:-30}"
+  local deadline=$((SECONDS + timeout_secs))
+  while (( SECONDS < deadline )); do
+    local output visible=true
+    output="$(run_in_node "${observer}" lycoris cluster get nodes 2>/dev/null || true)"
+    for i in $(seq 0 $((NODE_COUNT - 1))); do
+      if ! echo "${output}" | grep -q "node-${i}"; then
+        visible=false
+        break
+      fi
+    done
+    ${visible} && return 0
+    sleep 1
+  done
+  return 1
+}
+
+# Poll until a node is no longer reported active by the observer.
+wait_until_not_active() {
+  local observer="$1"
+  local node="$2"
+  local timeout_secs="${3:-30}"
+  local deadline=$((SECONDS + timeout_secs))
+  while (( SECONDS < deadline )); do
+    if ! run_in_node "${observer}" lycoris cluster get nodes 2>/dev/null | grep -q "${node}.*active"; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
 }
 
 echo "building static musl binary..."
@@ -69,20 +120,18 @@ echo "creating podman network..."
 podman network create "${NETWORK}" >/dev/null
 
 echo "starting bootstrap node (node-0)..."
+# The daemon config is mounted at the default user config path, so both the
+# daemon (default lookup) and the CLI subcommands that load it (join/leave)
+# find it without extra wiring.
 podman run -d --name "node-0" \
   --network "${NETWORK}" --hostname "node-0" \
   -v "${E2E_DIR}/certs:/certs" \
-  -v "${E2E_DIR}/configs/node-0.toml:/etc/lycoris/lycoris.toml:ro" \
+  -v "${E2E_DIR}/configs/node-0.toml:/root/.config/lycoris/lycoris.toml:ro" \
   -v "${E2E_DIR}/data/node-0:/data" \
   "${IMAGE}" >/dev/null
 
-# Make the daemon config discoverable by the CLI via the default user path.
-run_in_node 0 mkdir -p /root/.config/lycoris
-run_in_node 0 ln -sf /etc/lycoris/lycoris.toml /root/.config/lycoris/lycoris.toml
-
 echo "waiting for node-0 to generate CA and certificates..."
-sleep 3
-if [[ ! -f "${E2E_DIR}/certs/ca.crt" || ! -f "${E2E_DIR}/certs/ca.key" ]]; then
+if ! wait_for_file "${E2E_DIR}/certs/ca.crt" || ! wait_for_file "${E2E_DIR}/certs/ca.key"; then
   echo "error: node-0 failed to generate CA certificates" >&2
   podman logs node-0 >&2 || true
   exit 1
@@ -101,10 +150,13 @@ podman cp "${E2E_DIR}/keys/cluster.key" "node-0:/data/cluster.key"
 
 echo "restarting node-0 to pick up cluster key..."
 podman restart node-0 >/dev/null
-sleep 2
 
 echo "waiting for node-0 to be ready after restart..."
-sleep 3
+if ! wait_until_ready 0; then
+  echo "error: node-0 did not become ready after restart" >&2
+  podman logs node-0 >&2 || true
+  exit 1
+fi
 
 echo "copying shared CA to node-1 and node-2..."
 for i in $(seq 1 $((NODE_COUNT - 1))); do
@@ -121,20 +173,16 @@ for i in $(seq 1 $((NODE_COUNT - 1))); do
   podman run -d --name "node-${i}" \
     --network "${NETWORK}" --hostname "node-${i}" \
     -v "${E2E_DIR}/certs:/certs" \
-    -v "${E2E_DIR}/configs/node-${i}.toml:/etc/lycoris/lycoris.toml:ro" \
+    -v "${E2E_DIR}/configs/node-${i}.toml:/root/.config/lycoris/lycoris.toml:ro" \
     -v "${E2E_DIR}/data/node-${i}:/data" \
     -v "${E2E_DIR}/keys/cluster.key:/data/cluster.key:ro" \
     -v "${E2E_DIR}/keys/cluster.key:/root/.local/share/lycoris/cluster.key:ro" \
     "${IMAGE}" >/dev/null
-
-  run_in_node "${i}" mkdir -p /root/.config/lycoris
-  run_in_node "${i}" ln -sf /etc/lycoris/lycoris.toml /root/.config/lycoris/lycoris.toml
 done
 
 echo "waiting for nodes to generate certificates..."
-sleep 3
 for i in $(seq 1 $((NODE_COUNT - 1))); do
-  if [[ ! -f "${E2E_DIR}/certs/node-${i}.crt" ]]; then
+  if ! wait_for_file "${E2E_DIR}/certs/node-${i}.crt"; then
     echo "error: node-${i} failed to generate certificate" >&2
     podman logs "node-${i}" >&2 || true
     exit 1
@@ -142,14 +190,17 @@ for i in $(seq 1 $((NODE_COUNT - 1))); do
 done
 
 echo "joining node-1 and node-2 to the cluster..."
+# No --key flag: join must pick up the key from the local cluster key file.
 for i in $(seq 1 $((NODE_COUNT - 1))); do
   run_in_node "${i}" lycoris cluster join \
-    --peer "https://node-0:5000" \
-    --key "${CLUSTER_KEY}"
+    --peer "https://node-0:5000"
 done
 
 echo "waiting for cluster to converge..."
-sleep 6
+if ! wait_until_nodes_visible 0; then
+  echo "error: cluster did not converge in time" >&2
+  exit 1
+fi
 
 echo ""
 echo "=== verifying lycoris cluster key on node-1 ==="
@@ -219,7 +270,10 @@ echo "=== verifying lycoris cluster leave on node-2 ==="
 run_in_node 2 lycoris cluster leave
 
 echo "waiting for leave state to propagate..."
-sleep 6
+if ! wait_until_not_active 0 node-2; then
+  echo "error: node-2 is still active after leave (timed out waiting for propagation)" >&2
+  exit 1
+fi
 
 echo ""
 echo "=== verifying node-2 is no longer active ==="
