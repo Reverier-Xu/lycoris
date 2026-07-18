@@ -45,3 +45,11 @@ lycoris daemon --config /path/to/lycoris.toml
 cargo test --workspace --all-features
 ./e2e/run.sh
 ```
+
+`e2e/` 下的端到端测试套件:
+
+- `e2e/run.sh` — 基于 compose 的集群测试(docker compose 或 podman-compose);在 CI 中运行。
+- `e2e/shell-test.sh` — 面向 CLI 的测试;需要本地安装 podman。
+- `e2e/partition-test.sh` — 网络分区测试;需要本地 podman,且容器内需要 `iptables`(`NET_ADMIN`)。
+
+后两套 podman 测试不在 CI 中运行,需在本地执行。

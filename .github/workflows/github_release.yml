@@ -10,7 +10,52 @@ permissions:
   contents: write
 
 jobs:
+  build-musl:
+    name: build static musl binary
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v6
+
+      - name: install stable rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "23.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: build static musl binary
+        run: cargo build --release --target x86_64-unknown-linux-musl -p lycoris --locked
+
+      - name: stage release assets
+        run: |
+          mkdir -p release-assets
+          cp target/x86_64-unknown-linux-musl/release/lycoris \
+            release-assets/lycoris-x86_64-unknown-linux-musl
+          (cd release-assets && sha256sum lycoris-x86_64-unknown-linux-musl \
+            > lycoris-x86_64-unknown-linux-musl.sha256)
+
+      - name: upload release asset artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lycoris-x86_64-unknown-linux-musl
+          path: release-assets/
+
   github-release:
+    name: publish github release
+    needs: build-musl
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -53,3 +98,17 @@ jobs:
           else
             gh release create "$TAG_NAME" --verify-tag --title "$TAG_NAME" --notes-file "$NOTES_FILE"
           fi
+
+      - name: download release assets
+        if: ${{ env.ACT != 'true' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: lycoris-x86_64-unknown-linux-musl
+          path: release-assets
+
+      - name: upload assets to github release
+        if: ${{ env.ACT != 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: gh release upload "$TAG_NAME" release-assets/* --clobber
