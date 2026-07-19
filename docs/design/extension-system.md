@@ -231,7 +231,9 @@ heartbeat bump gossips the change through the existing Alive path). Capability
 annotations are runtime-derived; they are *not* persisted into the node's
 configured annotations.
 
-Routing for `ExtensionService.Invoke`:
+Routing for `ExtensionService.Invoke` (always over gRPC/mTLS — the guest-facing
+`http` capability is strictly a client for external APIs and never carries
+cluster traffic):
 
 1. If the extension runs locally → execute and return.
 2. Else collect candidates from membership registers: state `Active` and an

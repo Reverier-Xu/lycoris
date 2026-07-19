@@ -1,6 +1,11 @@
 //! Outbound HTTP host capability for guests (`lycoris-abi-v1` upgrade,
 //! llm-provider design section 4).
 //!
+//! This capability is strictly a *client*: it exists so guests can reach
+//! external APIs (an LLM provider's HTTPS endpoint). In-cluster traffic —
+//! extension routing and forwarding — always runs over gRPC and never
+//! touches this path.
+//!
 //! A guest hands the host a JSON request `{method, url, headers, body?}`
 //! through linear memory and gets back a JSON response
 //! `{status, headers, body}`. Bodies are text (provider APIs are JSON).
@@ -17,32 +22,40 @@
 //! non-empty host allowlist rejects every other host. Non-2xx statuses are
 //! *not* errors: the status passes through to the guest, which owns the
 //! retry/failover policy.
+//!
+//! The client is `reqwest` over hyper (async, tokio-native) with
+//! rustls/ring and webpki roots, matching the workspace TLS stack and the
+//! static musl distribution.
 
 use std::time::Duration;
 
+use futures_util::StreamExt;
+
+use crate::error::{ExtensionError, Result};
+
 /// Response body cap in bytes (llm-provider design section 4).
-pub const MAX_RESPONSE_BODY_BYTES: u64 = 8 * 1024 * 1024;
+pub const MAX_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
 
 /// Per-request wall-clock timeout.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Build the shared HTTP agent: rustls/ring with webpki roots (the crate
-/// features select exactly that stack). `http_status_as_error(false)` keeps
-/// 4xx/5xx statuses as pass-through responses for the guest.
-pub fn agent() -> ureq::Agent {
-  let config = ureq::Agent::config_builder()
-    .http_status_as_error(false)
-    .timeout_global(Some(REQUEST_TIMEOUT))
-    .build();
-  ureq::Agent::new_with_config(config)
+/// Build the shared HTTP client: rustls/ring with webpki roots (the crate
+/// features select exactly that stack). Non-2xx statuses are pass-through
+/// by default (`error_for_status` is never called).
+pub fn client() -> Result<reqwest::Client> {
+  reqwest::Client::builder()
+    .timeout(REQUEST_TIMEOUT)
+    .build()
+    .map_err(|err| ExtensionError::Engine(format!("failed to build the http client: {err}")))
 }
 
-/// Execute one request document against `agent`, honouring the per-instance
+/// Execute one request document against `client`, honouring the per-instance
 /// host allowlist (`None` allows every host), and return the response (or a
-/// structured error document) as JSON bytes. Blocking: callers run this on
-/// `tokio::task::spawn_blocking`.
-pub fn execute(agent: &ureq::Agent, request: &[u8], allow_hosts: &Option<Vec<String>>) -> Vec<u8> {
-  match execute_inner(agent, request, allow_hosts) {
+/// structured error document) as JSON bytes.
+pub async fn execute(
+  client: &reqwest::Client, request: &[u8], allow_hosts: &Option<Vec<String>>,
+) -> Vec<u8> {
+  match execute_inner(client, request, allow_hosts).await {
     Ok(response) => response,
     Err(error) => error.document(),
   }
@@ -83,8 +96,8 @@ struct Request {
   body: Option<String>,
 }
 
-fn execute_inner(
-  agent: &ureq::Agent, request: &[u8], allow_hosts: &Option<Vec<String>>,
+async fn execute_inner(
+  client: &reqwest::Client, request: &[u8], allow_hosts: &Option<Vec<String>>,
 ) -> std::result::Result<Vec<u8>, HttpFailure> {
   let request: Request = serde_json::from_slice(request).map_err(|err| {
     HttpFailure::new(
@@ -93,8 +106,8 @@ fn execute_inner(
     )
   })?;
 
-  // The scheme check runs on the raw string: `http::Uri` rejects some
-  // non-http schemes at parse time, which would blur the error taxonomy.
+  // The scheme check runs on the raw string so non-http schemes map to
+  // `unsupported_scheme` instead of blurring into the parse-error taxonomy.
   let lower = request.url.to_ascii_lowercase();
   if !(lower.starts_with("http://") || lower.starts_with("https://")) {
     return Err(HttpFailure::new(
@@ -105,12 +118,10 @@ fn execute_inner(
       ),
     ));
   }
-  let uri: ureq::http::Uri = request
-    .url
-    .parse()
+  let url = reqwest::Url::parse(&request.url)
     .map_err(|err| HttpFailure::new("invalid_request", format!("invalid url: {err}")))?;
-  let host = uri
-    .host()
+  let host = url
+    .host_str()
     .ok_or_else(|| HttpFailure::new("invalid_request", "url has no host"))?;
   if let Some(allow_hosts) = allow_hosts {
     let host = host.to_ascii_lowercase();
@@ -125,24 +136,27 @@ fn execute_inner(
     }
   }
 
-  let mut builder = ureq::http::Request::builder()
-    .method(request.method.as_str())
-    .uri(request.url.as_str());
+  let method = request
+    .method
+    .parse::<reqwest::Method>()
+    .map_err(|err| HttpFailure::new("invalid_request", format!("invalid method: {err}")))?;
+  let mut builder = client.request(method, url);
   for (name, value) in &request.headers {
+    let name = name
+      .parse::<reqwest::header::HeaderName>()
+      .map_err(|err| HttpFailure::new("invalid_request", format!("invalid header name: {err}")))?;
+    let value = value
+      .parse::<reqwest::header::HeaderValue>()
+      .map_err(|err| HttpFailure::new("invalid_request", format!("invalid header value: {err}")))?;
     builder = builder.header(name, value);
   }
-  let request = match request.body {
-    Some(body) => builder.body(body),
-    None => builder.body(String::new()),
+  if let Some(body) = request.body {
+    builder = builder.body(body);
   }
-  .map_err(|err| {
-    HttpFailure::new(
-      "invalid_request",
-      format!("failed to build the request: {err}"),
-    )
-  })?;
-  let response = agent
-    .run(request)
+
+  let response = builder
+    .send()
+    .await
     .map_err(|err| HttpFailure::new("transport", format!("request failed: {err}")))?;
 
   let status = response.status().as_u16();
@@ -158,14 +172,14 @@ fn execute_inner(
       )
     })
     .collect();
-  let body = match response
-    .into_body()
-    .with_config()
-    .limit(MAX_RESPONSE_BODY_BYTES)
-    .read_to_string()
-  {
-    Ok(body) => body,
-    Err(ureq::Error::BodyExceedsLimit(_)) => {
+
+  // Stream the body so the cap applies before the full payload is buffered.
+  let mut body = Vec::new();
+  let mut stream = response.bytes_stream();
+  while let Some(chunk) = stream.next().await {
+    let chunk = chunk
+      .map_err(|err| HttpFailure::new("transport", format!("failed to read the body: {err}")))?;
+    if body.len() + chunk.len() > MAX_RESPONSE_BODY_BYTES {
       return Err(HttpFailure::new(
         "response_too_large",
         format!(
@@ -174,13 +188,9 @@ fn execute_inner(
         ),
       ));
     }
-    Err(err) => {
-      return Err(HttpFailure::new(
-        "transport",
-        format!("failed to read the response body: {err}"),
-      ));
-    }
-  };
+    body.extend_from_slice(&chunk);
+  }
+  let body = String::from_utf8_lossy(&body).into_owned();
 
   serde_json::to_vec(&serde_json::json!({
     "status": status,
@@ -208,47 +218,50 @@ mod tests {
     value["error"]["type"].as_str().unwrap().to_string()
   }
 
-  #[test]
-  fn malformed_request_documents_are_structured_errors() {
-    let agent = agent();
+  #[tokio::test]
+  async fn malformed_request_documents_are_structured_errors() {
+    let client = client().unwrap();
     assert_eq!(
-      error_type(&execute(&agent, b"not json", &None)),
+      error_type(&execute(&client, b"not json", &None).await),
       "invalid_request"
     );
   }
 
-  #[test]
-  fn non_http_schemes_are_rejected() {
-    let agent = agent();
+  #[tokio::test]
+  async fn non_http_schemes_are_rejected() {
+    let client = client().unwrap();
     for url in ["file:///etc/passwd", "gopher://example.com", "ftp://x"] {
       let document = request_document(url);
       assert_eq!(
-        error_type(&execute(&agent, &document, &None)),
+        error_type(&execute(&client, &document, &None).await),
         "unsupported_scheme",
         "expected scheme rejection for {url}"
       );
     }
   }
 
-  #[test]
-  fn the_allowlist_rejects_unlisted_hosts_before_any_io() {
-    let agent = agent();
+  #[tokio::test]
+  async fn the_allowlist_rejects_unlisted_hosts_before_any_io() {
+    let client = client().unwrap();
     let document = request_document("http://example.com/");
     let allow = Some(vec!["api.openai.com".to_string()]);
     assert_eq!(
-      error_type(&execute(&agent, &document, &allow)),
+      error_type(&execute(&client, &document, &allow).await),
       "host_not_allowed"
     );
   }
 
-  #[test]
-  fn the_allowlist_matches_hosts_case_insensitively() {
-    let agent = agent();
+  #[tokio::test]
+  async fn the_allowlist_matches_hosts_case_insensitively() {
+    let client = client().unwrap();
     // Port 1 refuses the connection, so any outcome past the allowlist check
     // is a transport error; a case-sensitive (buggy) match would surface as
     // host_not_allowed instead.
     let document = request_document("http://LOCALHOST:1/");
     let allow = Some(vec!["localhost".to_string()]);
-    assert_eq!(error_type(&execute(&agent, &document, &allow)), "transport");
+    assert_eq!(
+      error_type(&execute(&client, &document, &allow).await),
+      "transport"
+    );
   }
 }

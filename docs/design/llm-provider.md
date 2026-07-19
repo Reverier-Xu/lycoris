@@ -94,9 +94,12 @@ known set and gates a new host function in the `lycoris` module:
 - Optional `http_allow_hosts` (list of host names) in settings: when present,
   the host rejects requests to other hosts with a structured error. Egress
   policy stays declarative and per-node (settings merge, §5).
-- Client: `ureq` 3 with rustls/ring (small transitive footprint, matches the
-  existing rustls choice; blocking calls run on `spawn_blocking` inside the
-  async host fn).
+- Scope: this capability is strictly a *client* for reaching external APIs.
+  In-cluster traffic — extension routing and forwarding — always runs over
+  gRPC and never touches this path.
+- Client: `reqwest` over hyper (async, tokio-native) with rustls/ring and
+  webpki roots, matching the workspace TLS stack and the static musl
+  distribution.
 
 ## 5. Per-node settings and secrets
 

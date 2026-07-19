@@ -65,7 +65,7 @@ pub struct WasmEngine {
   limits: EngineLimits,
   /// Shared HTTP client for the `lycoris.http` import (one connection pool
   /// per engine).
-  http: ureq::Agent,
+  http: reqwest::Client,
 }
 
 impl WasmEngine {
@@ -80,7 +80,7 @@ impl WasmEngine {
     Ok(Self {
       engine,
       limits,
-      http: http::agent(),
+      http: http::client()?,
     })
   }
 
@@ -112,14 +112,14 @@ impl WasmEngine {
         ExtensionError::Engine(format!("failed to register the lycoris host module: {err}"))
       })?;
     if http_capability {
-      let agent = self.http.clone();
+      let client = self.http.clone();
       linker
         .func_wrap_async(
           HOST_MODULE,
           HTTP_IMPORT,
           move |mut caller: Caller<'_, WasmState>, (ptr, len): (i32, i32)| {
-            let agent = agent.clone();
-            Box::new(async move { run_http_import(&mut caller, &agent, ptr, len).await })
+            let client = client.clone();
+            Box::new(async move { run_http_import(&mut caller, &client, ptr, len).await })
           },
         )
         .map_err(|err| {
@@ -368,15 +368,16 @@ fn read_guest_bytes(caller: &mut Caller<'_, WasmState>, ptr: i32, len: i32) -> O
 }
 
 /// The `lycoris.http` host import: read the request document out of guest
-/// memory, execute it (blocking, on `spawn_blocking`), and hand the response
-/// document back as a guest-allocated buffer packed as `(ptr << 32) | len`.
+/// memory, execute it on the shared async `reqwest` client, and hand the
+/// response document back as a guest-allocated buffer packed as
+/// `(ptr << 32) | len`.
 ///
 /// Protocol-level failures (bad documents, disallowed hosts, transport
 /// errors, over-limit responses) are encoded as structured error documents
 /// by [`http::execute`]; only failures of the ABI machinery itself — the
 /// guest allocator or an out-of-bounds response write — trap.
 async fn run_http_import(
-  caller: &mut Caller<'_, WasmState>, agent: &ureq::Agent, ptr: i32, len: i32,
+  caller: &mut Caller<'_, WasmState>, client: &reqwest::Client, ptr: i32, len: i32,
 ) -> wasmtime::Result<i64> {
   let request = read_guest_bytes(caller, ptr, len)
     .unwrap_or_else(|| b"{\"error\":\"out-of-bounds request buffer\"}".to_vec());
@@ -386,17 +387,7 @@ async fn run_http_import(
     .read()
     .map(|guard| guard.clone())
     .unwrap_or(None);
-  let agent = agent.clone();
-  let response = tokio::task::spawn_blocking(move || http::execute(&agent, &request, &allow_hosts))
-    .await
-    .unwrap_or_else(|err| {
-      // A panicked blocking task is a host failure, but the guest still gets
-      // a document rather than a trap.
-      serde_json::to_vec(&serde_json::json!({
-        "error": { "type": "internal", "message": format!("http task failed: {err}") }
-      }))
-      .unwrap_or_default()
-    });
+  let response = http::execute(client, &request, &allow_hosts).await;
 
   // Place the response in guest memory through the guest allocator, the same
   // packing convention as `lycoris_invoke` returns.
