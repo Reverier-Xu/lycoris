@@ -1,17 +1,17 @@
 use std::{
-  collections::HashMap,
+  collections::{BTreeMap, HashMap},
   path::PathBuf,
   sync::atomic::{AtomicU16, Ordering},
   time::Duration,
 };
 
-use lycoris_client::{ClusterClient, PeerClient};
+use lycoris_client::{ClusterClient, ExtensionClient, PeerClient};
 use lycoris_config::{ClusterConfig, DaemonConfig, ExtensionsConfig, NodeConfig, TlsConfig};
 use lycoris_core::{ClusterKey, now_ms};
 use lycoris_proto::node::{NodeInfo, ResourceKind, ResourceScope as ProtoResourceScope};
 use lycoris_storage::{
-  DEFAULT_EMBEDDING_DIM, MemoryEntry, ResourceScope, SkillRecord, Storage, VersionedContentStore,
-  WorkspaceRecord,
+  DEFAULT_EMBEDDING_DIM, ExtensionRecord, MemoryEntry, ResourceScope, SkillRecord, Storage,
+  VersionedContentStore, WorkspaceRecord,
 };
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
 use tempfile::TempDir;
@@ -1285,6 +1285,223 @@ async fn wrong_cluster_key_is_rejected() {
   match error {
     lycoris_client::ClientError::Status(status) => {
       assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    }
+    other => panic!("expected an rpc status error, got {other:?}"),
+  }
+}
+
+/// Connect an extension client to a freshly spawned node, retrying until its
+/// listener is up (same rationale as `connect_client`).
+async fn connect_extension_client(
+  url: &str, tls: &lycoris_tls::TlsBundle, key_hex: &str,
+) -> ExtensionClient {
+  let start = std::time::Instant::now();
+  loop {
+    match ExtensionClient::connect(url, tls).await {
+      Ok(client) => return client.with_cluster_key(key_hex.to_string()),
+      Err(error) => {
+        if start.elapsed() >= Duration::from_secs(10) {
+          panic!("failed to connect to {url}: {error}");
+        }
+        time::sleep(Duration::from_millis(100)).await;
+      }
+    }
+  }
+}
+
+/// Poll until `node_id`'s register (as seen through `client`) carries the
+/// annotation `key`, returning its value.
+async fn wait_for_annotation(
+  client: &mut ClusterClient, node_id: &str, key: &str, timeout: Duration,
+) -> String {
+  let start = std::time::Instant::now();
+  loop {
+    let resources = client
+      .list_resources(
+        ResourceKind::Node,
+        HashMap::new(),
+        ProtoResourceScope::Unspecified,
+      )
+      .await
+      .expect("list resources failed");
+    for resource in resources {
+      let Some(lycoris_proto::node::resource::Body::Node(lycoris_proto::node::NodeBody {
+        node: Some(node),
+      })) = resource.body
+      else {
+        continue;
+      };
+      if node.id == node_id
+        && let Some(value) = node.annotations.get(key)
+      {
+        return value.clone();
+      }
+    }
+    if start.elapsed() >= timeout {
+      panic!("timed out waiting for annotation {key} on {node_id}");
+    }
+    time::sleep(Duration::from_millis(200)).await;
+  }
+}
+
+/// Fetch one node's annotations as seen through `client`.
+async fn node_annotations(client: &mut ClusterClient, node_id: &str) -> HashMap<String, String> {
+  client
+    .list_resources(
+      ResourceKind::Node,
+      HashMap::new(),
+      ProtoResourceScope::Unspecified,
+    )
+    .await
+    .expect("list resources failed")
+    .into_iter()
+    .find_map(|resource| match resource.body {
+      Some(lycoris_proto::node::resource::Body::Node(lycoris_proto::node::NodeBody {
+        node: Some(node),
+      }))
+        if node.id == node_id =>
+      {
+        Some(node.annotations)
+      }
+      _ => None,
+    })
+    .unwrap_or_default()
+}
+
+const ECHO_EXTENSION_SOURCE: &[u8] = b"function invoke(method, payload) return payload end";
+
+#[tokio::test]
+async fn extension_invocation_routes_to_the_capable_node() {
+  let _ = lycoris_tls::install_crypto_provider();
+
+  let (node_count, base_port) = (2, alloc_base_port());
+  let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
+  let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
+
+  let cluster_key = ClusterKey::generate().expect("generate cluster key");
+  let key_hex = cluster_key.to_hex();
+
+  // Node labels live only in the storage node-local domain — DaemonConfig has
+  // no label surface — so node-1's label is written directly before boot; the
+  // runtime registers exactly these labels into membership.
+  {
+    let storage =
+      Storage::open(data_dirs[1].path().join("lycoris.redb")).expect("open node-1 storage");
+    storage
+      .node()
+      .local()
+      .set_label("role", "runner")
+      .expect("set node-1 label");
+  }
+
+  // Publish the extension on node-0: a cluster-shared record whose selector
+  // matches only node-1's label, so resource anti-entropy converges it to
+  // both nodes but only node-1 activates it.
+  {
+    let storage =
+      Storage::open(data_dirs[0].path().join("lycoris.redb")).expect("open node-0 storage");
+    let record = ExtensionRecord {
+      id: "echo-ext".to_string(),
+      name: "echo extension".to_string(),
+      version: 1,
+      engine: "lua".to_string(),
+      entry: "invoke".to_string(),
+      content_hash: blake3::hash(ECHO_EXTENSION_SOURCE).to_hex().to_string(),
+      scope: ResourceScope::ClusterShared,
+      source_node_id: Some("node-0".to_string()),
+      created_at_ms: 1_000,
+      updated_at_ms: 1_000,
+      manifest: BTreeMap::from([
+        ("semver".to_string(), "1.0.0".to_string()),
+        ("selector".to_string(), r#"{"role":"runner"}"#.to_string()),
+      ]),
+      labels: BTreeMap::new(),
+    };
+    let applied = storage
+      .extensions()
+      .apply_remote_extension(record, ECHO_EXTENSION_SOURCE)
+      .expect("apply echo extension");
+    assert!(applied);
+  }
+
+  let configs: Vec<DaemonConfig> = (0..node_count)
+    .map(|i| {
+      let port = base_port + i as u16;
+      let peer = format!("https://127.0.0.1:{}", base_port + ((i + 1) % 2) as u16);
+      build_config(
+        &format!("node-{i}"),
+        port,
+        vec![peer],
+        data_dirs[i].path().to_path_buf(),
+        &ca_cert_path,
+        &ca_key_path,
+        &cert_paths[i],
+        &key_paths[i],
+      )
+    })
+    .collect();
+
+  for config in configs.clone() {
+    spawn_runtime(config, cluster_key.clone());
+  }
+
+  let node0_url = format!("https://127.0.0.1:{base_port}");
+  let node1_url = format!("https://127.0.0.1:{}", base_port + 1);
+
+  // The record converges to node-1 through resource anti-entropy.
+  let client_tls = client_tls_bundle(&cert_paths[1], &key_paths[1], &ca_cert_path);
+  let mut node1_client = connect_client(&node1_url, &client_tls, &key_hex).await;
+  wait_for_resource(
+    &mut node1_client,
+    ResourceKind::Extension,
+    "echo-ext",
+    Duration::from_secs(30),
+  )
+  .await;
+
+  // node-1 loads the extension (selector match) and announces the capability;
+  // the register gossip delivers the annotation to node-0's membership view.
+  let client_tls = client_tls_bundle(&cert_paths[0], &key_paths[0], &ca_cert_path);
+  let mut node0_client = connect_client(&node0_url, &client_tls, &key_hex).await;
+  let announced = wait_for_annotation(
+    &mut node0_client,
+    "node-1",
+    "ext.echo-ext",
+    Duration::from_secs(30),
+  )
+  .await;
+  assert_eq!(announced, "1.0.0");
+
+  // The invoke on node-0 finds no local instance and is forwarded one hop to
+  // node-1, which executes it.
+  let client_tls = client_tls_bundle(&cert_paths[0], &key_paths[0], &ca_cert_path);
+  let mut extension_client = connect_extension_client(&node0_url, &client_tls, &key_hex).await;
+  let response = extension_client
+    .invoke("echo-ext", "echo", br#"{"hello":"world"}"#.to_vec(), None)
+    .await
+    .expect("extension invoke failed");
+  assert_eq!(response.executed_by, "node-1");
+  let echoed: serde_json::Value =
+    serde_json::from_slice(&response.payload).expect("echoed payload is json");
+  assert_eq!(echoed, serde_json::json!({"hello": "world"}));
+
+  // node-0's selector does not match, so it neither runs nor advertises the
+  // extension — its own register never carries the capability annotation.
+  let annotations = node_annotations(&mut node0_client, "node-0").await;
+  assert!(
+    !annotations.contains_key("ext.echo-ext"),
+    "node-0 must not advertise echo-ext: {annotations:?}"
+  );
+
+  // An extension no node serves surfaces as NotFound end to end.
+  let error = extension_client
+    .invoke("ghost-ext", "echo", b"{}".to_vec(), None)
+    .await
+    .expect_err("an extension without candidates must fail");
+  match error {
+    lycoris_client::ClientError::Status(status) => {
+      assert_eq!(status.code(), tonic::Code::NotFound);
+      assert!(status.message().contains("ghost-ext"));
     }
     other => panic!("expected an rpc status error, got {other:?}"),
   }
