@@ -7,7 +7,7 @@ pub(crate) mod cli;
 pub(crate) mod commands;
 pub(crate) mod error;
 
-use cli::{Cli, ClusterCommand, Command};
+use cli::{Cli, ClusterCommand, Command, ExtCommand};
 use error::ShellError;
 use lycoris_config::ClientConfig;
 
@@ -70,6 +70,17 @@ async fn dispatch_cluster(command: ClusterCommand) -> Result<(), ShellError> {
     ClusterCommand::Leave => {
       let config = ClientConfig::load_default()?;
       commands::cluster::leave_cluster(&config).await
+    }
+    ClusterCommand::Ext { command } => {
+      let config = ClientConfig::load_default()?;
+      match command {
+        ExtCommand::Load { package } => commands::cluster::ext::ext_load(&config, &package).await,
+        ExtCommand::Invoke {
+          id,
+          method,
+          payload,
+        } => commands::cluster::ext::ext_invoke(&config, &id, &method, payload).await,
+      }
     }
   }
 }

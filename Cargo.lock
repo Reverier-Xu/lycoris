@@ -4139,9 +4139,13 @@ dependencies = [
  "lycoris-tls",
  "owo-colors",
  "rustls",
+ "semver",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
 ]

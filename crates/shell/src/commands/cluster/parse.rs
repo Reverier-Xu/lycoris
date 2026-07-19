@@ -15,6 +15,7 @@ const RESOURCE_KINDS: &[(ResourceKind, &[&str])] = &[
   (ResourceKind::Skill, &["skill", "skills", "sk"]),
   (ResourceKind::Rule, &["rule", "rules", "ru"]),
   (ResourceKind::Workspace, &["workspace", "workspaces", "ws"]),
+  (ResourceKind::Extension, &["extension", "extensions", "ext"]),
 ];
 
 pub(crate) fn parse_resource_kind(raw: &str) -> Result<ResourceKind, ShellError> {
@@ -66,4 +67,27 @@ pub(crate) fn parse_selectors(raw: &[String]) -> Result<HashMap<String, String>,
     selector.insert(key.to_string(), value.to_string());
   }
   Ok(selector)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn extension_kind_aliases_resolve_to_the_extension_kind() {
+    for spelling in ["extension", "extensions", "ext", "EXT"] {
+      assert_eq!(
+        parse_resource_kind(spelling).unwrap(),
+        ResourceKind::Extension,
+        "spelling: {spelling}"
+      );
+    }
+    assert_eq!(resource_name(ResourceKind::Extension), "extension");
+  }
+
+  #[test]
+  fn unknown_kinds_and_scopes_are_rejected() {
+    assert!(parse_resource_kind("pods").is_err());
+    assert!(parse_scope(Some("global".to_string())).is_err());
+  }
 }

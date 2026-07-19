@@ -1,4 +1,4 @@
-use lycoris_client::ClusterClient;
+use lycoris_client::{ClusterClient, ExtensionClient};
 use lycoris_config::{ClientConfig, DaemonConfig};
 use lycoris_core::{ClusterKey, default_cluster_key_path};
 use lycoris_proto::node::{NodeInfo, ResourceKind};
@@ -6,6 +6,7 @@ use owo_colors::OwoColorize;
 
 use crate::error::ShellError;
 
+pub(crate) mod ext;
 mod parse;
 mod render;
 
@@ -19,12 +20,18 @@ pub(crate) async fn get_resources(
   let kind_name = parse::resource_name(kind);
   let selector = parse::parse_selectors(selectors)?;
   let scope = parse::parse_scope(scope)?;
-  // The local node marker is only rendered for node listings; other kinds
-  // skip the daemon-config read (and its warning) entirely.
+  // The local node marker is only rendered for node listings; the local
+  // selector-match marker only for extension listings. Other kinds skip the
+  // daemon-config read (and its warning) entirely.
   let local_id = if kind == ResourceKind::Node {
     local_node_id()
   } else {
     String::new()
+  };
+  let local_labels = if kind == ResourceKind::Extension {
+    local_node_labels()
+  } else {
+    std::collections::HashMap::new()
   };
 
   let mut client = connect_cluster(client_config).await?;
@@ -52,7 +59,7 @@ pub(crate) async fn get_resources(
           kind: kind_name.to_string(),
           source,
         })?;
-      render::render_list(kind, &resources, &local_id);
+      render::render_list(kind, &resources, &local_id, &local_labels);
       println!("total: {}", resources.len());
     }
   }
@@ -188,6 +195,34 @@ async fn connect_cluster(client_config: &ClientConfig) -> Result<ClusterClient, 
   })
 }
 
+/// Connect to the cluster-key-guarded `Extension` service; same key and TLS
+/// handling as [`connect_cluster`].
+async fn connect_extension(client_config: &ClientConfig) -> Result<ExtensionClient, ShellError> {
+  let key = match load_cluster_key(client_config) {
+    Ok(key) => Some(key),
+    Err(ShellError::ClusterKeyNotFound) => None,
+    Err(error) => {
+      tracing::warn!("failed to load cluster key, continuing without one: {error}");
+      None
+    }
+  };
+  let tls = lycoris_tls::load_tls_bundle(
+    &client_config.cert,
+    &client_config.key,
+    &client_config.ca_cert,
+  )?;
+  let client = ExtensionClient::connect(&client_config.api_address, &tls)
+    .await
+    .map_err(|source| ShellError::Connect {
+      address: client_config.api_address.clone(),
+      source,
+    })?;
+  Ok(match key {
+    Some(key) => client.with_cluster_key(key),
+    None => client,
+  })
+}
+
 /// Resolve the cluster key for commands that authenticate with one: an
 /// explicit `--key` wins, otherwise the local cluster key file is used so the
 /// secret stays out of shell history and process listings.
@@ -216,6 +251,20 @@ fn local_node_id() -> String {
     Err(error) => {
       eprintln!("warning: failed to load daemon config, local node will not be marked: {error}");
       String::new()
+    }
+  }
+}
+
+/// Best-effort local node labels used to mark selector-matching extensions in
+/// listings; same degradation policy as [`local_node_id`].
+fn local_node_labels() -> std::collections::HashMap<String, String> {
+  match DaemonConfig::load(None) {
+    Ok(config) => config.node.labels,
+    Err(error) => {
+      eprintln!(
+        "warning: failed to load daemon config, local selector matches will not be marked: {error}"
+      );
+      std::collections::HashMap::new()
     }
   }
 }

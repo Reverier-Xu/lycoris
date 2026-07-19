@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use lycoris_proto::node::{
   NodeBody, NodeState, Resource as ProtoResource, ResourceKind, resource::Body,
 };
@@ -5,9 +7,13 @@ use owo_colors::OwoColorize;
 
 use super::parse::{resource_name, scope_from_proto};
 
-pub(crate) fn render_list(kind: ResourceKind, resources: &[ProtoResource], local_id: &str) {
+pub(crate) fn render_list(
+  kind: ResourceKind, resources: &[ProtoResource], local_id: &str,
+  local_labels: &HashMap<String, String>,
+) {
   match kind {
     ResourceKind::Node => render_node_list(resources, local_id),
+    ResourceKind::Extension => render_extension_list(resources, local_labels),
     _ => render_generic_list(resources),
   }
 }
@@ -65,6 +71,57 @@ fn render_generic_list(resources: &[ProtoResource]) {
       metadata.source_node_id.as_str(),
     );
   }
+}
+
+/// The extension listing: one row per package with the activation-relevant
+/// facts — engine, human-facing semver, and whether the manifest selector
+/// matches this node's configured labels.
+fn render_extension_list(resources: &[ProtoResource], local_labels: &HashMap<String, String>) {
+  println!(
+    "{}  {}  {}  {}  {}",
+    "ID".bold().underline(),
+    "NAME".bold().underline(),
+    "ENGINE".bold().underline(),
+    "SEMVER".bold().underline(),
+    "LOCAL".bold().underline(),
+  );
+
+  let mut skipped = 0usize;
+  for resource in resources {
+    let (Some(metadata), Some(Body::Extension(body))) =
+      (resource.metadata.as_ref(), resource.body.as_ref())
+    else {
+      skipped += 1;
+      continue;
+    };
+    let selector: HashMap<String, String> = body
+      .manifest
+      .get("selector")
+      .and_then(|raw| serde_json::from_str(raw).ok())
+      .unwrap_or_default();
+    let local = if selector_matches(local_labels, &selector) {
+      "yes"
+    } else {
+      "no"
+    };
+    let semver = body.manifest.get("semver").map_or("-", String::as_str);
+    println!(
+      "{}  {}  {}  {}  {}",
+      metadata.id, metadata.name, body.engine, semver, local,
+    );
+  }
+  if skipped > 0 {
+    eprintln!("note: {skipped} resource(s) had no extension body and were not displayed");
+  }
+}
+
+/// Display-only mirror of the daemon's selector semantics (subset match: an
+/// empty selector matches every node). Activation decisions are made by the
+/// daemon; this only decides how a row renders.
+fn selector_matches(labels: &HashMap<String, String>, selector: &HashMap<String, String>) -> bool {
+  selector
+    .iter()
+    .all(|(key, value)| labels.get(key) == Some(value))
 }
 
 pub(crate) fn render_resource(resource: &ProtoResource, kind: ResourceKind, local_id: &str) {
@@ -146,7 +203,17 @@ fn render_generic(resource: &ProtoResource) {
       println!("  sessions:       {:?}", body.session_ids);
       println!("  metadata:       {:?}", body.metadata);
     }
-    Some(Body::Node(_)) | Some(Body::Extension(_)) | None => {}
+    Some(Body::Extension(body)) => {
+      println!("  version:        {}", body.version);
+      println!("  engine:         {}", body.engine);
+      println!("  entry:          {}", body.entry);
+      println!("  content hash:   {}", body.content_hash);
+      // The artifact itself is never dumped; its size is enough to confirm
+      // what the node holds.
+      println!("  artifact size:  {} bytes", body.artifact.len());
+      println!("  manifest:       {:?}", body.manifest);
+    }
+    Some(Body::Node(_)) | None => {}
   }
 }
 

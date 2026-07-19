@@ -87,16 +87,96 @@ pub(crate) enum ClusterCommand {
 
   /// Print the current cluster key.
   Key,
+
+  /// Manage extensions: load packages into the cluster and invoke them.
+  Ext {
+    #[command(subcommand)]
+    command: ExtCommand,
+  },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum ExtCommand {
+  /// Register an extension package from a package TOML file.
+  Load {
+    /// Path to the extension package file (TOML).
+    package: std::path::PathBuf,
+  },
+
+  /// Invoke an extension method with a JSON payload, routed to a capable node.
+  Invoke {
+    /// Extension id.
+    id: String,
+    /// Method to invoke.
+    method: String,
+    /// JSON payload sent to the extension. Defaults to `{}`.
+    payload: Option<String>,
+  },
 }
 
 #[cfg(test)]
 mod tests {
-  use clap::CommandFactory;
+  use clap::{CommandFactory, Parser};
 
-  use super::Cli;
+  use super::{Cli, ClusterCommand, Command, ExtCommand};
 
   #[test]
   fn cli_definition_is_valid() {
     Cli::command().debug_assert();
+  }
+
+  #[test]
+  fn parse_ext_load() {
+    let cli = Cli::try_parse_from(["lycoris", "cluster", "ext", "load", "pkg.toml"]).unwrap();
+    let Command::Cluster(ClusterCommand::Ext {
+      command: ExtCommand::Load { package },
+    }) = cli.command
+    else {
+      panic!("expected cluster ext load, got {:?}", cli.command);
+    };
+    assert_eq!(package, std::path::PathBuf::from("pkg.toml"));
+  }
+
+  #[test]
+  fn parse_ext_invoke_with_and_without_payload() {
+    let cli = Cli::try_parse_from([
+      "lycoris",
+      "cluster",
+      "ext",
+      "invoke",
+      "echo-ext",
+      "echo",
+      r#"{"k":"v"}"#,
+    ])
+    .unwrap();
+    let Command::Cluster(ClusterCommand::Ext {
+      command: ExtCommand::Invoke {
+        id,
+        method,
+        payload,
+      },
+    }) = cli.command
+    else {
+      panic!("expected cluster ext invoke, got {:?}", cli.command);
+    };
+    assert_eq!(id, "echo-ext");
+    assert_eq!(method, "echo");
+    assert_eq!(payload.as_deref(), Some(r#"{"k":"v"}"#));
+
+    let cli =
+      Cli::try_parse_from(["lycoris", "cluster", "ext", "invoke", "echo-ext", "echo"]).unwrap();
+    let Command::Cluster(ClusterCommand::Ext {
+      command: ExtCommand::Invoke { payload, .. },
+    }) = cli.command
+    else {
+      panic!("expected cluster ext invoke, got {:?}", cli.command);
+    };
+    assert_eq!(payload, None);
+  }
+
+  #[test]
+  fn ext_invoke_requires_id_and_method() {
+    let result = Cli::try_parse_from(["lycoris", "cluster", "ext", "invoke", "echo-ext"]);
+    assert!(result.is_err());
   }
 }

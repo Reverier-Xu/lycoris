@@ -49,6 +49,29 @@ pub(crate) enum ShellError {
   ClusterKeyNotFound,
   #[error("invalid selector '{0}', expected key=value")]
   InvalidSelector(String),
+  #[error("failed to read extension package {}: {source}", .path.display())]
+  PackageRead {
+    path: std::path::PathBuf,
+    source: std::io::Error,
+  },
+  #[error("failed to parse extension package {}: {source}", .path.display())]
+  PackageParse {
+    path: std::path::PathBuf,
+    source: toml::de::Error,
+  },
+  #[error("invalid extension package: {0}")]
+  PackageValidation(String),
+  #[error("failed to read extension artifact {}: {source}", .path.display())]
+  ArtifactRead {
+    path: std::path::PathBuf,
+    source: std::io::Error,
+  },
+  #[error("payload is not valid JSON: {0}")]
+  InvalidPayload(String),
+  #[error("failed to register extension: {0}")]
+  RegisterExtension(lycoris_client::ClientError),
+  #[error("failed to invoke extension: {0}")]
+  InvokeExtension(lycoris_client::ClientError),
   #[error("daemon runtime failed: {0}")]
   DaemonRuntime(#[from] lycoris_daemon::runtime::RuntimeError),
   #[error("setup error: {0}")]
