@@ -4,8 +4,11 @@ Short form: **ext** — used wherever a compact spelling is needed (capability
 annotation prefix `ext.<id>`, CLI shorthand, log fields); the feature name
 itself is **extension**.
 
-Status: architecture v1 (this document is the design contract for the initial
-implementation; the implementation ships no production extensions).
+Status: architecture v1, implemented (the §12 rollout is complete). A
+follow-on milestone added the `http` host capability, the `provides` manifest
+contract, and the typed daemon-side LLM facade, and ships one production
+extension — the OpenAI WASM provider under `extensions/openai`; see
+`llm-provider.md`.
 
 ## 1. Goals and non-goals
 
@@ -33,13 +36,12 @@ Goals:
 
 Non-goals (v1):
 
-- No production extensions (an LLM provider is the motivating example only).
 - No extension marketplace/distribution channel; packages enter the cluster
   through the `RegisterExtension` RPC (the admission-side write path) and
   converge to every node through the resource anti-entropy pipeline, like
   skills/rules.
-- No host-service matrix beyond logging (HTTP and friends are declared as
-  capabilities in the manifest but not implemented yet).
+- No host-service matrix beyond `log` and `http`: further host services are
+  declared as capabilities in the manifest but not implemented yet.
 
 ## 2. Technology selection
 
@@ -108,8 +110,10 @@ An extension package is one resource:
   - `entry: string` — exported entry point, default `invoke`.
   - `artifact: bytes` — wasm module or Lua source.
   - `manifest: map<string, string>` — everything else: `semver`, `capabilities`
-    (JSON array), `hooks` (JSON array of hook points), `selector` (JSON map),
-    `settings` (opaque JSON passed to the extension).
+    (JSON array), `provides` (JSON array of contract names the extension
+    implements, e.g. `"llm"` — the discovery key for `LlmRouter`, see
+    `llm-provider.md` section 3), `hooks` (JSON array of hook points),
+    `selector` (JSON map), `settings` (opaque JSON passed to the extension).
 - Generic metadata (`id`, `name`, `labels`, `scope`, `source_node_id`,
   timestamps) rides in `ResourceMetadata`, exactly like skills/rules.
 
@@ -182,6 +186,12 @@ Guest exports:
 Host imports (`lycoris` module):
 
 - `log(level: i32, ptr: i32, len: i32)` — forwarded to `tracing`.
+- `http(ptr: i32, len: i32) -> i64` — outbound HTTP/HTTPS *client*, linked
+  only when the manifest declares the `http` capability; a guest importing it
+  without the capability fails to instantiate. Request and response are JSON
+  documents through linear memory (the response packs `(ptr << 32) | len`
+  like `lycoris_invoke`); scheme, host-allowlist, body-cap and timeout
+  enforcement live host-side (`llm-provider.md` section 4).
 
 Limits (from daemon config, §9): fuel per call (deterministic timeout),
 max linear memory, per-call wall-clock deadline enforced via fuel + async
@@ -308,8 +318,12 @@ declared by future workflow code.
 ## 10. Security notes
 
 - WASM guests get no WASI capabilities; Lua guests get no io/os-execute.
-  Declared `capabilities` in the manifest are the extension points for future
-  host services and are validated on load (unknown capability → load error).
+  Declared `capabilities` in the manifest are the extension points for host
+  services (`log` and `http` are the implemented set) and are validated at
+  manifest parse (unknown capability → registration/load error). The `http`
+  capability only reaches outward: scheme-restricted, optionally
+  host-allowlisted, response-capped, and time-boxed; it never carries
+  cluster traffic (§7).
 - Artifact integrity: `content_hash` (blake3) is verified at ingest (apply
   pipeline) and again at load time; a mismatch quarantines the extension
   (not loaded, warning logged).
@@ -323,7 +337,7 @@ declared by future workflow code.
 
 - `lycoris-extension`: Lua fixture (echo/transform script), WAT fixture
   compiled with the `wat` crate implementing `lycoris-abi-v1` (bump allocator
-  + echo), sandbox escape attempts (io/os/debug absent), budget enforcement
+  - echo), sandbox escape attempts (io/os/debug absent), budget enforcement
   (infinite loop → budget error; balloon allocation → memory error).
 - Storage: extension apply pipeline reuses the versioned tests' shape; blob
   store id validation and content-before-metadata ordering.
@@ -332,12 +346,20 @@ declared by future workflow code.
   no-candidate `NOT_FOUND`), manifest validation failures.
 - Integration: two-node test — extension runs on node B only; invoke on node
   A returns B's result; registry convergence via existing resource sync.
+- WASM provider: the OpenAI guest's host-side e2e (real artifact → engine →
+  mock upstream) and the cluster-level wasm test (selector-gated activation,
+  capability announcement, routed invoke, HTTP egress). Both build the
+  artifact through cargo, stay `#[ignore]`d in a plain `cargo test`, and CI
+  runs them explicitly in the `wasm-provider-tests` job.
 - E2E fixture: a tiny Lua extension registered through the CLI path
   (`cluster ext load`, listed by `cluster get extensions`), invoked from a
   node whose labels do not match the selector and routed to the matching node
-  — fixtures are test assets, not production extensions.
+  — fixtures are test assets; the production extension is the OpenAI guest
+  under `extensions/openai`.
 
-## 12. Rollout plan (this task)
+## 12. Rollout plan (complete)
+
+All five steps shipped as planned:
 
 1. `crates/extension`: manifest model, engine trait, Lua engine, WASM engine,
    limits, unit tests.
@@ -350,3 +372,8 @@ declared by future workflow code.
 5. shell (`extensions`/`ext` kind for `cluster get`, `cluster ext load` /
    `cluster ext invoke`), docs (README, crate READMEs, AGENTS.md), e2e
    fixture.
+
+The follow-on LLM-provider milestone (`llm-provider.md`) then layered on the
+`http` host capability, the `provides` manifest contract, the typed
+daemon-side LLM facade/router, and the production OpenAI guest under
+`extensions/openai`.
