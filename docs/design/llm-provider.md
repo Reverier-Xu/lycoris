@@ -37,8 +37,9 @@ Types are OpenAI-flavored, engine-neutral, serde-serializable both ways:
 - `EmbedRequest { model, input: Vec<String> }`,
   `EmbedResponse { data: Vec<Embedding> }`
 - `LlmError`: `Provider { status, message }` (upstream said no),
-  `Unavailable` (no provider reachable), `Extension(ExtensionManagerError)`
-  passthrough, `InvalidResponse` (guest returned something off-contract).
+  `Unavailable` (no provider reachable), `Extension` passthrough (the
+  extension crate's `ExtensionError`; the daemon facade maps its manager
+  errors onto it), `InvalidResponse` (guest returned something off-contract).
 
 ```rust
 #[async_trait]
@@ -69,9 +70,12 @@ Methods on the instance:
 - `models` — `{}` → `{ data: [{id}] }` (OpenAI shape; facade flattens).
 - `configure` — see §5.
 
-Error convention: the payload is `{ "error": { "message", "type", "code"? } }`
-when the upstream provider failed; the facade maps that to
-`LlmError::Provider`. Transport/engine failures are engine errors, never
+Error convention: the payload is `{ "error": { "message", "type", "code"?,
+"status"? } }` when the upstream provider failed; `status` carries the
+upstream HTTP status (absent — mapped to 0 — for failures without an
+upstream response, e.g. the "not configured" answer of section 5). The
+facade maps the document to `LlmError::Provider`; `type` and `code` stay on
+the wire as diagnostics. Transport/engine failures are engine errors, never
 synthesized error payloads.
 
 ## 4. Outbound HTTP capability (`lycoris-abi-v1` upgrade)
@@ -138,32 +142,40 @@ method as stateless until `configure` has run (the OpenAI guest answers
   and `host::http` wrappers over the extern imports (extern block only
   compiled for `wasm32`). Deps: serde/serde_json only.
 - `extensions/openai` (`lycoris-ext-openai`, workspace member, `cdylib` +
-  `lib`): pure, host-testable core —
-  `chat_request_to_openai(ChatRequest, &Settings) -> HttpRequestSpec`,
-  `openai_to_chat_response(status, body) -> Result<ChatResponse, LlmError>`,
-  and the same split for embed/models. The `wasm32` glue binds these to the
-  exported `invoke`; host tests drive the pure functions plus a mock
+  `lib`): pure, host-testable core operating on `serde_json::Value` (the
+  guest cannot depend on the host crate) —
+  `chat_to_openai(Value, &Settings) -> Result<HttpRequestSpec, String>`,
+  `openai_to_chat(status, body) -> Result<Value, String>` producing the wire
+  JSON, and the same split for embed/models. The `wasm32` glue binds these
+  to the exported `invoke`; host tests drive the pure functions plus a mock
   transport, so no wasm toolchain is needed for unit tests.
 - Settings: `api_key` (required), `base_url` (default
   `https://api.openai.com/v1`), optional `organization`.
 - Behavior: POST `{base}/chat/completions`, `{base}/embeddings`,
-  GET `{base}/models`; non-2xx → the §3 error payload; response mapped into
-  the §2 types (unknown upstream fields ignored).
+  GET `{base}/models`; non-2xx → the §3 error payload; chat responses map
+  into the §2 shape (unknown upstream fields ignored), and embedding
+  vectors pass through as raw JSON (no float round-trip, no precision
+  loss).
 
 ## 7. Build and test strategy
 
-- `extensions/build.sh`: `cargo build --release --target
-  wasm32-unknown-unknown -p lycoris-ext-openai`; the artifact
-  (`lycoris_ext_openai.wasm`) is the registrable ext. `rustup target add
-  wasm32-unknown-unknown` is documented and added to CI.
+- Build: `rustup target add wasm32-unknown-unknown`, then `cargo build
+  --locked --release --target wasm32-unknown-unknown -p
+  lycoris-ext-openai`; the artifact
+  (`target/wasm32-unknown-unknown/release/lycoris_ext_openai.wasm`) is the
+  registrable ext. CI installs the target and runs both ignored suites in
+  the `wasm-provider-tests` job.
 - Unit: pure transform tests (host), settings merge, capability gating
   (import without declaration → instantiate error), HTTP host fn against a
   local mock (status passthrough, size cap, host allowlist).
-- Daemon integration: build the real `.wasm` (test invokes
-  `extensions/build.sh`; fails loudly if the target is missing), register it
+- Daemon integration: build the real `.wasm` (the test shells out to cargo
+  itself; fails loudly if the target is missing), register it
   on a node whose label matches, invoke `chat` from a *second* node against a
   mock OpenAI server (tiny tokio HTTP server in the test) — asserts sync,
-  capability announcement, routing, HTTP egress, and response mapping.
+  capability announcement, routing, HTTP egress, and response mapping. Both
+  wasm suites run on the default fuel budget (100M per call,
+  extension-system design section 9), which is sized for this guest's
+  serde_json-scale JSON workload.
 - E2E (`e2e/shell-test.sh`): a mock `openai` container (nginx returning a
   canned chat completion), node-1 labelled `role=runner` with
   `[extensions.local.openai] base_url=http://openai-mock/v1`, register via
