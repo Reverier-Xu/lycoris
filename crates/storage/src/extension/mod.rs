@@ -136,9 +136,10 @@ impl From<std::io::Error> for ExtensionStorageError {
 ///
 /// Provides access to extension metadata records and the artifact blob store.
 /// The underlying redb database is shared with the other storage domains via
-/// an `Arc`. The write path for locally created extensions is deliberately left
-/// to a future change; records currently enter only through the anti-entropy
-/// apply pipeline.
+/// an `Arc`. Records enter through [`Self::apply_remote_extension`]: the
+/// anti-entropy apply pipeline calls it for synced resources, and the
+/// admission-side registration path (`ExtensionManager::register` in the
+/// daemon) reuses it so both write paths share one ordering and validation.
 #[derive(Debug, Clone)]
 pub struct ExtensionDomain {
   records: RedbTableStorage<ExtensionRecord>,

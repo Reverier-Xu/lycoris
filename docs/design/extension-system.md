@@ -35,7 +35,9 @@ Non-goals (v1):
 
 - No production extensions (an LLM provider is the motivating example only).
 - No extension marketplace/distribution channel; packages enter the cluster
-  through the resource API like skills/rules.
+  through the `RegisterExtension` RPC (the admission-side write path) and
+  converge to every node through the resource anti-entropy pipeline, like
+  skills/rules.
 - No host-service matrix beyond logging (HTTP and friends are declared as
   capabilities in the manifest but not implemented yet).
 
@@ -127,6 +129,17 @@ Storage (new `extension` domain in `lycoris-storage`):
 Sync: no new protocol. `ResourceMapper` learns the EXTENSION kind (list/get/
 apply/local_shared_resources), so extension packages replicate through the
 existing 5-second resource anti-entropy and the `SyncResources` RPC.
+
+Ingest: the admission-side write path is `Extension.RegisterExtension`
+(`crates/daemon/src/rpc/extension.rs` → `ExtensionManager::register`). The
+receiving node validates the request (id whitelist shared with the content
+stores, known engine, parseable manifest with `semver`, non-empty artifact),
+computes the blake3 `content_hash`, persists the record with the same
+blob-before-metadata ordering as the apply pipeline (`created_at_ms` of an
+existing id is preserved; the new `version` must strictly increase over it),
+and fires the manager's reconcile notify so a selector-matching extension
+loads immediately. Validation failures reject in-band with a reason; a
+non-increasing version is a `FAILED_PRECONDITION` status.
 
 ## 5. Execution engines
 
@@ -231,9 +244,10 @@ Routing for `ExtensionService.Invoke`:
    `FAILED_PRECONDITION` instead of looping.
 4. No candidates → `NOT_FOUND` ("no node currently serves extension X").
 
-`Sync`/`Membership` stay mTLS-only; `ExtensionService` sits behind the
-cluster-key interceptor like `Cluster` — invoking extensions is an
-admission-level operation, and forwarded calls reuse the daemon's cluster key.
+`Sync`/`Membership` stay mTLS-only; `ExtensionService` (Invoke and
+RegisterExtension) sits behind the cluster-key interceptor like `Cluster` —
+invoking or registering extensions is an admission-level operation, and
+forwarded calls reuse the daemon's cluster key.
 
 ## 8. Version management policy
 
@@ -250,9 +264,15 @@ admission-level operation, and forwarded calls reuse the daemon's cluster key.
 
 ## 9. Configuration surface
 
-Daemon TOML (node-local engine limits only):
+Daemon TOML (node-local settings only):
 
 ```toml
+[node]
+# Static node labels: merged into the node-local label store at startup (set
+# semantics) and registered into membership; extension selectors evaluate
+# against exactly these labels.
+labels = { role = "runner" }
+
 [extensions]
 wasm_fuel_per_call = 5_000_000
 wasm_max_memory_bytes = 67_108_864   # 64 MiB
@@ -268,11 +288,13 @@ labels, which is what makes selector-based activation meaningful.
 Hook dispatch: the manifest's `hooks` array names hook points
 (`"skill.invoke.pre"`, `"llm.call.post"`, …). The daemon owns a
 `HookDispatcher`: workflow code emits `(point, context_json)`; the dispatcher
-resolves subscribers from the synced registry (selector-filtered), invokes
-them in manifest order through the same `ExtensionManager::invoke` path (so a
-hook may run remotely), and applies each hook's `on_error` policy
-(`"abort"` | `"ignore"`). v1 ships the dispatcher and its tests; concrete
-hook points are declared by future workflow code.
+resolves subscribers from the synced registry — every record whose manifest
+declares the point, in record-id order so the ordering is deterministic — and
+invokes them through the same `ExtensionManager::invoke` path (so a hook runs
+wherever its extension runs: locally, or on a capable peer via the routing
+rules of section 7), and applies each hook's `on_error` policy (`"abort"` |
+`"ignore"`). v1 ships the dispatcher and its tests; concrete hook points are
+declared by future workflow code.
 
 ## 10. Security notes
 
@@ -302,8 +324,9 @@ hook points are declared by future workflow code.
 - Integration: two-node test — extension runs on node B only; invoke on node
   A returns B's result; registry convergence via existing resource sync.
 - E2E fixture: a tiny Lua extension registered through the CLI path
-  (`cluster get extensions` lists it) — fixtures are test assets, not
-  production extensions.
+  (`cluster ext load`, listed by `cluster get extensions`), invoked from a
+  node whose labels do not match the selector and routed to the matching node
+  — fixtures are test assets, not production extensions.
 
 ## 12. Rollout plan (this task)
 
@@ -313,5 +336,8 @@ hook points are declared by future workflow code.
    blob store + mapper wiring.
 3. daemon: `ExtensionManager`, capability announcement, routing/forwarding,
    `HookDispatcher`, config section, integration tests.
-4. shell (`extensions` kind for `cluster get`), docs (README, crate READMEs,
-   AGENTS.md), e2e fixture.
+4. Registration channel: `RegisterExtension` RPC (validation, version policy,
+   notify-on-register) + `[node] labels` config surface.
+5. shell (`extensions`/`ext` kind for `cluster get`, `cluster ext load` /
+   `cluster ext invoke`), docs (README, crate READMEs, AGENTS.md), e2e
+   fixture.

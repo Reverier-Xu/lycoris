@@ -9,6 +9,7 @@ Lycoris is a decentralized cluster system for LLM agents. Every node is both a s
 - Decentralized: the cluster is an undirected, cyclic, sparse graph; nodes probe each other and propagate state through a SWIM-style membership protocol.
 - Partition tolerant: during a network partition, each partition keeps operating independently; once connectivity is restored, shared state is merged through anti-entropy synchronization.
 - Shared and isolated: each node stores shared cluster base information, shared skills/rules, and a shared workspace metadata index, while owning its private memory and private workspace.
+- Extensible: extension packages are cluster-shared resources synchronized to every node through the same anti-entropy pipeline; two sandboxed engines (WASM via wasmtime, Lua via mlua) share one JSON invocation contract, label selectors decide per-node activation, capability announcements (`ext.<id>`) route invocations to a capable node (one hop), and packages enter the cluster through `lycoris cluster ext load`. See `docs/design/extension-system.md`.
 
 ## Code Organization
 
@@ -18,7 +19,10 @@ crates/
   config      Daemon and client configuration parsing, validation, defaults, and fallback loading strategy
   core        Shared core primitives: cluster key, ResourceScope, time, and path conventions
   daemon      Cluster node runtime: transport connection pool, sync/ (SWIM dispatch, gossip, Merkle anti-entropy orchestration, peer selection),
-              membership bridging (domain type boundary), resource facade, rpc/ (tonic boundary and cluster-key interceptor)
+              membership bridging (domain type boundary), resource facade, rpc/ (tonic boundary and cluster-key interceptor),
+              extension/ (selector-driven activation, capability announcement, invocation routing, hook dispatch)
+  extension   Extension engine layer: package and manifest model, sandboxed WASM (wasmtime) and Lua (mlua) engines
+              behind one JSON invocation contract
   membership  Membership CRDT (deterministic total-order merge), SWIM state machine, Merkle tree and anti-entropy diff (independent of tonic, no transport)
   proto       protobuf/gRPC definitions, with protocol constants and NodeInfo construction helpers
   shell       Unified binary entry point `lycoris`, providing subcommands such as daemon and cluster
