@@ -85,6 +85,38 @@ wait_until_not_active() {
   return 1
 }
 
+# Poll until an extension id shows up in the observer's extension listing.
+wait_until_extension_visible() {
+  local observer="$1"
+  local extension="$2"
+  local timeout_secs="${3:-60}"
+  local deadline=$((SECONDS + timeout_secs))
+  while (( SECONDS < deadline )); do
+    if run_in_node "${observer}" lycoris cluster get extensions 2>/dev/null | grep -q "${extension}"; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+# Poll until the observer sees the capability annotation `ext.<id>` on the
+# serving node's register (rendered by the single-node get output).
+wait_until_extension_announced() {
+  local observer="$1"
+  local node="$2"
+  local extension="$3"
+  local timeout_secs="${4:-60}"
+  local deadline=$((SECONDS + timeout_secs))
+  while (( SECONDS < deadline )); do
+    if run_in_node "${observer}" lycoris cluster get node "${node}" 2>/dev/null | grep -q "ext.${extension}"; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
 echo "building static musl binary..."
 cargo +stable build --release --target x86_64-unknown-linux-musl -p lycoris
 
@@ -115,6 +147,14 @@ cert = "/certs/node-${i}.crt"
 key = "/certs/node-${i}.key"
 EOF
 done
+
+# node-1 carries the label the echo extension's selector matches; the runtime
+# merges it into the node-local store at startup.
+cat >> "${E2E_DIR}/configs/node-1.toml" <<EOF
+
+[node.labels]
+role = "runner"
+EOF
 
 echo "creating podman network..."
 podman network create "${NETWORK}" >/dev/null
@@ -264,6 +304,93 @@ if ! echo "${SESSIONS_OUTPUT}" | grep -q "total:"; then
   exit 1
 fi
 echo "ok: resource smoke tests passed"
+
+echo ""
+echo "=== verifying extension registration and routing ==="
+echo "copying extension fixtures into node-0..."
+podman cp "${SCRIPT_DIR}/fixtures" "node-0:/fixtures"
+
+echo "registering the echo extension from node-0..."
+LOAD_OUTPUT="$(run_in_node 0 lycoris cluster ext load /fixtures/echo.pkg.toml)"
+echo "${LOAD_OUTPUT}"
+# The CLI colorizes values, so assert the label and the value separately.
+if ! echo "${LOAD_OUTPUT}" | grep -qE "accepted:.*true"; then
+  echo "error: extension registration was not accepted" >&2
+  exit 1
+fi
+if ! echo "${LOAD_OUTPUT}" | grep -q "content hash:"; then
+  echo "error: extension registration output missing content hash" >&2
+  exit 1
+fi
+echo "ok: extension registered"
+
+echo "waiting for the extension to converge to node-1..."
+if ! wait_until_extension_visible 1 "echo-ext"; then
+  echo "error: echo-ext did not become visible on node-1" >&2
+  run_in_node 1 lycoris cluster get extensions >&2 || true
+  exit 1
+fi
+
+echo "waiting for node-1 to announce the ext.echo-ext capability..."
+if ! wait_until_extension_announced 0 "node-1" "echo-ext"; then
+  echo "error: node-1 did not announce ext.echo-ext in time" >&2
+  run_in_node 0 lycoris cluster get node node-1 >&2 || true
+  exit 1
+fi
+echo "ok: node-1 runs the extension and advertises it"
+
+# The announcing register carries node-1's configured label too: the
+# `[node] labels` config surface reached membership end to end.
+NODE1_DETAIL="$(run_in_node 0 lycoris cluster get node node-1)"
+echo "${NODE1_DETAIL}"
+if ! echo "${NODE1_DETAIL}" | grep -qE '"role": "runner"'; then
+  echo "error: node-1 register does not carry the configured role=runner label" >&2
+  exit 1
+fi
+echo "ok: node-1 register carries the configured label"
+
+NODE0_DETAIL="$(run_in_node 0 lycoris cluster get node node-0)"
+if echo "${NODE0_DETAIL}" | grep -q "ext.echo-ext"; then
+  echo "error: node-0 must not advertise echo-ext (its labels do not match the selector)" >&2
+  echo "${NODE0_DETAIL}" >&2
+  exit 1
+fi
+echo "ok: node-0 does not advertise the extension (selector mismatch)"
+
+echo "invoking echo-ext from node-0..."
+INVOKE_OUTPUT="$(run_in_node 0 lycoris cluster ext invoke echo-ext echo '{"k":"v"}' 2>&1)"
+echo "${INVOKE_OUTPUT}"
+if ! echo "${INVOKE_OUTPUT}" | grep -q "executed by: node-1"; then
+  echo "error: invocation was not routed to node-1" >&2
+  exit 1
+fi
+if ! echo "${INVOKE_OUTPUT}" | grep -q '"k":"v"'; then
+  echo "error: invocation payload was not echoed back" >&2
+  exit 1
+fi
+echo "ok: invocation routed to node-1 and payload echoed"
+
+echo ""
+echo "=== verifying extension detail and listing on node-0 ==="
+EXT_DETAIL="$(run_in_node 0 lycoris cluster get ext echo-ext)"
+echo "${EXT_DETAIL}"
+for field in "engine:" "content hash:" "artifact size:" "manifest:"; do
+  if ! echo "${EXT_DETAIL}" | grep -q "${field}"; then
+    echo "error: extension detail missing ${field}" >&2
+    exit 1
+  fi
+done
+if echo "${EXT_DETAIL}" | grep -q "function invoke"; then
+  echo "error: extension detail must not dump the artifact body" >&2
+  exit 1
+fi
+EXT_LIST="$(run_in_node 0 lycoris cluster get ext)"
+echo "${EXT_LIST}"
+if ! echo "${EXT_LIST}" | grep -q "echo-ext"; then
+  echo "error: extension listing missing echo-ext" >&2
+  exit 1
+fi
+echo "ok: extension detail and listing look correct"
 
 echo ""
 echo "=== verifying lycoris cluster leave on node-2 ==="

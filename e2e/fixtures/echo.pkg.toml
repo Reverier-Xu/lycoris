@@ -1,0 +1,9 @@
+# Echo extension package fixture (test asset, not a production extension).
+# Activated only on nodes carrying the label `role = "runner"`.
+id = "echo-ext"
+name = "Echo"
+version = 1
+engine = "lua"
+artifact = "./echo.lua"
+semver = "1.0.0"
+selector = { role = "runner" }
