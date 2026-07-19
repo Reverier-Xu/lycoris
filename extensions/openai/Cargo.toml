@@ -17,7 +17,7 @@ version.workspace      = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-lycoris-extension-guest = { workspace = true }
+lycoris-extguest = { workspace = true }
 serde                   = { workspace = true }
 serde_json              = { workspace = true }
 
@@ -26,6 +26,6 @@ lycoris-extension = { workspace = true }
 tokio             = { workspace = true }
 
 [lints.rust]
-# Same split as lycoris-extension-guest: deny, not the workspace forbid, so
+# Same split as lycoris-extguest: deny, not the workspace forbid, so
 # the macro-generated ABI shims can carry their documented unsafe blocks.
 unsafe_code = "deny"

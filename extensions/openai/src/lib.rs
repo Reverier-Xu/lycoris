@@ -11,7 +11,7 @@
 //!   upstream response mapping;
 //! - [`invoke`]: the wire dispatch with per-instance settings state;
 //! - the `wasm32`-only glue exports `lycoris_alloc` / `lycoris_invoke` through
-//!   [`lycoris_extension_guest::export_extension!`].
+//!   [`lycoris_extguest::export_extension!`].
 //!
 //! Error semantics: provider-side failures (upstream non-2xx, transport,
 //! off-contract bodies, missing configuration) are answered as the section 3
@@ -102,7 +102,7 @@ fn with_settings(f: impl FnOnce(&Settings) -> Value) -> Value {
 /// map the answer with `map`. The host's own structured error document
 /// (transport failures, disallowed hosts, ...) passes through unchanged.
 fn execute(spec: HttpRequestSpec, map: impl FnOnce(u16, &str) -> Result<Value, String>) -> Value {
-  let response = match lycoris_extension_guest::host::http(&spec.to_json()) {
+  let response = match lycoris_extguest::host::http(&spec.to_json()) {
     Ok(response) => response,
     Err(message) => return error_document("transport", &message, None, None),
   };
@@ -134,9 +134,9 @@ fn execute(spec: HttpRequestSpec, map: impl FnOnce(u16, &str) -> Result<Value, S
 /// The `wasm32` glue: the `lycoris-abi-v1` exports dispatching to
 /// [`invoke`].
 #[cfg(target_arch = "wasm32")]
-#[allow(unsafe_code)] // The generated shims do raw linear-memory IO; see lycoris-extension-guest.
+#[allow(unsafe_code)] // The generated shims do raw linear-memory IO; see lycoris-extguest.
 mod glue {
-  lycoris_extension_guest::export_extension!(crate::invoke);
+  lycoris_extguest::export_extension!(crate::invoke);
 }
 
 #[cfg(test)]

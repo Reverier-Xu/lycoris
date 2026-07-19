@@ -131,7 +131,7 @@ method as stateless until `configure` has run (the OpenAI guest answers
 
 ## 6. Guest support crate and the OpenAI ext
 
-- `crates/extension-guest` (`lycoris-extension-guest`): the guest-side half
+- `crates/extguest` (`lycoris-extguest`): the guest-side half
   of `lycoris-abi-v1` — `export_extension!` macro emitting `lycoris_alloc` /
   `lycoris_invoke` shims that dispatch to a guest
   `fn invoke(method, payload) -> Result<Vec<u8>, String>`; safe `host::log`

@@ -1,5 +1,5 @@
 [package]
-name = "lycoris-extension-guest"
+name = "lycoris-extguest"
 
 authors.workspace      = true
 description.workspace  = true

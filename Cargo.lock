@@ -4215,7 +4215,7 @@ name = "lycoris-ext-openai"
 version = "0.1.0"
 dependencies = [
  "lycoris-extension",
- "lycoris-extension-guest",
+ "lycoris-extguest",
  "serde",
  "serde_json",
  "tokio",
@@ -4241,7 +4241,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "lycoris-extension-guest"
+name = "lycoris-extguest"
 version = "0.1.0"
 dependencies = [
  "serde",
