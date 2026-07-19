@@ -8,7 +8,8 @@
 //! announcement, routing, HTTP egress, and response mapping in one pass.
 //!
 //! Ignored by default: the test requires the `wasm32-unknown-unknown`
-//! target, which CI does not install yet. Run locally with:
+//! target, so a plain `cargo test` skips it; CI installs the target and runs
+//! it explicitly (the `wasm-provider-tests` job). Run locally with:
 //!
 //! ```sh
 //! cargo test -p lycoris-daemon --test extension_wasm -- --ignored
@@ -429,7 +430,7 @@ impl Drop for MockOpenAi {
 }
 
 #[tokio::test]
-#[ignore = "requires the wasm32-unknown-unknown target (not installed on CI yet); run with --ignored"]
+#[ignore = "requires the wasm32-unknown-unknown target; run with --ignored"]
 async fn wasm_openai_provider_serves_cluster_chat_from_the_capable_node() {
   let Some(artifact) = build_wasm_artifact() else {
     return;

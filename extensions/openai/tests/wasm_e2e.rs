@@ -6,8 +6,8 @@
 //! contract in `lycoris-extension::llm`.
 //!
 //! Ignored by default: the test requires the `wasm32-unknown-unknown`
-//! target, which CI does not install yet (a later batch adds the target to
-//! CI and enables this). Run locally with:
+//! target, so a plain `cargo test` skips it; CI installs the target and runs
+//! it explicitly (the `wasm-provider-tests` job). Run locally with:
 //!
 //! ```sh
 //! cargo test -p lycoris-ext-openai --test wasm_e2e -- --ignored
@@ -214,7 +214,7 @@ impl Drop for MockOpenAi {
 }
 
 #[tokio::test]
-#[ignore = "requires the wasm32-unknown-unknown target (not installed on CI yet); run with --ignored"]
+#[ignore = "requires the wasm32-unknown-unknown target; run with --ignored"]
 async fn wasm_guest_end_to_end_configure_and_chat() {
   let artifact = build_wasm_artifact();
   let server = MockOpenAi::start().await;
