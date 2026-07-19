@@ -15,6 +15,15 @@ use crate::selector::matches_selector;
 /// not rewind to 1 and lose the merge dominance it already earned).
 pub const LOCAL_INCARNATION_KEY: &str = "local_incarnation";
 
+/// Annotation key prefix owned by the extension capability announcer
+/// (extension system design, section 7):
+/// [`MembershipService::update_local_annotations`] replaces exactly this key
+/// subset on the local register and never touches the operator-configured
+/// annotations outside it.
+// The ExtensionManager (selector-driven activation change) is the caller.
+#[allow(dead_code)]
+pub const EXTENSION_ANNOTATION_PREFIX: &str = "ext.";
+
 /// Bridge between the CRDT/SWIM membership layer and the rest of the daemon.
 ///
 /// `MembershipService` owns the authoritative in-memory membership state. Its
@@ -166,6 +175,54 @@ impl MembershipService {
     vec![SwimAction::Broadcast(SwimMessage::Leave {
       node_id: node_id.to_string(),
       incarnation,
+    })]
+  }
+
+  /// Replace the extension-owned (`ext.`-prefixed) annotations of the local
+  /// register with `extension_annotations`, leaving every other annotation
+  /// untouched, and return the Alive broadcast that gossips the change.
+  ///
+  /// The heartbeat bump makes the updated register dominate its predecessor
+  /// in the local CRDT and carries the change through the existing Alive
+  /// gossip path. Capability annotations are runtime-derived: they are never
+  /// persisted into the node's configured annotations (extension system
+  /// design, section 7). Keys outside the owned prefix are dropped from the
+  /// input, so this method structurally cannot clobber operator annotations.
+  /// A call that would not change the register is a no-op returning no
+  /// actions, so the periodic reconcile does not churn gossip.
+  // The ExtensionManager (selector-driven activation change) is the caller.
+  #[allow(dead_code)]
+  pub async fn update_local_annotations(
+    &self, extension_annotations: HashMap<String, String>,
+  ) -> Vec<SwimAction> {
+    let now = now_ms();
+    let mut state = self.state.lock().await;
+    let Some(current) = state.swim.membership().get(&self.local_node_id).cloned() else {
+      return Vec::new();
+    };
+
+    let mut annotations: HashMap<String, String> = current
+      .annotations()
+      .iter()
+      .filter(|(key, _)| !key.starts_with(EXTENSION_ANNOTATION_PREFIX))
+      .map(|(key, value)| (key.clone(), value.clone()))
+      .collect();
+    annotations.extend(
+      extension_annotations
+        .into_iter()
+        .filter(|(key, _)| key.starts_with(EXTENSION_ANNOTATION_PREFIX)),
+    );
+    if annotations == *current.annotations() {
+      return Vec::new();
+    }
+
+    let mut updated = current;
+    updated.set_annotations(annotations);
+    updated.bump_heartbeat(now);
+    state.swim.membership_mut().merge_register(&updated);
+    state.persist_local_incarnation(&self.local_node_id);
+    vec![SwimAction::Broadcast(SwimMessage::Alive {
+      register: updated,
     })]
   }
 
@@ -373,6 +430,116 @@ mod tests {
     let nodes = service.list_nodes(&selector).await;
     assert_eq!(nodes.len(), 1);
     assert_eq!(nodes[0].node_id(), "peer");
+  }
+
+  fn register_with_annotations(id: &str, annotations: &[(&str, &str)]) -> MemberRegister {
+    register(id).with_annotations(
+      annotations
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect(),
+    )
+  }
+
+  async fn local_annotations(service: &MembershipService) -> HashMap<String, String> {
+    let mut registers = service.fetch_registers(&["local"]).await;
+    registers
+      .pop()
+      .map(|register| register.annotations().clone())
+      .unwrap_or_default()
+  }
+
+  #[tokio::test]
+  async fn update_local_annotations_replaces_only_the_owned_prefix() {
+    let service = MembershipService::new(
+      "local",
+      SwimConfig::default(),
+      register_with_annotations("local", &[("ext.old", "0.1.0"), ("team", "core")]),
+    );
+
+    let actions = service
+      .update_local_annotations(HashMap::from([(
+        "ext.new".to_string(),
+        "1.0.0".to_string(),
+      )]))
+      .await;
+
+    // The owned prefix is replaced wholesale; the user annotation survives.
+    let annotations = local_annotations(&service).await;
+    assert_eq!(
+      annotations,
+      HashMap::from([
+        ("ext.new".to_string(), "1.0.0".to_string()),
+        ("team".to_string(), "core".to_string()),
+      ])
+    );
+
+    // The change is broadcast as an Alive gossip carrying the updated
+    // register with a bumped heartbeat.
+    assert_eq!(actions.len(), 1);
+    let [SwimAction::Broadcast(SwimMessage::Alive { register })] = &actions[..] else {
+      panic!("expected an Alive broadcast, got {actions:?}");
+    };
+    assert_eq!(register.node_id(), "local");
+    assert_eq!(register.annotations(), &annotations);
+    assert_eq!(register.heartbeat(), 1);
+  }
+
+  #[tokio::test]
+  async fn update_local_annotations_with_an_empty_set_clears_the_prefix() {
+    let service = MembershipService::new(
+      "local",
+      SwimConfig::default(),
+      register_with_annotations("local", &[("ext.a", "0.1.0"), ("team", "core")]),
+    );
+
+    let actions = service.update_local_annotations(HashMap::new()).await;
+
+    assert_eq!(actions.len(), 1);
+    assert_eq!(
+      local_annotations(&service).await,
+      HashMap::from([("team".to_string(), "core".to_string())])
+    );
+  }
+
+  #[tokio::test]
+  async fn update_local_annotations_is_a_no_op_when_the_set_is_unchanged() {
+    let service = MembershipService::new(
+      "local",
+      SwimConfig::default(),
+      register_with_annotations("local", &[("ext.a", "0.1.0"), ("team", "core")]),
+    );
+
+    let actions = service
+      .update_local_annotations(HashMap::from([("ext.a".to_string(), "0.1.0".to_string())]))
+      .await;
+
+    // No heartbeat bump and no gossip when the owned subset already matches.
+    assert!(actions.is_empty());
+    let mut registers = service.fetch_registers(&["local"]).await;
+    let register = registers.pop().expect("local register");
+    assert_eq!(register.heartbeat(), 0);
+  }
+
+  #[tokio::test]
+  async fn update_local_annotations_drops_keys_outside_the_owned_prefix() {
+    let service = MembershipService::new(
+      "local",
+      SwimConfig::default(),
+      register_with_annotations("local", &[("ext.a", "0.1.0"), ("team", "core")]),
+    );
+
+    // A foreign key in the input is dropped: it neither clobbers the user
+    // annotation nor shields the owned prefix from wholesale replacement.
+    let actions = service
+      .update_local_annotations(HashMap::from([("team".to_string(), "hijack".to_string())]))
+      .await;
+
+    assert_eq!(actions.len(), 1);
+    assert_eq!(
+      local_annotations(&service).await,
+      HashMap::from([("team".to_string(), "core".to_string())])
+    );
   }
 
   #[tokio::test]
