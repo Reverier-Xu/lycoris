@@ -1,0 +1,14 @@
+# OpenAI LLM provider extension package fixture (test asset, not a production
+# configuration). Activated only on nodes carrying the label `role = "runner"`.
+# The artifact is the release wasm build of `extensions/openai`:
+# e2e/shell-test.sh builds it and stages it next to this file before loading,
+# so the relative path below resolves inside the container.
+id = "openai"
+name = "OpenAI"
+version = 1
+engine = "wasm"
+artifact = "./lycoris_ext_openai.wasm"
+semver = "0.1.0"
+provides = ["llm"]
+capabilities = ["http"]
+selector = { role = "runner" }

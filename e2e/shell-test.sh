@@ -13,6 +13,7 @@ cleanup() {
   for i in $(seq 0 $((NODE_COUNT - 1))); do
     podman rm -f "node-${i}" >/dev/null 2>&1 || true
   done
+  podman rm -f openai-mock >/dev/null 2>&1 || true
   podman network rm -f "${NETWORK}" >/dev/null 2>&1 || true
   rm -rf "${E2E_DIR}"
 }
@@ -118,7 +119,17 @@ wait_until_extension_announced() {
 }
 
 echo "building static musl binary..."
+build_start=${SECONDS}
 cargo +stable build --release --target x86_64-unknown-linux-musl -p lycoris
+echo "musl binary built in $((SECONDS - build_start))s"
+
+echo "building the wasm llm provider extension..."
+if ! rustup target list --installed | grep -q wasm32-unknown-unknown; then
+  rustup target add wasm32-unknown-unknown
+fi
+build_start=${SECONDS}
+cargo build --locked --release --target wasm32-unknown-unknown -p lycoris-ext-openai
+echo "wasm extension built in $((SECONDS - build_start))s"
 
 echo "building container image..."
 podman build -t "${IMAGE}" -f "${SCRIPT_DIR}/Dockerfile.shell-test" "${PROJECT_ROOT}" >/dev/null
@@ -156,8 +167,24 @@ cat >> "${E2E_DIR}/configs/node-1.toml" <<EOF
 role = "runner"
 EOF
 
+# node-1 also carries the node-local settings of the openai wasm provider:
+# the api key and base url never leave the node (llm-provider design,
+# section 5). The base url points at the canned mock on the podman network.
+cat >> "${E2E_DIR}/configs/node-1.toml" <<EOF
+
+[extensions.local.openai]
+api_key = "sk-e2e"
+base_url = "http://openai-mock/v1"
+EOF
+
 echo "creating podman network..."
 podman network create "${NETWORK}" >/dev/null
+
+echo "starting the canned openai api (no real key involved)..."
+podman run -d --name "openai-mock" \
+  --network "${NETWORK}" --hostname "openai-mock" \
+  -v "${SCRIPT_DIR}/openai-mock.conf:/etc/nginx/conf.d/default.conf:ro" \
+  docker.io/library/nginx:alpine >/dev/null
 
 echo "starting bootstrap node (node-0)..."
 # The daemon config is mounted at the default user config path, so both the
@@ -391,6 +418,61 @@ if ! echo "${EXT_LIST}" | grep -q "echo-ext"; then
   exit 1
 fi
 echo "ok: extension detail and listing look correct"
+
+echo ""
+echo "=== verifying the wasm llm provider scenario ==="
+echo "staging the openai package with the built wasm artifact..."
+# The committed fixture names the artifact relative to the package file, so
+# stage the release build next to it before copying both into node-0.
+mkdir -p "${E2E_DIR}/openai-fixture"
+cp "${SCRIPT_DIR}/fixtures/openai.pkg.toml" "${E2E_DIR}/openai-fixture/"
+cp "${PROJECT_ROOT}/target/wasm32-unknown-unknown/release/lycoris_ext_openai.wasm" \
+  "${E2E_DIR}/openai-fixture/"
+podman cp "${E2E_DIR}/openai-fixture" "node-0:/fixtures-openai"
+
+echo "registering the openai wasm extension from node-0..."
+LOAD_OUTPUT="$(run_in_node 0 lycoris cluster ext load /fixtures-openai/openai.pkg.toml)"
+echo "${LOAD_OUTPUT}"
+if ! echo "${LOAD_OUTPUT}" | grep -qE "accepted:.*true"; then
+  echo "error: openai extension registration was not accepted" >&2
+  exit 1
+fi
+echo "ok: openai extension registered"
+
+echo "waiting for the openai extension to converge to node-1..."
+if ! wait_until_extension_visible 1 "openai"; then
+  echo "error: openai did not become visible on node-1" >&2
+  run_in_node 1 lycoris cluster get extensions >&2 || true
+  exit 1
+fi
+
+echo "waiting for node-1 to announce the ext.openai capability..."
+if ! wait_until_extension_announced 0 "node-1" "openai"; then
+  echo "error: node-1 did not announce ext.openai in time" >&2
+  run_in_node 0 lycoris cluster get node node-1 >&2 || true
+  exit 1
+fi
+echo "ok: node-1 runs the openai provider and advertises it"
+
+echo "invoking openai chat from node-0 (must route to node-1)..."
+CHAT_STDERR="${E2E_DIR}/openai-chat.stderr"
+if ! CHAT_OUTPUT="$(run_in_node 0 lycoris cluster ext invoke openai chat \
+  '{"model":"gpt-mock","messages":[{"role":"user","content":"hi"}]}' 2>"${CHAT_STDERR}")"; then
+  echo "error: openai chat invocation failed" >&2
+  cat "${CHAT_STDERR}" >&2
+  exit 1
+fi
+echo "${CHAT_OUTPUT}"
+if ! echo "${CHAT_OUTPUT}" | grep -q "canned hello"; then
+  echo "error: chat response does not carry the canned completion" >&2
+  exit 1
+fi
+if ! grep -q "executed by: node-1" "${CHAT_STDERR}"; then
+  echo "error: the chat call was not routed to node-1" >&2
+  cat "${CHAT_STDERR}" >&2
+  exit 1
+fi
+echo "ok: chat routed to node-1 and answered by the mock through the wasm guest"
 
 echo ""
 echo "=== verifying lycoris cluster leave on node-2 ==="

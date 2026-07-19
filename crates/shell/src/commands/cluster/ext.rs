@@ -11,6 +11,7 @@
 //! semver = "1.0.0"
 //! # entry = "invoke"                   # optional override of the entry point
 //! # capabilities = ["log"]
+//! # provides = ["llm"]                 # contracts the ext implements (llm-provider design, section 3)
 //! # selector = { role = "runner" }
 //! # hooks = [{ point = "skill.invoke.pre", on_error = "ignore" }]
 //! # [settings]                         # arbitrary values, forwarded as JSON
@@ -59,6 +60,7 @@ struct PackageFile {
   artifact: PathBuf,
   semver: String,
   capabilities: Option<Vec<String>>,
+  provides: Option<Vec<String>>,
   selector: Option<BTreeMap<String, String>>,
   hooks: Option<Vec<PackageHook>>,
   settings: Option<toml::Value>,
@@ -132,6 +134,9 @@ fn manifest_map(package: &PackageFile) -> Result<HashMap<String, String>, ShellE
       "capabilities".to_string(),
       to_json(capabilities, "capabilities")?,
     );
+  }
+  if let Some(provides) = &package.provides {
+    manifest.insert("provides".to_string(), to_json(provides, "provides")?);
   }
   if let Some(hooks) = &package.hooks {
     manifest.insert("hooks".to_string(), to_json(hooks, "hooks")?);
@@ -211,6 +216,7 @@ artifact = "./echo.lua"
 semver = "1.0.0-rc.1"
 entry = "handle"
 capabilities = ["log"]
+provides = ["llm"]
 selector = { role = "runner", zone = "eu" }
 hooks = [{ point = "skill.invoke.pre", on_error = "ignore" }, { point = "llm.call.post" }]
 
@@ -241,6 +247,7 @@ retries = 3
     assert_eq!(request.artifact, b"lua-source");
     assert_eq!(request.manifest.get("semver").unwrap(), "1.0.0-rc.1");
     assert_eq!(request.manifest.get("capabilities").unwrap(), r#"["log"]"#);
+    assert_eq!(request.manifest.get("provides").unwrap(), r#"["llm"]"#);
     assert_eq!(
       request.manifest.get("selector").unwrap(),
       r#"{"role":"runner","zone":"eu"}"#
