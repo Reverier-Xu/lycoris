@@ -3,6 +3,8 @@
 
 pub mod runtime;
 
+pub(crate) mod extension;
+
 pub(crate) mod membership;
 pub(crate) mod resource;
 pub(crate) mod rpc;

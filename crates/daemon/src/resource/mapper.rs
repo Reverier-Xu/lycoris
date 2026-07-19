@@ -6,10 +6,7 @@
 //! (`crate::sync::resource`); the wire/domain converters live in
 //! [`super::convert`].
 
-use std::{
-  collections::{BTreeMap, HashMap},
-  sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
 use lycoris_core::ResourceScope;
 use lycoris_proto::node::{Resource, ResourceKind, resource::Body};
@@ -37,6 +34,7 @@ use crate::{
 pub struct ResourceMapper {
   storage: Storage,
   service: Arc<MembershipService>,
+  extension_notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 /// Storage accessors and operation contexts that vary between the two
@@ -100,11 +98,6 @@ where
   }
 }
 
-/// Extension records carry no user labels — extension configuration lives in
-/// the manifest (design section 4) — so label selectors match extensions only
-/// when empty.
-static EMPTY_LABELS: BTreeMap<String, String> = BTreeMap::new();
-
 /// Filter stored records by the label selector and map them onto resources.
 fn collect_matching<T, M>(
   records: Vec<T>, selector: &HashMap<String, String>, metadata: impl Fn(&T) -> &M,
@@ -121,7 +114,19 @@ where
 
 impl ResourceMapper {
   pub fn new(storage: Storage, service: Arc<MembershipService>) -> Self {
-    Self { storage, service }
+    Self {
+      storage,
+      service,
+      extension_notify: None,
+    }
+  }
+
+  /// Inject the notify handle fired after a successful EXTENSION apply
+  /// (extension design, section 6): the `ExtensionManager` reconciles on it.
+  /// Optional so call sites without an extension manager keep working.
+  pub fn with_extension_notify(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
+    self.extension_notify = Some(notify);
+    self
   }
 
   pub async fn list(
@@ -172,7 +177,7 @@ impl ResourceMapper {
         Ok(collect_matching(
           extensions,
           &selector,
-          |_| &EMPTY_LABELS,
+          |record| &record.labels,
           |record| extension_to_resource(record, None),
         ))
       }
@@ -389,6 +394,10 @@ impl ResourceMapper {
           .extensions()
           .apply_remote_extension(record, &body.artifact)
           .map_err(MapperError::extension("failed to apply remote extension"))?;
+        // Wake the extension manager's reconcile loop (design section 6).
+        if let Some(notify) = &self.extension_notify {
+          notify.notify_one();
+        }
       }
       (ResourceKind::Node | ResourceKind::Session, _) => {
         return Err(MapperError::NotSynchronized { kind });
@@ -673,14 +682,14 @@ mod tests {
   async fn list_extensions_filters_by_scope_and_selector() {
     let (_dir, mapper) = test_mapper();
     for (id, artifact) in [("ext-a", b"a" as &[u8]), ("ext-b", b"b")] {
-      mapper
-        .apply_resource(&extension_resource(
-          id,
-          ProtoResourceScope::ClusterShared,
-          artifact,
-        ))
-        .await
-        .unwrap();
+      let mut resource = extension_resource(id, ProtoResourceScope::ClusterShared, artifact);
+      resource
+        .metadata
+        .as_mut()
+        .expect("metadata")
+        .labels
+        .insert("zone".to_string(), id.to_string());
+      mapper.apply_resource(&resource).await.unwrap();
     }
 
     let all = mapper
@@ -712,16 +721,48 @@ mod tests {
       .unwrap();
     assert!(local.is_empty());
 
-    // Extensions carry no labels, so a non-empty selector matches nothing.
+    // Generic metadata labels make the selector filter meaningful.
     let selected = mapper
       .list(
         ResourceKind::Extension,
-        HashMap::from([("a".to_string(), "b".to_string())]),
+        HashMap::from([("zone".to_string(), "ext-a".to_string())]),
         None,
       )
       .await
       .unwrap();
-    assert!(selected.is_empty());
+    assert_eq!(selected.len(), 1);
+    let metadata = selected[0].metadata.as_ref().expect("metadata");
+    assert_eq!(metadata.id, "ext-a");
+    assert_eq!(metadata.labels.get("zone"), Some(&"ext-a".to_string()));
+  }
+
+  #[tokio::test]
+  async fn apply_resource_fires_the_extension_notify_only_for_extensions() {
+    let (_dir, mapper) = test_mapper();
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let mapper = mapper.with_extension_notify(notify.clone());
+
+    mapper
+      .apply_resource(&extension_resource(
+        "ext-notify",
+        ProtoResourceScope::ClusterShared,
+        b"x",
+      ))
+      .await
+      .unwrap();
+    // The permit is stored, so a waiter registered after the fact still
+    // observes it.
+    notify.notified().await;
+
+    mapper
+      .apply_resource(&memory_resource(ProtoResourceScope::ClusterShared))
+      .await
+      .unwrap();
+    let fired = tokio::time::timeout(std::time::Duration::from_millis(50), notify.notified()).await;
+    assert!(
+      fired.is_err(),
+      "non-extension applies must not fire the extension notify"
+    );
   }
 
   #[tokio::test]

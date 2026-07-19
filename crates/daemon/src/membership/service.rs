@@ -20,8 +20,6 @@ pub const LOCAL_INCARNATION_KEY: &str = "local_incarnation";
 /// [`MembershipService::update_local_annotations`] replaces exactly this key
 /// subset on the local register and never touches the operator-configured
 /// annotations outside it.
-// The ExtensionManager (selector-driven activation change) is the caller.
-#[allow(dead_code)]
 pub const EXTENSION_ANNOTATION_PREFIX: &str = "ext.";
 
 /// Bridge between the CRDT/SWIM membership layer and the rest of the daemon.
@@ -190,8 +188,6 @@ impl MembershipService {
   /// input, so this method structurally cannot clobber operator annotations.
   /// A call that would not change the register is a no-op returning no
   /// actions, so the periodic reconcile does not churn gossip.
-  // The ExtensionManager (selector-driven activation change) is the caller.
-  #[allow(dead_code)]
   pub async fn update_local_annotations(
     &self, extension_annotations: HashMap<String, String>,
   ) -> Vec<SwimAction> {

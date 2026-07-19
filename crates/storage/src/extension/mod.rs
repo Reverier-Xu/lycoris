@@ -56,6 +56,10 @@ pub struct ExtensionRecord {
   /// Extension configuration (`semver`, `capabilities`, `hooks`, `selector`,
   /// `settings`); `BTreeMap` keeps the postcard encoding deterministic.
   pub manifest: BTreeMap<String, String>,
+  /// Generic metadata labels matched by list selectors (same role as
+  /// `VersionedResource::metadata`); `BTreeMap` keeps the postcard encoding
+  /// deterministic across processes.
+  pub labels: BTreeMap<String, String>,
 }
 
 impl VersionedRecord for ExtensionRecord {
@@ -270,6 +274,7 @@ mod tests {
       manifest: [("semver".to_string(), "0.1.0".to_string())]
         .into_iter()
         .collect(),
+      labels: BTreeMap::new(),
     }
   }
 

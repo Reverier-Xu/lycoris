@@ -4190,6 +4190,7 @@ dependencies = [
  "lycoris-client",
  "lycoris-config",
  "lycoris-core",
+ "lycoris-extension",
  "lycoris-membership",
  "lycoris-proto",
  "lycoris-storage",

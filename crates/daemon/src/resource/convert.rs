@@ -199,16 +199,17 @@ pub(super) fn workspace_to_resource(workspace: WorkspaceRecord) -> Resource {
 
 /// Convert a stored extension record into the wire resource.
 ///
-/// Extension configuration lives in the manifest (design section 4), so
-/// extension metadata carries no labels. Listings pass `None` for the artifact
-/// to keep list responses small; `get` and the anti-entropy snapshot carry the
-/// full artifact bytes.
+/// Generic metadata labels ride in the resource metadata exactly like
+/// skills/rules (design section 4); extension configuration lives in the
+/// manifest. Listings pass `None` for the artifact to keep list responses
+/// small; `get` and the anti-entropy snapshot carry the full artifact bytes.
 pub(super) fn extension_to_resource(
   record: ExtensionRecord, artifact: Option<Vec<u8>>,
 ) -> Resource {
   Resource {
     metadata: Some(
       MetadataBuilder::new(&record.id, &record.name, ResourceKind::Extension)
+        .labels(record.labels.clone().into_iter().collect())
         .scope(record.scope, record.source_node_id.as_deref())
         .timestamps(record.created_at_ms, record.updated_at_ms)
         .build(),
@@ -315,6 +316,7 @@ pub(super) fn resource_to_extension(
     created_at_ms: metadata.created_at_ms,
     updated_at_ms: metadata.updated_at_ms,
     manifest: body.manifest.clone().into_iter().collect(),
+    labels: metadata.labels.clone().into_iter().collect(),
   })
 }
 
@@ -337,6 +339,7 @@ mod tests {
       created_at_ms: 11,
       updated_at_ms: 22,
       manifest,
+      labels: BTreeMap::from([("zone".to_string(), "eu".to_string())]),
     }
   }
 
@@ -365,7 +368,11 @@ mod tests {
     let (metadata, body) = split(&resource);
 
     assert_eq!(metadata.kind, ResourceKind::Extension as i32);
-    assert!(metadata.labels.is_empty());
+    assert_eq!(
+      metadata.labels.get("zone"),
+      Some(&"eu".to_string()),
+      "generic metadata labels ride in the resource metadata"
+    );
     assert_eq!(body.artifact, artifact);
     let restored = resource_to_extension(metadata, body).expect("convert back");
     assert_eq!(restored, record);

@@ -8,6 +8,7 @@ use thiserror::Error;
 use tokio::sync::watch;
 
 use crate::{
+  extension::ExtensionManager,
   membership::{LOCAL_INCARNATION_KEY, MemberRegister, MembershipService, SwimConfig},
   resource::ResourceMapper,
   rpc::server::ClusterService,
@@ -35,6 +36,8 @@ pub enum RuntimeError {
   InvalidAddress(#[from] std::net::AddrParseError),
   #[error("transport error: {0}")]
   Transport(#[from] tonic::transport::Error),
+  #[error("extension engine error: {0}")]
+  Extension(#[from] lycoris_extension::ExtensionError),
   #[error("failed to install crypto provider")]
   CryptoProvider,
 }
@@ -175,7 +178,17 @@ pub async fn run_with_shutdown(
       .with_meta(node.meta().clone()),
   );
 
-  let mapper = ResourceMapper::new(storage.clone(), membership_service.clone());
+  // The extension manager is constructed before the mapper so the mapper can
+  // fire its reconcile trigger on EXTENSION applies; the gossip handle only
+  // exists after `ClusterSync` is built, so it is injected afterwards.
+  let extension_manager = ExtensionManager::new(
+    &config.extensions,
+    storage.clone(),
+    membership_service.clone(),
+  )?;
+
+  let mapper = ResourceMapper::new(storage.clone(), membership_service.clone())
+    .with_extension_notify(extension_manager.notify());
 
   let pool = PeerPool::new(&tls_bundle);
   let resources = ResourceSync::new(mapper.clone(), node.clone(), pool.clone());
@@ -186,12 +199,22 @@ pub async fn run_with_shutdown(
     pool,
     resources.clone(),
   );
+  let extension_manager = Arc::new(extension_manager.with_cluster_sync(cluster_sync.clone()));
 
   let cluster_service = ClusterService::new(membership_service.clone(), storage.clone(), mapper)
     .with_cluster_sync(cluster_sync.clone())
     .with_shutdown(shutdown_tx);
 
   let mut background = tokio::task::JoinSet::new();
+
+  // Reconcile once at startup so selector-matching extensions serve before
+  // the first periodic pass, then drive the reconcile loop (design section 6).
+  extension_manager.reconcile().await;
+
+  spawn_until_shutdown(&mut background, shutdown.clone(), {
+    let extension_manager = extension_manager.clone();
+    async move { extension_manager.run().await }
+  });
 
   spawn_until_shutdown(&mut background, shutdown.clone(), {
     let cluster_sync = cluster_sync.clone();

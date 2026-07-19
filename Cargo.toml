@@ -40,6 +40,7 @@ lycoris-client    = { path = "crates/client" }
 lycoris-config    = { path = "crates/config" }
 lycoris-core      = { path = "crates/core" }
 lycoris-daemon    = { path = "crates/daemon" }
+lycoris-extension = { path = "crates/extension" }
 lycoris-membership = { path = "crates/membership" }
 lycoris-proto     = { path = "crates/proto" }
 lycoris-storage   = { path = "crates/storage" }
