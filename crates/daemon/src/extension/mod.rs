@@ -1,5 +1,6 @@
-//! Selector-driven extension activation and capability announcement
-//! (extension system design, sections 6 and 7).
+//! Selector-driven extension activation, capability announcement, and
+//! cluster-wide invocation routing (extension system design, sections 6
+//! and 7).
 //!
 //! The [`ExtensionManager`] reconciles the desired set — all synced extension
 //! records in storage — with the running set of engine instances: a record
@@ -9,6 +10,12 @@
 //! member register's annotations and gossips the change through the existing
 //! Alive path. Reconcile is triggered by the resource-apply path (a `Notify`
 //! wired into the `ResourceMapper`) with a 30 s safety-net tick.
+//!
+//! Invocation ([`ExtensionManager::invoke`]) serves a call locally when an
+//! instance runs here, and otherwise forwards it one hop to the best
+//! membership candidate advertising `ext.<id>` (state Active, peer-policy
+//! order). Forwarded calls carry `origin_node_id` and are never re-forwarded
+//! (hop limit 1).
 //!
 //! Loads are lazy-safe: a failed load (bad manifest, quarantined artifact,
 //! engine error) is logged and retried on the next trigger; it never blocks
@@ -20,7 +27,9 @@ use std::{
   time::Duration,
 };
 
+use lycoris_client::ClientError;
 use lycoris_config::ExtensionsConfig;
+use lycoris_core::now_ms;
 use lycoris_extension::{
   DEFAULT_ENTRY, EngineKind, EngineLimits, ExtensionEngine, ExtensionError, ExtensionInstance,
   ExtensionManifest, ExtensionPackage, LuaEngine, WasmEngine,
@@ -35,7 +44,8 @@ use tokio::{
 use crate::{
   membership::{EXTENSION_ANNOTATION_PREFIX, MembershipService},
   selector::matches_selector,
-  sync::ClusterSync,
+  sync::{ClusterSync, peers::order_candidates},
+  transport::PeerPool,
 };
 
 /// Reconcile safety-net cadence (design section 6); the apply-path notify is
@@ -46,12 +56,31 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 #[derive(Debug, Error)]
 pub enum ExtensionManagerError {
   /// The extension has no running instance on this node: it is unknown, its
-  /// selector does not match, or it is quarantined. Routing (a later change)
-  /// turns this into a forwarding decision.
-  // Constructed by `invoke_local`; the rpc surface lands with routing.
-  #[allow(dead_code)]
+  /// selector does not match, or it is quarantined.
   #[error("extension {0:?} is not running on this node")]
   NotRunning(String),
+  /// No Active member advertises the extension, so a non-local call has
+  /// nowhere to go (extension system design, section 7).
+  #[error("no node currently serves extension {0:?}")]
+  NotFound(String),
+  /// The request was already forwarded (`origin_node_id` set) but no instance
+  /// runs here: forwarding is limited to one hop so calls never loop.
+  #[error(
+    "extension {0:?} is not running on this node and the request was already forwarded (hop limit 1)"
+  )]
+  AlreadyForwarded(String),
+  /// Every candidate advertising the extension failed the forwarded call.
+  #[error(
+    "extension {id:?} is unavailable: all {candidates} candidate(s) failed (last error: {message})"
+  )]
+  Unavailable {
+    id: String,
+    candidates: usize,
+    message: String,
+  },
+  /// A single forwarding attempt failed at the transport or RPC level.
+  #[error("failed to forward extension call: {0}")]
+  Forwarded(#[from] ClientError),
   /// The record's artifact is missing from the blob store.
   #[error("extension {0:?} has no artifact in the blob store")]
   MissingArtifact(String),
@@ -88,9 +117,16 @@ struct LoadedExtension {
   /// call may occupy its engine deadline (seconds), and serializing unrelated
   /// invocations — or the next reconcile — behind it would stall the
   /// subsystem.
-  // Read by `invoke_local`; the rpc surface lands with routing.
-  #[allow(dead_code)]
   instance: Arc<dyn ExtensionInstance>,
+}
+
+/// The outcome of a successfully routed invocation: the JSON response payload
+/// plus the id of the node that actually executed the call (this node for a
+/// local call, the serving peer for a forwarded one).
+#[derive(Debug)]
+pub struct InvokeOutcome {
+  pub payload: Vec<u8>,
+  pub executed_by: String,
 }
 
 /// Reconciles synced extension records with locally running instances.
@@ -106,6 +142,12 @@ pub struct ExtensionManager {
   /// completed via [`Self::with_cluster_sync`]; unit tests leave it unset and
   /// assert the membership effect directly.
   cluster_sync: Option<ClusterSync>,
+  /// Forwarding transport for calls no local instance can serve. `Option`
+  /// (same pattern as `cluster_sync`): the pool needs the TLS bundle and the
+  /// daemon's cluster key, so it is injected via [`Self::with_peer_pool`]
+  /// after construction; unit tests that never reach the network leave it
+  /// unset.
+  pool: Option<PeerPool>,
   notify: Arc<Notify>,
 }
 
@@ -123,6 +165,7 @@ impl ExtensionManager {
       storage,
       membership,
       cluster_sync: None,
+      pool: None,
       notify: Arc::new(Notify::new()),
     })
   }
@@ -130,6 +173,13 @@ impl ExtensionManager {
   /// Inject the gossip handle used to broadcast capability announcements.
   pub fn with_cluster_sync(mut self, cluster_sync: ClusterSync) -> Self {
     self.cluster_sync = Some(cluster_sync);
+    self
+  }
+
+  /// Inject the peer channel pool used to forward invocations to capable
+  /// peers (extension system design, section 7).
+  pub fn with_peer_pool(mut self, pool: PeerPool) -> Self {
+    self.pool = Some(pool);
     self
   }
 
@@ -141,10 +191,8 @@ impl ExtensionManager {
 
   /// Invoke a locally running extension. `payload` is JSON; the return value
   /// is JSON. Extensions without a local instance surface as
-  /// [`ExtensionManagerError::NotRunning`] — cluster-wide routing is a later
-  /// change.
-  // The rpc surface (ExtensionService routing change) is the caller.
-  #[allow(dead_code)]
+  /// [`ExtensionManagerError::NotRunning`] — callers wanting cluster-wide
+  /// routing go through [`Self::invoke`].
   pub async fn invoke_local(
     &self, id: &str, method: &str, payload: &[u8],
   ) -> Result<Vec<u8>, ExtensionManagerError> {
@@ -156,6 +204,128 @@ impl ExtensionManager {
       return Err(ExtensionManagerError::NotRunning(id.to_string()));
     };
     Ok(instance.invoke(method, payload).await?)
+  }
+
+  /// Invoke an extension, routing the call when no instance runs locally
+  /// (extension system design, section 7):
+  ///
+  /// 1. A local instance serves the call directly.
+  /// 2. Without one, a request that was already forwarded (`origin` set) fails
+  ///    with [`ExtensionManagerError::AlreadyForwarded`] — forwarding is
+  ///    limited to one hop so calls never loop.
+  /// 3. Otherwise the Active members advertising `ext.<id>` are ordered by the
+  ///    peer selection policy and tried in turn with `origin_node_id` set to
+  ///    this node. No candidate surfaces as
+  ///    [`ExtensionManagerError::NotFound`]; every candidate failing surfaces
+  ///    as [`ExtensionManagerError::Unavailable`].
+  pub async fn invoke(
+    &self, id: &str, method: &str, payload: &[u8], origin: Option<String>,
+  ) -> Result<InvokeOutcome, ExtensionManagerError> {
+    let local_id = self.membership.local_node_id().to_string();
+    let has_local = self.instances.lock().await.contains_key(id);
+    if has_local {
+      match self.invoke_local(id, method, payload).await {
+        Ok(payload) => {
+          return Ok(InvokeOutcome {
+            payload,
+            executed_by: local_id,
+          });
+        }
+        // The instance vanished between the check and the call (a reconcile
+        // unloaded it): fall through to routing instead of failing spuriously.
+        Err(ExtensionManagerError::NotRunning(_)) => {}
+        Err(error) => return Err(error),
+      }
+    }
+
+    if origin.is_some() {
+      return Err(ExtensionManagerError::AlreadyForwarded(id.to_string()));
+    }
+
+    let candidates = self.route_candidates(id).await;
+    if candidates.is_empty() {
+      return Err(ExtensionManagerError::NotFound(id.to_string()));
+    }
+    let Some(pool) = &self.pool else {
+      // The runtime always injects the pool; a missing one is a wiring bug,
+      // surfaced as an unavailable call instead of a panic.
+      tracing::warn!(extension = %id, "no peer pool configured; cannot forward the invocation");
+      return Err(ExtensionManagerError::Unavailable {
+        id: id.to_string(),
+        candidates: candidates.len(),
+        message: "peer pool is not configured on this node".to_string(),
+      });
+    };
+
+    let mut last_error = None;
+    for address in &candidates {
+      match Self::forward(pool, address, id, method, payload, &local_id).await {
+        Ok(outcome) => {
+          if let Err(error) = self.storage.node().peers().mark_seen(address, now_ms()) {
+            tracing::warn!(%address, %error, "failed to mark peer seen");
+          }
+          return Ok(outcome);
+        }
+        Err(error) => {
+          tracing::warn!(extension = %id, %address, %error, "forwarded extension call failed");
+          // Feed the failure back into the selection policy (backoff) and
+          // drop the cached channel so the next attempt reconnects.
+          if let Err(error) = self.storage.node().peers().mark_attempt(address, false) {
+            tracing::warn!(%address, %error, "failed to record failed peer attempt");
+          }
+          pool.remove(address).await;
+          last_error = Some(error);
+        }
+      }
+    }
+    Err(ExtensionManagerError::Unavailable {
+      id: id.to_string(),
+      candidates: candidates.len(),
+      message: last_error
+        .map(|error| error.to_string())
+        .unwrap_or_default(),
+    })
+  }
+
+  /// The ordered forwarding candidates for `id`: Active members whose
+  /// register advertises the `ext.<id>` capability annotation, ordered by the
+  /// peer selection policy (primary first, most-recently-seen next, failure
+  /// backoff excluded — v1's definition of "nearest").
+  async fn route_candidates(&self, id: &str) -> Vec<String> {
+    let local_id = self.membership.local_node_id();
+    let local_address = self
+      .membership
+      .member_address(local_id)
+      .await
+      .unwrap_or_default();
+    let capability = format!("{EXTENSION_ANNOTATION_PREFIX}{id}");
+    let candidates: Vec<String> = self
+      .membership
+      .list_nodes(&HashMap::new())
+      .await
+      .into_iter()
+      .filter(|register| {
+        register.node_id() != local_id && register.annotations().contains_key(&capability)
+      })
+      .map(|register| register.address().to_string())
+      .collect();
+    order_candidates(self.storage.node(), &local_address, &candidates, now_ms())
+  }
+
+  /// Forward the call to one candidate with `origin_node_id` set to the local
+  /// node, so the receiving node executes locally and never re-forwards.
+  async fn forward(
+    pool: &PeerPool, address: &str, id: &str, method: &str, payload: &[u8], local_id: &str,
+  ) -> Result<InvokeOutcome, ExtensionManagerError> {
+    let mut client = pool.connect(address).await?;
+    let response = client
+      .extension
+      .invoke(id, method, payload.to_vec(), Some(local_id.to_string()))
+      .await?;
+    Ok(InvokeOutcome {
+      payload: response.payload,
+      executed_by: response.executed_by,
+    })
   }
 
   /// Reconcile the desired set (all synced extension records) with the
@@ -527,5 +697,215 @@ mod tests {
 
     assert!(running(&manager).await.is_empty());
     assert_eq!(local_annotations(&membership).await, HashMap::new());
+  }
+
+  fn register_with_annotations(
+    id: &str, address: &str, annotations: &[(&str, &str)],
+  ) -> MemberRegister {
+    MemberRegister::new(id, address, 1, 0)
+      .with_annotations(
+        annotations
+          .iter()
+          .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+          .collect(),
+      )
+      .with_updated_at_ms(0)
+  }
+
+  #[tokio::test]
+  async fn invoke_executes_locally_and_reports_the_executor() {
+    let dir = TempDir::new().unwrap();
+    let (storage, _membership, manager) = test_manager(&dir);
+    apply_extension(&storage, "ext-echo", 1, None);
+    manager.reconcile().await;
+
+    let outcome = manager
+      .invoke("ext-echo", "echo", br#"{"a":1}"#, None)
+      .await
+      .unwrap();
+    assert_eq!(outcome.payload, br#"{"a":1}"#.to_vec());
+    assert_eq!(outcome.executed_by, "local");
+
+    // A local instance also serves a forwarded request: the receiving node
+    // executes locally instead of re-forwarding (hop limit 1).
+    let outcome = manager
+      .invoke(
+        "ext-echo",
+        "echo",
+        br#"{"a":2}"#,
+        Some("origin".to_string()),
+      )
+      .await
+      .unwrap();
+    assert_eq!(outcome.executed_by, "local");
+  }
+
+  #[tokio::test]
+  async fn invoke_rejects_a_second_forwarding_hop() {
+    let dir = TempDir::new().unwrap();
+    let (_storage, membership, manager) = test_manager(&dir);
+    // A candidate exists, so the request would be forwardable — but the
+    // origin is already set, and the hop limit refuses the loop before
+    // routing even starts.
+    let _ = membership
+      .register(register_with_annotations(
+        "peer-a",
+        "peer-a:1",
+        &[("ext.ext-x", "1.0.0")],
+      ))
+      .await;
+
+    let error = manager
+      .invoke("ext-x", "m", b"{}", Some("peer-a".to_string()))
+      .await
+      .unwrap_err();
+    assert!(
+      matches!(&error, ExtensionManagerError::AlreadyForwarded(id) if id == "ext-x"),
+      "expected AlreadyForwarded, got {error}"
+    );
+  }
+
+  #[tokio::test]
+  async fn invoke_without_any_candidate_is_not_found() {
+    let dir = TempDir::new().unwrap();
+    let (_storage, membership, manager) = test_manager(&dir);
+    // Members exist but none advertises the extension.
+    let _ = membership
+      .register(register_with_annotations(
+        "peer-a",
+        "peer-a:1",
+        &[("other", "1")],
+      ))
+      .await;
+
+    let error = manager.invoke("ghost", "m", b"{}", None).await.unwrap_err();
+    assert!(
+      matches!(&error, ExtensionManagerError::NotFound(id) if id == "ghost"),
+      "expected NotFound, got {error}"
+    );
+    assert!(error.to_string().contains("ghost"));
+  }
+
+  #[tokio::test]
+  async fn route_candidates_filters_and_orders_by_the_peer_policy() {
+    let dir = TempDir::new().unwrap();
+    let (storage, membership, manager) = test_manager(&dir);
+    // The local node advertises the capability too; it must never be its own
+    // forwarding candidate.
+    let _ = membership
+      .update_local_annotations(HashMap::from([(
+        "ext.ext-x".to_string(),
+        "1.0.0".to_string(),
+      )]))
+      .await;
+    let _ = membership
+      .register(register_with_annotations(
+        "peer-a",
+        "peer-a:1",
+        &[("ext.ext-x", "1.0.0")],
+      ))
+      .await;
+    let _ = membership
+      .register(register_with_annotations(
+        "peer-b",
+        "peer-b:1",
+        &[("ext.ext-x", "1.0.0")],
+      ))
+      .await;
+    let _ = membership
+      .register(register_with_annotations(
+        "peer-c",
+        "peer-c:1",
+        &[("other", "1")],
+      ))
+      .await;
+    let _ = membership
+      .register(register_with_annotations(
+        "peer-d",
+        "peer-d:1",
+        &[("ext.ext-x", "1.0.0")],
+      ))
+      .await;
+
+    // peer-b was reachable recently and ranks first; peer-d sits in failure
+    // backoff and is excluded; peer-c does not advertise and is filtered out.
+    storage.node().peers().seed("peer-a:1").unwrap();
+    storage.node().peers().seed("peer-b:1").unwrap();
+    storage.node().peers().seed("peer-d:1").unwrap();
+    storage
+      .node()
+      .peers()
+      .mark_seen("peer-b:1", now_ms())
+      .unwrap();
+    storage
+      .node()
+      .peers()
+      .mark_attempt("peer-d:1", false)
+      .unwrap();
+
+    assert_eq!(
+      manager.route_candidates("ext-x").await,
+      vec!["peer-b:1".to_string(), "peer-a:1".to_string()]
+    );
+  }
+
+  /// Generate a test CA and one node identity; the bundle serves as client
+  /// credentials for the forwarding path.
+  fn test_tls(dir: &std::path::Path) -> lycoris_tls::TlsBundle {
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+
+    let ca_key = KeyPair::generate().unwrap();
+    let mut ca_params = CertificateParams::new(vec!["lycoris-test-ca".to_string()]).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+    let ca_path = dir.join("ca.crt");
+    std::fs::write(&ca_path, ca_cert.pem()).unwrap();
+
+    let key = KeyPair::generate().unwrap();
+    let params = CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
+    let cert = params.signed_by(&key, &ca_cert, &ca_key).unwrap();
+    let cert_path = dir.join("node.crt");
+    let key_path = dir.join("node.key");
+    std::fs::write(&cert_path, cert.pem()).unwrap();
+    std::fs::write(&key_path, key.serialize_pem()).unwrap();
+
+    lycoris_tls::load_tls_bundle(&cert_path, &key_path, &ca_path).unwrap()
+  }
+
+  #[tokio::test]
+  async fn invoke_surfaces_unavailable_when_every_candidate_fails() {
+    let _ = lycoris_tls::install_crypto_provider();
+    let dir = TempDir::new().unwrap();
+    let (storage, membership, manager) = test_manager(&dir);
+    let tls_dir = TempDir::new().unwrap();
+    let tls = test_tls(tls_dir.path());
+    let manager = manager.with_peer_pool(crate::transport::PeerPool::new(&tls, None));
+
+    // The only candidate is unreachable (nothing listens on port 1).
+    let _ = membership
+      .register(register_with_annotations(
+        "peer-dead",
+        "https://127.0.0.1:1",
+        &[("ext.ext-remote", "1.0.0")],
+      ))
+      .await;
+
+    let error = manager
+      .invoke("ext-remote", "m", b"{}", None)
+      .await
+      .unwrap_err();
+    assert!(
+      matches!(&error, ExtensionManagerError::Unavailable { id, candidates: 1, .. } if id == "ext-remote"),
+      "expected Unavailable, got {error}"
+    );
+
+    // The failed attempt was fed back into the peer bookkeeping so the
+    // selection policy backs off.
+    let records = storage.node().peers().records().unwrap();
+    let record = records
+      .iter()
+      .find(|record| record.address == "https://127.0.0.1:1")
+      .unwrap();
+    assert!(!record.online);
   }
 }

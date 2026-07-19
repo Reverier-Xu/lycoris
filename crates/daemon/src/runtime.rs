@@ -11,7 +11,7 @@ use crate::{
   extension::ExtensionManager,
   membership::{LOCAL_INCARNATION_KEY, MemberRegister, MembershipService, SwimConfig},
   resource::ResourceMapper,
-  rpc::server::ClusterService,
+  rpc::{extension::ExtensionService, server::ClusterService},
   sync::{ClusterSync, ResourceSync},
   transport::PeerPool,
 };
@@ -196,14 +196,19 @@ pub async fn run_with_shutdown(
     config.node.id.clone(),
     membership_service.clone(),
     node.clone(),
-    pool,
+    pool.clone(),
     resources.clone(),
   );
-  let extension_manager = Arc::new(extension_manager.with_cluster_sync(cluster_sync.clone()));
+  let extension_manager = Arc::new(
+    extension_manager
+      .with_cluster_sync(cluster_sync.clone())
+      .with_peer_pool(pool),
+  );
 
   let cluster_service = ClusterService::new(membership_service.clone(), storage.clone(), mapper)
     .with_cluster_sync(cluster_sync.clone())
     .with_shutdown(shutdown_tx);
+  let extension_service = ExtensionService::new(extension_manager.clone());
 
   let mut background = tokio::task::JoinSet::new();
 
@@ -242,24 +247,32 @@ pub async fn run_with_shutdown(
 
   let server_shutdown = shutdown.clone();
   // Authentication boundary (deliberate layering): the cluster-key
-  // interceptor guards only the Cluster service — the admission plane reached
-  // by operators and joining members. The Sync and Membership services are
-  // node-to-node; node identity there comes from the mTLS handshake against
-  // the cluster CA, so they carry no cluster-key check.
-  // The message limits live on `ClusterServer`, so they are applied before
-  // wrapping it into the intercepted service (`with_interceptor` only takes
-  // the raw inner service).
+  // interceptor guards the admission plane — the Cluster service reached by
+  // operators and joining members, and the Extension service whose invocations
+  // (direct or forwarded) are admission-level operations (extension system
+  // design, section 7). The Sync and Membership services are node-to-node;
+  // node identity there comes from the mTLS handshake against the cluster CA,
+  // so they carry no cluster-key check.
+  // The message limits live on the inner servers, so they are applied before
+  // wrapping them into the intercepted services (`with_interceptor` only
+  // takes the raw inner service).
+  let admission = crate::rpc::interceptor::cluster_key_interceptor(cluster_key.map(Arc::new));
   let cluster_server = lycoris_proto::node::cluster_server::ClusterServer::new(cluster_service)
     .max_decoding_message_size(lycoris_client::MAX_RPC_MESSAGE_BYTES)
     .max_encoding_message_size(lycoris_client::MAX_RPC_MESSAGE_BYTES);
-  let cluster_server = tonic::service::interceptor::InterceptedService::new(
-    cluster_server,
-    crate::rpc::interceptor::cluster_key_interceptor(cluster_key.map(Arc::new)),
-  );
+  let cluster_server =
+    tonic::service::interceptor::InterceptedService::new(cluster_server, admission.clone());
+  let extension_server =
+    lycoris_proto::node::extension_server::ExtensionServer::new(extension_service)
+      .max_decoding_message_size(lycoris_client::MAX_RPC_MESSAGE_BYTES)
+      .max_encoding_message_size(lycoris_client::MAX_RPC_MESSAGE_BYTES);
+  let extension_server =
+    tonic::service::interceptor::InterceptedService::new(extension_server, admission);
   let result = tonic::transport::Server::builder()
     .tls_config(server_tls)?
     .timeout(Duration::from_secs(30))
     .add_service(cluster_server)
+    .add_service(extension_server)
     .add_service(sync_service)
     .add_service(membership_service_rpc)
     .serve_with_shutdown(addr, wait_shutdown(server_shutdown))

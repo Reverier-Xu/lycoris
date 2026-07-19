@@ -1,6 +1,7 @@
 use tonic::Status;
 
 pub mod cluster;
+pub mod extension;
 pub mod interceptor;
 pub mod resource;
 pub mod server;

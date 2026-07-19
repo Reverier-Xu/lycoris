@@ -13,7 +13,7 @@
 
 mod antientropy;
 mod gossip;
-mod peers;
+pub(crate) mod peers;
 mod resource;
 mod swim;
 

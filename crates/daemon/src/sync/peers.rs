@@ -4,7 +4,7 @@
 //! Gossip fan-out, membership anti-entropy, and resource anti-entropy all
 //! consume [`targets`]; none of them selects endpoints on its own.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use lycoris_storage::{NodeDomain, PeerRecord};
 
@@ -33,38 +33,68 @@ const FAILURE_BACKOFF_MS: i64 = 30_000;
 /// The anti-entropy loop treats that as isolation and retries the complete
 /// seed set once per cycle (see `super::antientropy`).
 pub(super) fn targets(node: &NodeDomain, local_address: &str, now_ms: i64) -> Vec<String> {
+  order_candidates(
+    node,
+    local_address,
+    &node.peers().known_addresses().unwrap_or_default(),
+    now_ms,
+  )
+}
+
+/// Order an explicit candidate set by the peer policy: the stored primary
+/// heads the list when it is one of the candidates, the rest follow by
+/// `last_seen_ms` descending (never-seen last, address tiebreak), and
+/// endpoints inside the failure backoff window are excluded. The local
+/// endpoint is never returned. [`targets`] is the special case where the
+/// candidate set is every known endpoint; extension routing passes the
+/// membership-derived set of nodes advertising a capability (extension system
+/// design, section 7 — v1's definition of "nearest").
+pub(crate) fn order_candidates(
+  node: &NodeDomain, local_address: &str, candidates: &[String], now_ms: i64,
+) -> Vec<String> {
   let primary = node.peers().get_primary().unwrap_or(None);
   let records = node.peers().records().unwrap_or_default();
   let by_address: HashMap<&str, &PeerRecord> = records
     .iter()
     .map(|record| (record.address.as_str(), record))
     .collect();
+  let backing_off_at = |address: &str| {
+    by_address
+      .get(address)
+      .is_some_and(|record| backing_off(record, now_ms))
+  };
 
   let mut targets = Vec::new();
   if let Some(address) = &primary
     && address != local_address
-    && !by_address
-      .get(address.as_str())
-      .is_some_and(|record| backing_off(record, now_ms))
+    && candidates.contains(address)
+    && !backing_off_at(address)
   {
     targets.push(address.clone());
   }
 
-  let mut healthy: Vec<&PeerRecord> = records
+  let mut seen = HashSet::new();
+  let mut healthy: Vec<&String> = candidates
     .iter()
-    .filter(|record| {
-      record.address != local_address
-        && primary.as_ref() != Some(&record.address)
-        && !backing_off(record, now_ms)
+    .filter(|address| {
+      address.as_str() != local_address
+        && primary.as_ref() != Some(address)
+        && seen.insert(address.as_str())
+        && !backing_off_at(address)
     })
     .collect();
   healthy.sort_by(|a, b| {
-    b.last_seen_ms
-      .unwrap_or(i64::MIN)
-      .cmp(&a.last_seen_ms.unwrap_or(i64::MIN))
-      .then_with(|| a.address.cmp(&b.address))
+    let last_seen = |address: &&String| {
+      by_address
+        .get(address.as_str())
+        .and_then(|record| record.last_seen_ms)
+        .unwrap_or(i64::MIN)
+    };
+    last_seen(b)
+      .cmp(&last_seen(a))
+      .then_with(|| a.as_str().cmp(b.as_str()))
   });
-  targets.extend(healthy.into_iter().map(|record| record.address.clone()));
+  targets.extend(healthy.into_iter().cloned());
 
   targets
 }
@@ -174,5 +204,56 @@ mod tests {
     );
     node.peers().mark_attempt("peer-b:1", false).unwrap();
     assert!(targets(&node, "local:1", now_ms()).is_empty());
+  }
+
+  #[test]
+  fn order_candidates_restricts_the_primary_head_to_the_candidate_set() {
+    let (_dir, node) = test_node();
+    node.peers().seed("peer-a:1").unwrap();
+    node.peers().seed("peer-b:1").unwrap();
+    node.peers().set_primary("peer-b:1", "local:1").unwrap();
+
+    // The primary is not among the candidates, so it cannot head the list.
+    let candidates = vec!["peer-a:1".to_string()];
+    assert_eq!(
+      order_candidates(&node, "local:1", &candidates, now_ms()),
+      vec!["peer-a:1".to_string()]
+    );
+
+    // When the primary is a candidate it heads the list.
+    let candidates = vec!["peer-a:1".to_string(), "peer-b:1".to_string()];
+    assert_eq!(
+      order_candidates(&node, "local:1", &candidates, now_ms()),
+      vec!["peer-b:1".to_string(), "peer-a:1".to_string()]
+    );
+  }
+
+  #[test]
+  fn order_candidates_ranks_unrecorded_candidates_last_and_dedupes() {
+    let (_dir, node) = test_node();
+    node.peers().seed("peer-a:1").unwrap();
+    node.peers().mark_seen("peer-a:1", 1_000).unwrap();
+
+    // "peer-b:1" has no peer record (a membership-only endpoint): it is never
+    // in backoff but ranks as never-seen. Duplicates collapse.
+    let candidates = vec![
+      "peer-b:1".to_string(),
+      "peer-a:1".to_string(),
+      "peer-b:1".to_string(),
+    ];
+    assert_eq!(
+      order_candidates(&node, "local:1", &candidates, now_ms()),
+      vec!["peer-a:1".to_string(), "peer-b:1".to_string()]
+    );
+  }
+
+  #[test]
+  fn order_candidates_excludes_local_and_backing_off_candidates() {
+    let (_dir, node) = test_node();
+    node.peers().seed("peer-a:1").unwrap();
+    node.peers().mark_attempt("peer-a:1", false).unwrap();
+
+    let candidates = vec!["local:1".to_string(), "peer-a:1".to_string()];
+    assert!(order_candidates(&node, "local:1", &candidates, now_ms()).is_empty());
   }
 }
