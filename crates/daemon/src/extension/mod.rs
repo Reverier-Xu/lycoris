@@ -21,6 +21,11 @@
 //! engine error) is logged and retried on the next trigger; it never blocks
 //! reconcile and never takes down a still-serviceable previous instance.
 
+// Workflow emitters land in a later batch (design section 9); until then the
+// dispatcher's only callers are its tests.
+#[allow(dead_code)]
+pub mod hooks;
+
 use std::{
   collections::{HashMap, HashSet},
   sync::Arc,
