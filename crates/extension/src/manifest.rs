@@ -7,6 +7,7 @@
 //! | -------------- | -------------------------------------------- |
 //! | `semver`       | human-facing SemVer string (required)        |
 //! | `capabilities` | JSON array of capability names             |
+//! | `provides`     | JSON array of contract names the ext implements (e.g. `"llm"`) |
 //! | `hooks`        | JSON array of `{point, on_error}` objects    |
 //! | `selector`     | JSON object of string -> string label terms  |
 //! | `settings`     | opaque JSON passed to the extension uninterpreted |
@@ -23,13 +24,14 @@ use crate::error::{ExtensionError, Result};
 
 const SEMVER_KEY: &str = "semver";
 const CAPABILITIES_KEY: &str = "capabilities";
+const PROVIDES_KEY: &str = "provides";
 const HOOKS_KEY: &str = "hooks";
 const SELECTOR_KEY: &str = "selector";
 const SETTINGS_KEY: &str = "settings";
 
 /// Capabilities the host currently knows how to honour. Anything else is
 /// rejected (design document section 10).
-const KNOWN_CAPABILITIES: [&str; 1] = ["log"];
+const KNOWN_CAPABILITIES: [&str; 2] = ["log", "http"];
 
 /// What the hook dispatcher should do when a hook invocation fails.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,6 +65,10 @@ pub struct ExtensionManifest {
   pub semver: semver::Version,
   /// Declared host-service capabilities; unknown names are rejected.
   pub capabilities: Vec<String>,
+  /// Contracts the extension implements (e.g. `"llm"`); parsed and carried
+  /// for discovery, not interpreted by the engines (llm-provider design,
+  /// section 3).
+  pub provides: Vec<String>,
   /// Hook subscriptions, applied in declaration order.
   pub hooks: Vec<HookDecl>,
   /// Label selector deciding per-node activation.
@@ -89,6 +95,13 @@ impl ExtensionManifest {
         )));
       }
     }
+
+    // Contract names are open-ended: they name wire conventions (llm-provider
+    // design section 3), so any string is accepted and carried for discovery.
+    let provides: Vec<String> = match map.get(PROVIDES_KEY) {
+      Some(raw) => parse_json(raw, PROVIDES_KEY)?,
+      None => Vec::new(),
+    };
 
     let hooks: Vec<HookDecl> = match map.get(HOOKS_KEY) {
       Some(raw) => parse_json(raw, HOOKS_KEY)?,
@@ -119,6 +132,7 @@ impl ExtensionManifest {
     Ok(Self {
       semver,
       capabilities,
+      provides,
       hooks,
       selector,
       settings,
@@ -134,6 +148,11 @@ impl ExtensionManifest {
       CAPABILITIES_KEY.to_string(),
       serde_json::to_string(&self.capabilities)
         .map_err(|err| ExtensionError::Manifest(format!("failed to encode capabilities: {err}")))?,
+    );
+    map.insert(
+      PROVIDES_KEY.to_string(),
+      serde_json::to_string(&self.provides)
+        .map_err(|err| ExtensionError::Manifest(format!("failed to encode provides: {err}")))?,
     );
     map.insert(
       HOOKS_KEY.to_string(),
@@ -172,6 +191,7 @@ mod tests {
     BTreeMap::from([
       ("semver".to_string(), "1.2.3-rc.1".to_string()),
       ("capabilities".to_string(), r#"["log"]"#.to_string()),
+      ("provides".to_string(), r#"["llm","embed"]"#.to_string()),
       (
         "hooks".to_string(),
         r#"[{"point":"skill.invoke.pre","on_error":"ignore"},{"point":"llm.call.post"}]"#
@@ -193,6 +213,10 @@ mod tests {
     let manifest = ExtensionManifest::from_map(&full_map()).unwrap();
     assert_eq!(manifest.semver.to_string(), "1.2.3-rc.1");
     assert_eq!(manifest.capabilities, vec!["log".to_string()]);
+    assert_eq!(
+      manifest.provides,
+      vec!["llm".to_string(), "embed".to_string()]
+    );
     assert_eq!(
       manifest.hooks,
       vec![
@@ -221,6 +245,7 @@ mod tests {
     let map = BTreeMap::from([("semver".to_string(), "0.1.0".to_string())]);
     let manifest = ExtensionManifest::from_map(&map).unwrap();
     assert!(manifest.capabilities.is_empty());
+    assert!(manifest.provides.is_empty());
     assert!(manifest.hooks.is_empty());
     assert!(manifest.selector.is_empty());
     assert_eq!(manifest.settings, "{}");
@@ -262,13 +287,41 @@ mod tests {
   }
 
   #[test]
-  fn rejects_unknown_capabilities() {
+  fn accepts_the_known_capabilities() {
     let map = BTreeMap::from([
       ("semver".to_string(), "0.1.0".to_string()),
       ("capabilities".to_string(), r#"["log","http"]"#.to_string()),
     ]);
+    let manifest = ExtensionManifest::from_map(&map).unwrap();
+    assert_eq!(
+      manifest.capabilities,
+      vec!["log".to_string(), "http".to_string()]
+    );
+  }
+
+  #[test]
+  fn rejects_unknown_capabilities() {
+    let map = BTreeMap::from([
+      ("semver".to_string(), "0.1.0".to_string()),
+      ("capabilities".to_string(), r#"["log","dns"]"#.to_string()),
+    ]);
     let result = ExtensionManifest::from_map(&map);
-    assert!(matches!(result, Err(ExtensionError::Manifest(err)) if err.contains("http")));
+    assert!(matches!(result, Err(ExtensionError::Manifest(err)) if err.contains("dns")));
+  }
+
+  #[test]
+  fn rejects_malformed_provides_json() {
+    for bad in ["not json", r#"{"llm":true}"#, r#"[1]"#] {
+      let map = BTreeMap::from([
+        ("semver".to_string(), "0.1.0".to_string()),
+        ("provides".to_string(), bad.to_string()),
+      ]);
+      let result = ExtensionManifest::from_map(&map);
+      assert!(
+        matches!(result, Err(ExtensionError::Manifest(_))),
+        "expected manifest error for provides {bad:?}"
+      );
+    }
   }
 
   #[test]

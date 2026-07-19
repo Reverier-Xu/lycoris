@@ -62,6 +62,15 @@ impl ExtensionEngine for LuaEngine {
     }
     let source = String::from_utf8(package.artifact.clone())
       .map_err(|err| ExtensionError::Engine(format!("lua artifact is not utf-8: {err}")))?;
+    // The Lua engine has no http host capability in v1 (llm-provider design
+    // section 4 is a WASM-only surface); fail the load instead of letting the
+    // extension discover the gap at call time.
+    if package.manifest.capabilities.iter().any(|c| c == "http") {
+      return Err(ExtensionError::Engine(format!(
+        "extension {} declares the http capability, which the lua engine does not support",
+        package.id
+      )));
+    }
     let entry = package.entry.clone();
     let limits = self.limits;
 
@@ -490,5 +499,25 @@ mod tests {
     package.engine = EngineKind::Wasm;
     let result = LuaEngine::new(EngineLimits::default()).load(&package).await;
     assert!(matches!(result, Err(ExtensionError::Engine(_))));
+  }
+
+  #[tokio::test]
+  async fn load_rejects_the_http_capability() {
+    // The Lua engine has no http host capability in v1 (llm-provider design
+    // section 4 is a WASM-only surface).
+    let mut package = package("function invoke() end");
+    package.manifest = ExtensionManifest::from_map(&BTreeMap::from([
+      ("semver".to_string(), "0.1.0".to_string()),
+      ("capabilities".to_string(), r#"["http"]"#.to_string()),
+    ]))
+    .unwrap();
+    let result = LuaEngine::new(EngineLimits::default()).load(&package).await;
+    match result {
+      Err(ExtensionError::Engine(err)) => {
+        assert!(err.contains("http"), "unexpected error: {err}");
+      }
+      Err(other) => panic!("expected an engine error, got {other}"),
+      Ok(_) => panic!("expected an http capability error, but the load succeeded"),
+    }
   }
 }

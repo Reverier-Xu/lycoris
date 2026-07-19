@@ -10,6 +10,7 @@
 
 mod engine;
 mod error;
+mod http;
 mod lua;
 mod manifest;
 mod package;
