@@ -11,6 +11,7 @@ use serde_json::Value;
 #[cfg(target_arch = "wasm32")]
 #[allow(unsafe_code)] // Extern declarations of the host imports.
 mod ffi {
+  #[link(wasm_import_module = "lycoris")]
   unsafe extern "C" {
     /// `log(level: i32, ptr: i32, len: i32)` — forwarded to `tracing`.
     pub fn log(level: i32, ptr: i32, len: i32);
