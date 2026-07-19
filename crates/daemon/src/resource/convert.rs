@@ -11,14 +11,15 @@ use std::collections::HashMap;
 use lycoris_core::ResourceScope;
 use lycoris_proto::{
   node::{
-    MemoryBody, NodeBody, NodeInfo, PluginBody, Resource, ResourceKind, ResourceMetadata,
+    ExtensionBody, MemoryBody, NodeBody, NodeInfo, Resource, ResourceKind, ResourceMetadata,
     ResourceScope as ProtoResourceScope, RuleBody, SessionBody, SkillBody, WorkspaceBody,
     resource::Body,
   },
   scope_from_proto, scope_to_proto,
 };
 use lycoris_storage::{
-  MemoryEntry, PluginRecord, RuleRecord, Session, SkillRecord, VersionedResource, WorkspaceRecord,
+  ExtensionRecord, MemoryEntry, RuleRecord, Session, SkillRecord, VersionedResource,
+  WorkspaceRecord,
 };
 
 use super::error::MapperError;
@@ -196,21 +197,23 @@ pub(super) fn workspace_to_resource(workspace: WorkspaceRecord) -> Resource {
   }
 }
 
-/// Convert a stored plugin record into the wire resource.
+/// Convert a stored extension record into the wire resource.
 ///
-/// Plugin configuration lives in the manifest (design section 4), so plugin
-/// metadata carries no labels. Listings pass `None` for the artifact to keep
-/// list responses small; `get` and the anti-entropy snapshot carry the full
-/// artifact bytes.
-pub(super) fn plugin_to_resource(record: PluginRecord, artifact: Option<Vec<u8>>) -> Resource {
+/// Extension configuration lives in the manifest (design section 4), so
+/// extension metadata carries no labels. Listings pass `None` for the artifact
+/// to keep list responses small; `get` and the anti-entropy snapshot carry the
+/// full artifact bytes.
+pub(super) fn extension_to_resource(
+  record: ExtensionRecord, artifact: Option<Vec<u8>>,
+) -> Resource {
   Resource {
     metadata: Some(
-      MetadataBuilder::new(&record.id, &record.name, ResourceKind::Plugin)
+      MetadataBuilder::new(&record.id, &record.name, ResourceKind::Extension)
         .scope(record.scope, record.source_node_id.as_deref())
         .timestamps(record.created_at_ms, record.updated_at_ms)
         .build(),
     ),
-    body: Some(Body::Plugin(PluginBody {
+    body: Some(Body::Extension(ExtensionBody {
       version: record.version,
       content_hash: record.content_hash,
       engine: record.engine,
@@ -297,10 +300,10 @@ pub(super) fn resource_to_workspace(
   })
 }
 
-pub(super) fn resource_to_plugin(
-  metadata: &ResourceMetadata, body: &PluginBody,
-) -> Result<PluginRecord, MapperError> {
-  Ok(PluginRecord {
+pub(super) fn resource_to_extension(
+  metadata: &ResourceMetadata, body: &ExtensionBody,
+) -> Result<ExtensionRecord, MapperError> {
+  Ok(ExtensionRecord {
     id: metadata.id.clone(),
     name: metadata.name.clone(),
     version: body.version,
@@ -321,9 +324,9 @@ mod tests {
 
   use super::*;
 
-  fn plugin_record(manifest: BTreeMap<String, String>) -> PluginRecord {
-    PluginRecord {
-      id: "plug-1".to_string(),
+  fn extension_record(manifest: BTreeMap<String, String>) -> ExtensionRecord {
+    ExtensionRecord {
+      id: "ext-1".to_string(),
       name: "echo".to_string(),
       version: 7,
       engine: "lua".to_string(),
@@ -344,54 +347,54 @@ mod tests {
     ])
   }
 
-  /// Extract back the (metadata, plugin body) pair of a wire resource.
-  fn split(resource: &Resource) -> (&ResourceMetadata, &PluginBody) {
+  /// Extract back the (metadata, extension body) pair of a wire resource.
+  fn split(resource: &Resource) -> (&ResourceMetadata, &ExtensionBody) {
     let metadata = resource.metadata.as_ref().expect("metadata");
-    let Some(Body::Plugin(body)) = resource.body.as_ref() else {
-      panic!("expected a plugin body");
+    let Some(Body::Extension(body)) = resource.body.as_ref() else {
+      panic!("expected an extension body");
     };
     (metadata, body)
   }
 
   #[test]
-  fn plugin_conversion_round_trip() {
-    let record = plugin_record(small_manifest());
+  fn extension_conversion_round_trip() {
+    let record = extension_record(small_manifest());
     let artifact = b"return {}".to_vec();
 
-    let resource = plugin_to_resource(record.clone(), Some(artifact.clone()));
+    let resource = extension_to_resource(record.clone(), Some(artifact.clone()));
     let (metadata, body) = split(&resource);
 
-    assert_eq!(metadata.kind, ResourceKind::Plugin as i32);
+    assert_eq!(metadata.kind, ResourceKind::Extension as i32);
     assert!(metadata.labels.is_empty());
     assert_eq!(body.artifact, artifact);
-    let restored = resource_to_plugin(metadata, body).expect("convert back");
+    let restored = resource_to_extension(metadata, body).expect("convert back");
     assert_eq!(restored, record);
   }
 
   #[test]
-  fn plugin_conversion_round_trip_without_artifact() {
-    let record = plugin_record(BTreeMap::new());
+  fn extension_conversion_round_trip_without_artifact() {
+    let record = extension_record(BTreeMap::new());
 
-    let resource = plugin_to_resource(record.clone(), None);
+    let resource = extension_to_resource(record.clone(), None);
     let (metadata, body) = split(&resource);
 
     assert!(body.artifact.is_empty());
-    let restored = resource_to_plugin(metadata, body).expect("convert back");
+    let restored = resource_to_extension(metadata, body).expect("convert back");
     assert_eq!(restored, record);
   }
 
   #[test]
-  fn plugin_conversion_round_trip_with_large_manifest() {
+  fn extension_conversion_round_trip_with_large_manifest() {
     let manifest: BTreeMap<String, String> = (0..2048)
       .map(|index| (format!("key-{index}"), format!("value-{index}")))
       .collect();
-    let record = plugin_record(manifest);
+    let record = extension_record(manifest);
 
-    let resource = plugin_to_resource(record.clone(), Some(vec![0xAB; 4096]));
+    let resource = extension_to_resource(record.clone(), Some(vec![0xAB; 4096]));
     let (metadata, body) = split(&resource);
 
     assert_eq!(body.manifest.len(), 2048);
-    let restored = resource_to_plugin(metadata, body).expect("convert back");
+    let restored = resource_to_extension(metadata, body).expect("convert back");
     assert_eq!(restored, record);
   }
 }

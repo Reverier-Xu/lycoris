@@ -26,7 +26,7 @@ impl From<MapperError> for Status {
       MapperError::NotFound(_) => Status::not_found(error.to_string()),
       MapperError::Agent { context, source } => agent_storage_status(context, source),
       MapperError::Workspace { context, source } => workspace_storage_status(context, source),
-      MapperError::Plugin { context, source } => plugin_storage_status(context, source),
+      MapperError::Extension { context, source } => extension_storage_status(context, source),
     }
   }
 }
@@ -64,12 +64,12 @@ pub(crate) fn workspace_storage_status(
   }
 }
 
-/// Map a plugin-domain storage failure to a gRPC status; see
+/// Map an extension-domain storage failure to a gRPC status; see
 /// [`agent_storage_status`] for the mapping rationale.
-pub(crate) fn plugin_storage_status(
-  context: &str, error: lycoris_storage::PluginStorageError,
+pub(crate) fn extension_storage_status(
+  context: &str, error: lycoris_storage::ExtensionStorageError,
 ) -> Status {
-  use lycoris_storage::PluginStorageError as Error;
+  use lycoris_storage::ExtensionStorageError as Error;
   match &error {
     Error::HashMismatch(_) | Error::InvalidResourceId(_) => {
       Status::invalid_argument(format!("{context}: {error}"))
@@ -132,9 +132,9 @@ mod tests {
         Code::Internal,
       ),
       (
-        MapperError::Plugin {
-          context: "failed to apply remote plugin",
-          source: lycoris_storage::PluginStorageError::HashMismatch(
+        MapperError::Extension {
+          context: "failed to apply remote extension",
+          source: lycoris_storage::ExtensionStorageError::HashMismatch(
             lycoris_storage::ContentHashMismatch,
           ),
         },
@@ -165,24 +165,24 @@ mod tests {
   }
 
   #[test]
-  fn plugin_storage_status_mapping() {
-    let hash_mismatch = plugin_storage_status(
+  fn extension_storage_status_mapping() {
+    let hash_mismatch = extension_storage_status(
       "ctx",
-      lycoris_storage::PluginStorageError::HashMismatch(lycoris_storage::ContentHashMismatch),
+      lycoris_storage::ExtensionStorageError::HashMismatch(lycoris_storage::ContentHashMismatch),
     );
     assert_eq!(hash_mismatch.code(), Code::InvalidArgument);
 
-    let invalid_id = plugin_storage_status(
+    let invalid_id = extension_storage_status(
       "ctx",
-      lycoris_storage::PluginStorageError::InvalidResourceId(lycoris_storage::InvalidResourceId(
-        "a/b".to_string(),
-      )),
+      lycoris_storage::ExtensionStorageError::InvalidResourceId(
+        lycoris_storage::InvalidResourceId("a/b".to_string()),
+      ),
     );
     assert_eq!(invalid_id.code(), Code::InvalidArgument);
 
-    let storage = plugin_storage_status(
+    let storage = extension_storage_status(
       "ctx",
-      lycoris_storage::PluginStorageError::Storage(lycoris_storage::StorageError::Io(
+      lycoris_storage::ExtensionStorageError::Storage(lycoris_storage::StorageError::Io(
         std::io::Error::other("boom"),
       )),
     );

@@ -1,16 +1,16 @@
-//! Plugin error types.
+//! Extension error types.
 //!
 //! Every failure that crosses an engine boundary is reported as a structured
-//! [`PluginError`]; the host never panics on guest misbehaviour.
+//! [`ExtensionError`]; the host never panics on guest misbehaviour.
 
 use std::time::Duration;
 
 use thiserror::Error;
 
-/// Errors produced by the plugin engine layer.
+/// Errors produced by the extension engine layer.
 #[derive(Debug, Error)]
-pub enum PluginError {
-  /// The plugin manifest failed validation.
+pub enum ExtensionError {
+  /// The extension manifest failed validation.
   #[error("invalid manifest: {0}")]
   Manifest(String),
   /// The engine itself (wasmtime runtime / Lua VM setup) failed, as opposed
@@ -38,5 +38,5 @@ pub enum PluginError {
   ContentHashMismatch { expected: String, actual: String },
 }
 
-/// Convenience alias for plugin results.
-pub type Result<T> = std::result::Result<T, PluginError>;
+/// Convenience alias for extension results.
+pub type Result<T> = std::result::Result<T, ExtensionError>;

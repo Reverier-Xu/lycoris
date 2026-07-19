@@ -1,4 +1,4 @@
-//! Plugin package model: the unit that crosses storage, sync and engines.
+//! Extension package model: the unit that crosses storage, sync and engines.
 //!
 //! A package pairs the generic resource metadata (id, name, monotonic
 //! version) with the validated manifest and the raw artifact bytes. Artifact
@@ -7,19 +7,19 @@
 
 use crate::{
   engine::EngineKind,
-  error::{PluginError, Result},
-  manifest::PluginManifest,
+  error::{ExtensionError, Result},
+  manifest::ExtensionManifest,
 };
 
 /// Entry point assumed when the record leaves `entry` empty.
 pub const DEFAULT_ENTRY: &str = "invoke";
 
-/// A plugin package ready to be stored, synced or loaded.
+/// An extension package ready to be stored, synced or loaded.
 #[derive(Debug, Clone)]
-pub struct PluginPackage {
-  /// Cluster-unique plugin id.
+pub struct ExtensionPackage {
+  /// Cluster-unique extension id.
   pub id: String,
-  /// Human-facing plugin name.
+  /// Human-facing extension name.
   pub name: String,
   /// Monotonic convergence version ordered by anti-entropy.
   pub version: u64,
@@ -28,19 +28,19 @@ pub struct PluginPackage {
   /// Exported entry point name (`invoke` unless overridden).
   pub entry: String,
   /// Validated manifest.
-  pub manifest: PluginManifest,
+  pub manifest: ExtensionManifest,
   /// Raw artifact: a WASM module or Lua source.
   pub artifact: Vec<u8>,
   /// blake3 hex digest of `artifact`.
   pub content_hash: String,
 }
 
-impl PluginPackage {
+impl ExtensionPackage {
   /// Build a package, computing the content hash of the artifact. An empty
   /// `entry` falls back to [`DEFAULT_ENTRY`].
   pub fn new(
     id: String, name: String, version: u64, engine: EngineKind, entry: String,
-    manifest: PluginManifest, artifact: Vec<u8>,
+    manifest: ExtensionManifest, artifact: Vec<u8>,
   ) -> Self {
     let content_hash = hash_artifact(&artifact);
     let entry = if entry.is_empty() {
@@ -64,7 +64,7 @@ impl PluginPackage {
   pub fn verify(&self) -> Result<()> {
     let actual = hash_artifact(&self.artifact);
     if actual != self.content_hash {
-      return Err(PluginError::ContentHashMismatch {
+      return Err(ExtensionError::ContentHashMismatch {
         expected: self.content_hash.clone(),
         actual,
       });
@@ -83,18 +83,18 @@ mod tests {
   use std::collections::BTreeMap;
 
   use super::*;
-  use crate::manifest::PluginManifest;
+  use crate::manifest::ExtensionManifest;
 
-  fn manifest() -> PluginManifest {
-    PluginManifest::from_map(&BTreeMap::from([(
+  fn manifest() -> ExtensionManifest {
+    ExtensionManifest::from_map(&BTreeMap::from([(
       "semver".to_string(),
       "0.1.0".to_string(),
     )]))
     .unwrap()
   }
 
-  fn package(artifact: &[u8]) -> PluginPackage {
-    PluginPackage::new(
+  fn package(artifact: &[u8]) -> ExtensionPackage {
+    ExtensionPackage::new(
       "p1".to_string(),
       "echo".to_string(),
       1,
@@ -132,7 +132,7 @@ mod tests {
     package.artifact = b"y".to_vec();
     assert!(matches!(
       package.verify(),
-      Err(PluginError::ContentHashMismatch { .. })
+      Err(ExtensionError::ContentHashMismatch { .. })
     ));
   }
 
@@ -142,7 +142,7 @@ mod tests {
     package.content_hash = "0".repeat(64);
     assert!(matches!(
       package.verify(),
-      Err(PluginError::ContentHashMismatch { .. })
+      Err(ExtensionError::ContentHashMismatch { .. })
     ));
   }
 }

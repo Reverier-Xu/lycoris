@@ -4,7 +4,7 @@
 //! malicious id such as `../escape` would let a peer write outside the content
 //! directory. Only non-empty ASCII alphanumeric ids with `-`/`_`/`.` are
 //! accepted; any `..` sequence or leading dot is rejected. Every domain that
-//! stores content on the filesystem (skills, rules, plugin artifacts) shares
+//! stores content on the filesystem (skills, rules, extension artifacts) shares
 //! this single whitelist.
 
 /// A resource id that is not safe to use as a content-store file name.

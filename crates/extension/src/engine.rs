@@ -10,11 +10,11 @@ use std::{fmt, str::FromStr, time::Duration};
 use async_trait::async_trait;
 
 use crate::{
-  error::{PluginError, Result},
-  package::PluginPackage,
+  error::{ExtensionError, Result},
+  package::ExtensionPackage,
 };
 
-/// The execution engine backing a plugin package.
+/// The execution engine backing an extension package.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EngineKind {
   /// Core WASM module executed by wasmtime (`lycoris-abi-v1`).
@@ -40,13 +40,15 @@ impl fmt::Display for EngineKind {
 }
 
 impl FromStr for EngineKind {
-  type Err = PluginError;
+  type Err = ExtensionError;
 
   fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
     match s {
       "wasm" => Ok(Self::Wasm),
       "lua" => Ok(Self::Lua),
-      other => Err(PluginError::Manifest(format!("unknown engine: {other:?}"))),
+      other => Err(ExtensionError::Manifest(format!(
+        "unknown engine: {other:?}"
+      ))),
     }
   }
 }
@@ -78,22 +80,22 @@ impl Default for EngineLimits {
   }
 }
 
-/// An execution engine: loads [`PluginPackage`]s into runnable instances.
+/// An execution engine: loads [`ExtensionPackage`]s into runnable instances.
 #[async_trait]
-pub trait PluginEngine: Send + Sync {
+pub trait ExtensionEngine: Send + Sync {
   /// The engine kind this loader handles.
   fn kind(&self) -> EngineKind;
 
   /// Load a package into an instance, verifying the content hash, the
   /// package engine kind and all engine-specific shape (ABI exports for
   /// WASM, entry function presence for Lua).
-  async fn load(&self, package: &PluginPackage) -> Result<Box<dyn PluginInstance>>;
+  async fn load(&self, package: &ExtensionPackage) -> Result<Box<dyn ExtensionInstance>>;
 }
 
-/// A loaded plugin ready to serve invocations.
+/// A loaded extension ready to serve invocations.
 #[async_trait]
-pub trait PluginInstance: Send + Sync {
-  /// Invoke the plugin's entry point. `payload` is JSON; the return value is
+pub trait ExtensionInstance: Send + Sync {
+  /// Invoke the extension's entry point. `payload` is JSON; the return value is
   /// JSON.
   async fn invoke(&self, method: &str, payload: &[u8]) -> Result<Vec<u8>>;
 }

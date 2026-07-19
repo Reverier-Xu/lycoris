@@ -10,8 +10,8 @@
 //! Enforcement: an instruction-count hook aborts scripts that exceed the
 //! per-call instruction budget, [`Lua::set_memory_limit`] caps allocations,
 //! and every invocation is wrapped in a wall-clock deadline. Misbehaving
-//! scripts surface as [`PluginError::Script`] / [`PluginError::BudgetExceeded`]
-//! and never poison the host task.
+//! scripts surface as [`ExtensionError::Script`] /
+//! [`ExtensionError::BudgetExceeded`] and never poison the host task.
 
 use std::{
   sync::{
@@ -25,9 +25,9 @@ use async_trait::async_trait;
 use mlua::{Function, HookTriggers, Lua, LuaSerdeExt, Table, Value, VmState};
 
 use crate::{
-  engine::{EngineKind, EngineLimits, PluginEngine, PluginInstance},
-  error::{PluginError, Result},
-  package::PluginPackage,
+  engine::{EngineKind, EngineLimits, ExtensionEngine, ExtensionInstance},
+  error::{ExtensionError, Result},
+  package::ExtensionPackage,
 };
 
 /// Instruction-hook granularity: the budget is checked every this many VM
@@ -47,21 +47,21 @@ impl LuaEngine {
 }
 
 #[async_trait]
-impl PluginEngine for LuaEngine {
+impl ExtensionEngine for LuaEngine {
   fn kind(&self) -> EngineKind {
     EngineKind::Lua
   }
 
-  async fn load(&self, package: &PluginPackage) -> Result<Box<dyn PluginInstance>> {
+  async fn load(&self, package: &ExtensionPackage) -> Result<Box<dyn ExtensionInstance>> {
     package.verify()?;
     if package.engine != EngineKind::Lua {
-      return Err(PluginError::Engine(format!(
-        "plugin {} targets {:?}, not the lua engine",
+      return Err(ExtensionError::Engine(format!(
+        "extension {} targets {:?}, not the lua engine",
         package.id, package.engine
       )));
     }
     let source = String::from_utf8(package.artifact.clone())
-      .map_err(|err| PluginError::Engine(format!("lua artifact is not utf-8: {err}")))?;
+      .map_err(|err| ExtensionError::Engine(format!("lua artifact is not utf-8: {err}")))?;
     let entry = package.entry.clone();
     let limits = self.limits;
 
@@ -70,7 +70,7 @@ impl PluginEngine for LuaEngine {
     let (lua, entry_fn) =
       tokio::task::spawn_blocking(move || build_state(&source, &entry, &limits))
         .await
-        .map_err(|err| PluginError::Engine(format!("lua load task failed: {err}")))??;
+        .map_err(|err| ExtensionError::Engine(format!("lua load task failed: {err}")))??;
 
     Ok(Box::new(LuaInstance {
       lua,
@@ -81,7 +81,7 @@ impl PluginEngine for LuaEngine {
   }
 }
 
-/// A loaded Lua plugin: one sandboxed `Lua` state plus its entry function.
+/// A loaded Lua extension: one sandboxed `Lua` state plus its entry function.
 struct LuaInstance {
   lua: Lua,
   entry_fn: Function,
@@ -90,10 +90,10 @@ struct LuaInstance {
 }
 
 #[async_trait]
-impl PluginInstance for LuaInstance {
+impl ExtensionInstance for LuaInstance {
   async fn invoke(&self, method: &str, payload: &[u8]) -> Result<Vec<u8>> {
     let input: serde_json::Value = serde_json::from_slice(payload).map_err(|err| {
-      PluginError::InvalidPayload(format!("request payload is not valid JSON: {err}"))
+      ExtensionError::InvalidPayload(format!("request payload is not valid JSON: {err}"))
     })?;
 
     let lua = self.lua.clone();
@@ -104,13 +104,13 @@ impl PluginInstance for LuaInstance {
     let result = tokio::time::timeout(self.deadline, async move {
       tokio::task::spawn_blocking(move || call_entry(&lua, &entry_fn, &method, &input, budget))
         .await
-        .map_err(|err| PluginError::Engine(format!("lua invoke task failed: {err}")))?
+        .map_err(|err| ExtensionError::Engine(format!("lua invoke task failed: {err}")))?
     })
     .await;
 
     match result {
       Ok(output) => output,
-      Err(_) => Err(PluginError::Timeout(self.deadline)),
+      Err(_) => Err(ExtensionError::Timeout(self.deadline)),
     }
   }
 }
@@ -122,7 +122,7 @@ fn build_state(source: &str, entry: &str, limits: &EngineLimits) -> Result<(Lua,
   sandbox(&lua)?;
   lua
     .set_memory_limit(limits.lua_max_memory_bytes)
-    .map_err(|err| PluginError::Engine(format!("failed to set lua memory limit: {err}")))?;
+    .map_err(|err| ExtensionError::Engine(format!("failed to set lua memory limit: {err}")))?;
 
   let fired = arm_instruction_hook(&lua, limits.lua_instructions_per_call)?;
   let returned = lua.load(source).eval::<Value>();
@@ -149,7 +149,7 @@ fn build_state(source: &str, entry: &str, limits: &EngineLimits) -> Result<(Lua,
   {
     return Ok((lua, entry_fn));
   }
-  Err(PluginError::Engine(format!(
+  Err(ExtensionError::Engine(format!(
     "lua chunk defines no entry function {entry:?} (global or returned module)"
   )))
 }
@@ -159,7 +159,7 @@ fn call_entry(
   lua: &Lua, entry_fn: &Function, method: &str, input: &serde_json::Value, budget: u64,
 ) -> Result<Vec<u8>> {
   let payload = lua.to_value(input).map_err(|err| {
-    PluginError::InvalidPayload(format!("failed to bridge payload to lua: {err}"))
+    ExtensionError::InvalidPayload(format!("failed to bridge payload to lua: {err}"))
   })?;
 
   let fired = arm_instruction_hook(lua, budget)?;
@@ -172,13 +172,13 @@ fn call_entry(
   };
 
   let json: serde_json::Value = lua.from_value(output).map_err(|err| {
-    PluginError::InvalidPayload(format!("guest returned a non-JSON value: {err}"))
+    ExtensionError::InvalidPayload(format!("guest returned a non-JSON value: {err}"))
   })?;
   serde_json::to_vec(&json)
-    .map_err(|err| PluginError::InvalidPayload(format!("failed to encode guest output: {err}")))
+    .map_err(|err| ExtensionError::InvalidPayload(format!("failed to encode guest output: {err}")))
 }
 
-/// Strip the freshly created state down to the plugin sandbox (design
+/// Strip the freshly created state down to the extension sandbox (design
 /// document section 5.3). `Lua::new()` loads mlua's "safe" stdlib subset,
 /// which still includes `io` and the full `os` library, so the hardening
 /// below is mandatory, not defensive.
@@ -223,7 +223,7 @@ fn arm_instruction_hook(lua: &Lua, budget: u64) -> Result<Arc<AtomicU64>> {
         }
       },
     )
-    .map_err(|err| PluginError::Engine(format!("failed to arm instruction hook: {err}")))?;
+    .map_err(|err| ExtensionError::Engine(format!("failed to arm instruction hook: {err}")))?;
   Ok(fired)
 }
 
@@ -232,26 +232,26 @@ fn allowed_hook_fires(budget: u64) -> u64 {
   budget.div_ceil(u64::from(HOOK_GRANULARITY))
 }
 
-/// Map a Lua failure onto the plugin error taxonomy: budget exhaustion beats
+/// Map a Lua failure onto the extension error taxonomy: budget exhaustion beats
 /// script errors when the hook tripped, allocation failures are budget
 /// failures, everything else is a plain script error.
-fn classify_script_error(err: mlua::Error, fired: &AtomicU64, budget: u64) -> PluginError {
+fn classify_script_error(err: mlua::Error, fired: &AtomicU64, budget: u64) -> ExtensionError {
   if fired.load(Ordering::Relaxed) > allowed_hook_fires(budget) {
-    return PluginError::BudgetExceeded(format!(
+    return ExtensionError::BudgetExceeded(format!(
       "lua instruction budget of {budget} instructions exceeded"
     ));
   }
   match err {
     mlua::Error::MemoryError(message) => {
-      PluginError::BudgetExceeded(format!("lua memory budget exceeded: {message}"))
+      ExtensionError::BudgetExceeded(format!("lua memory budget exceeded: {message}"))
     }
-    other => PluginError::Script(other.to_string()),
+    other => ExtensionError::Script(other.to_string()),
   }
 }
 
 /// Map a sandbox/setup failure (host-side, not guest code).
-fn engine_err(err: mlua::Error) -> PluginError {
-  PluginError::Engine(format!("failed to prepare lua state: {err}"))
+fn engine_err(err: mlua::Error) -> ExtensionError {
+  ExtensionError::Engine(format!("failed to prepare lua state: {err}"))
 }
 
 #[cfg(test)]
@@ -259,20 +259,20 @@ mod tests {
   use std::collections::BTreeMap;
 
   use super::*;
-  use crate::manifest::PluginManifest;
+  use crate::manifest::ExtensionManifest;
 
-  fn manifest() -> PluginManifest {
-    PluginManifest::from_map(&BTreeMap::from([(
+  fn manifest() -> ExtensionManifest {
+    ExtensionManifest::from_map(&BTreeMap::from([(
       "semver".to_string(),
       "0.1.0".to_string(),
     )]))
     .unwrap()
   }
 
-  fn package(source: &str) -> PluginPackage {
-    PluginPackage::new(
+  fn package(source: &str) -> ExtensionPackage {
+    ExtensionPackage::new(
       "test".to_string(),
-      "test-plugin".to_string(),
+      "test-extension".to_string(),
       1,
       EngineKind::Lua,
       String::new(),
@@ -281,7 +281,7 @@ mod tests {
     )
   }
 
-  async fn load(source: &str) -> Box<dyn PluginInstance> {
+  async fn load(source: &str) -> Box<dyn ExtensionInstance> {
     LuaEngine::new(EngineLimits::default())
       .load(&package(source))
       .await
@@ -326,9 +326,9 @@ mod tests {
 
   #[tokio::test]
   async fn custom_entry_name_is_respected() {
-    let package = PluginPackage::new(
+    let package = ExtensionPackage::new(
       "test".to_string(),
-      "test-plugin".to_string(),
+      "test-extension".to_string(),
       1,
       EngineKind::Lua,
       "handle".to_string(),
@@ -347,7 +347,7 @@ mod tests {
   async fn script_errors_surface_as_the_script_variant() {
     let instance = load("function invoke() error('boom') end").await;
     let result = instance.invoke("m", b"{}").await;
-    assert!(matches!(result, Err(PluginError::Script(err)) if err.contains("boom")));
+    assert!(matches!(result, Err(ExtensionError::Script(err)) if err.contains("boom")));
   }
 
   #[tokio::test]
@@ -355,7 +355,7 @@ mod tests {
     let result = LuaEngine::new(EngineLimits::default())
       .load(&package("this is not lua"))
       .await;
-    assert!(matches!(result, Err(PluginError::Script(_))));
+    assert!(matches!(result, Err(ExtensionError::Script(_))));
   }
 
   #[tokio::test]
@@ -367,7 +367,7 @@ mod tests {
     let package = package("function invoke() while true do end end");
     let instance = LuaEngine::new(limits).load(&package).await.unwrap();
     let result = instance.invoke("m", b"{}").await;
-    assert!(matches!(result, Err(PluginError::BudgetExceeded(_))));
+    assert!(matches!(result, Err(ExtensionError::BudgetExceeded(_))));
   }
 
   #[tokio::test]
@@ -378,7 +378,7 @@ mod tests {
     };
     let package = package("while true do end");
     let result = LuaEngine::new(limits).load(&package).await;
-    assert!(matches!(result, Err(PluginError::BudgetExceeded(_))));
+    assert!(matches!(result, Err(ExtensionError::BudgetExceeded(_))));
   }
 
   #[tokio::test]
@@ -391,7 +391,7 @@ mod tests {
     let package = package("function invoke() return string.rep('x', 10 * 1024 * 1024) end");
     let instance = LuaEngine::new(limits).load(&package).await.unwrap();
     let result = instance.invoke("m", b"{}").await;
-    assert!(matches!(result, Err(PluginError::BudgetExceeded(_))));
+    assert!(matches!(result, Err(ExtensionError::BudgetExceeded(_))));
   }
 
   #[tokio::test]
@@ -435,14 +435,14 @@ mod tests {
   async fn non_json_input_is_an_invalid_payload() {
     let instance = load("function invoke(method, payload) return payload end").await;
     let result = instance.invoke("m", b"not json").await;
-    assert!(matches!(result, Err(PluginError::InvalidPayload(_))));
+    assert!(matches!(result, Err(ExtensionError::InvalidPayload(_))));
   }
 
   #[tokio::test]
   async fn non_json_guest_output_is_an_invalid_payload() {
     let instance = load("function invoke() return function() end end").await;
     let result = instance.invoke("m", b"{}").await;
-    assert!(matches!(result, Err(PluginError::InvalidPayload(_))));
+    assert!(matches!(result, Err(ExtensionError::InvalidPayload(_))));
   }
 
   #[tokio::test]
@@ -472,7 +472,7 @@ mod tests {
     let result = LuaEngine::new(EngineLimits::default()).load(&package).await;
     assert!(matches!(
       result,
-      Err(PluginError::ContentHashMismatch { .. })
+      Err(ExtensionError::ContentHashMismatch { .. })
     ));
   }
 
@@ -481,7 +481,7 @@ mod tests {
     let result = LuaEngine::new(EngineLimits::default())
       .load(&package("local x = 1"))
       .await;
-    assert!(matches!(result, Err(PluginError::Engine(_))));
+    assert!(matches!(result, Err(ExtensionError::Engine(_))));
   }
 
   #[tokio::test]
@@ -489,6 +489,6 @@ mod tests {
     let mut package = package("function invoke() end");
     package.engine = EngineKind::Wasm;
     let result = LuaEngine::new(EngineLimits::default()).load(&package).await;
-    assert!(matches!(result, Err(PluginError::Engine(_))));
+    assert!(matches!(result, Err(ExtensionError::Engine(_))));
   }
 }

@@ -4204,14 +4204,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "lycoris-membership"
-version = "0.1.0"
-dependencies = [
- "blake3",
-]
-
-[[package]]
-name = "lycoris-plugin"
+name = "lycoris-extension"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -4225,6 +4218,13 @@ dependencies = [
  "tracing",
  "wasmtime",
  "wat",
+]
+
+[[package]]
+name = "lycoris-membership"
+version = "0.1.0"
+dependencies = [
+ "blake3",
 ]
 
 [[package]]

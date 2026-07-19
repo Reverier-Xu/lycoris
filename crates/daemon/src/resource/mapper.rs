@@ -14,14 +14,14 @@ use std::{
 use lycoris_core::ResourceScope;
 use lycoris_proto::node::{Resource, ResourceKind, resource::Body};
 use lycoris_storage::{
-  AgentStorageError, MemoryEntry, PluginRecord, PluginStorageError, Storage, VersionedContentStore,
-  VersionedStorage, WorkspaceRecord, WorkspaceStorageError,
+  AgentStorageError, ExtensionRecord, ExtensionStorageError, MemoryEntry, Storage,
+  VersionedContentStore, VersionedStorage, WorkspaceRecord, WorkspaceStorageError,
 };
 
 use super::{
   convert::{
-    VersionedKind, decode_kind, memory_to_resource, metadata_scope, node_to_resource,
-    plugin_to_resource, resource_to_memory, resource_to_plugin, resource_to_rule,
+    VersionedKind, decode_kind, extension_to_resource, memory_to_resource, metadata_scope,
+    node_to_resource, resource_to_extension, resource_to_memory, resource_to_rule,
     resource_to_skill, resource_to_workspace, session_to_resource, versioned_to_resource,
     workspace_to_resource,
   },
@@ -100,9 +100,9 @@ where
   }
 }
 
-/// Plugin records carry no user labels — plugin configuration lives in the
-/// manifest (design section 4) — so label selectors match plugins only when
-/// empty.
+/// Extension records carry no user labels — extension configuration lives in
+/// the manifest (design section 4) — so label selectors match extensions only
+/// when empty.
 static EMPTY_LABELS: BTreeMap<String, String> = BTreeMap::new();
 
 /// Filter stored records by the label selector and map them onto resources.
@@ -165,15 +165,15 @@ impl ResourceMapper {
       }
       ResourceKind::Skill => self.list_versioned(VersionedKind::Skill, &selector, scope),
       ResourceKind::Rule => self.list_versioned(VersionedKind::Rule, &selector, scope),
-      ResourceKind::Plugin => {
-        let plugins = self
-          .list_plugins(scope)
-          .map_err(MapperError::plugin("failed to list plugins"))?;
+      ResourceKind::Extension => {
+        let extensions = self
+          .list_extensions(scope)
+          .map_err(MapperError::extension("failed to list extensions"))?;
         Ok(collect_matching(
-          plugins,
+          extensions,
           &selector,
           |_| &EMPTY_LABELS,
-          |record| plugin_to_resource(record, None),
+          |record| extension_to_resource(record, None),
         ))
       }
       ResourceKind::Workspace => {
@@ -222,20 +222,20 @@ impl ResourceMapper {
       }
       ResourceKind::Skill => self.get_versioned(VersionedKind::Skill, id),
       ResourceKind::Rule => self.get_versioned(VersionedKind::Rule, id),
-      ResourceKind::Plugin => {
+      ResourceKind::Extension => {
         let record = self
           .storage
-          .plugins()
+          .extensions()
           .get(id)
-          .map_err(MapperError::plugin("failed to get plugin"))?
+          .map_err(MapperError::extension("failed to get extension"))?
           .ok_or_else(|| MapperError::NotFound(id.to_string()))?;
         let artifact = self
           .storage
-          .plugins()
+          .extensions()
           .blobs()
           .read(id)
-          .map_err(MapperError::plugin("failed to read plugin artifact"))?;
-        Ok(plugin_to_resource(record, artifact))
+          .map_err(MapperError::extension("failed to read extension artifact"))?;
+        Ok(extension_to_resource(record, artifact))
       }
       ResourceKind::Workspace => {
         let workspace = self
@@ -276,15 +276,15 @@ impl ResourceMapper {
     )
   }
 
-  fn list_plugins(
+  fn list_extensions(
     &self, scope: Option<ResourceScope>,
-  ) -> Result<Vec<PluginRecord>, PluginStorageError> {
-    let plugins = self.storage.plugins();
+  ) -> Result<Vec<ExtensionRecord>, ExtensionStorageError> {
+    let extensions = self.storage.extensions();
     list_by_scope(
       scope,
-      || plugins.list_shared(),
-      || plugins.list_local(),
-      || plugins.list(),
+      || extensions.list_shared(),
+      || extensions.list_local(),
+      || extensions.list(),
     )
   }
 
@@ -382,13 +382,13 @@ impl ResourceMapper {
           .apply_remote_workspace(record)
           .map_err(MapperError::workspace("failed to apply remote workspace"))?;
       }
-      (ResourceKind::Plugin, Some(Body::Plugin(body))) => {
-        let record = resource_to_plugin(metadata, body)?;
+      (ResourceKind::Extension, Some(Body::Extension(body))) => {
+        let record = resource_to_extension(metadata, body)?;
         self
           .storage
-          .plugins()
-          .apply_remote_plugin(record, &body.artifact)
-          .map_err(MapperError::plugin("failed to apply remote plugin"))?;
+          .extensions()
+          .apply_remote_extension(record, &body.artifact)
+          .map_err(MapperError::extension("failed to apply remote extension"))?;
       }
       (ResourceKind::Node | ResourceKind::Session, _) => {
         return Err(MapperError::NotSynchronized { kind });
@@ -447,19 +447,19 @@ impl ResourceMapper {
       }
     }
 
-    let plugins = self
+    let extensions = self
       .storage
-      .plugins()
+      .extensions()
       .list_shared()
-      .map_err(MapperError::plugin("failed to list shared plugins"))?;
-    for record in plugins {
+      .map_err(MapperError::extension("failed to list shared extensions"))?;
+    for record in extensions {
       let artifact = self
         .storage
-        .plugins()
+        .extensions()
         .blobs()
         .read(&record.id)
-        .map_err(MapperError::plugin("failed to read plugin artifact"))?;
-      resources.push(plugin_to_resource(record, artifact));
+        .map_err(MapperError::extension("failed to read extension artifact"))?;
+      resources.push(extension_to_resource(record, artifact));
     }
 
     Ok(resources)
@@ -470,7 +470,7 @@ impl ResourceMapper {
 mod tests {
   use lycoris_membership::SwimConfig;
   use lycoris_proto::node::{
-    MemoryBody, PluginBody, ResourceMetadata, ResourceScope as ProtoResourceScope, WorkspaceBody,
+    ExtensionBody, MemoryBody, ResourceMetadata, ResourceScope as ProtoResourceScope, WorkspaceBody,
   };
   use lycoris_storage::DEFAULT_EMBEDDING_DIM;
   use tempfile::TempDir;
@@ -572,19 +572,19 @@ mod tests {
     assert!(matches!(stored.body, Some(Body::Memory(_))));
   }
 
-  fn plugin_resource(id: &str, scope: ProtoResourceScope, artifact: &[u8]) -> Resource {
+  fn extension_resource(id: &str, scope: ProtoResourceScope, artifact: &[u8]) -> Resource {
     Resource {
       metadata: Some(ResourceMetadata {
         id: id.to_string(),
-        name: format!("plugin-{id}"),
-        kind: ResourceKind::Plugin as i32,
+        name: format!("extension-{id}"),
+        kind: ResourceKind::Extension as i32,
         scope: scope as i32,
         source_node_id: "peer".to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         ..ResourceMetadata::default()
       }),
-      body: Some(Body::Plugin(PluginBody {
+      body: Some(Body::Extension(ExtensionBody {
         version: 1,
         content_hash: blake3::hash(artifact).to_hex().to_string(),
         engine: "lua".to_string(),
@@ -595,20 +595,20 @@ mod tests {
     }
   }
 
-  fn plugin_body(resource: &Resource) -> &PluginBody {
-    let Some(Body::Plugin(body)) = resource.body.as_ref() else {
-      panic!("expected a plugin body");
+  fn extension_body(resource: &Resource) -> &ExtensionBody {
+    let Some(Body::Extension(body)) = resource.body.as_ref() else {
+      panic!("expected an extension body");
     };
     body
   }
 
   #[tokio::test]
-  async fn apply_resource_stores_valid_shared_plugin() {
+  async fn apply_resource_stores_valid_shared_extension() {
     let (_dir, mapper) = test_mapper();
     let artifact = b"return { echo = true }";
     mapper
-      .apply_resource(&plugin_resource(
-        "plug-1",
+      .apply_resource(&extension_resource(
+        "ext-1",
         ProtoResourceScope::ClusterShared,
         artifact,
       ))
@@ -616,14 +616,14 @@ mod tests {
       .unwrap();
 
     let stored = mapper
-      .get(ResourceKind::Plugin, "plug-1")
+      .get(ResourceKind::Extension, "ext-1")
       .await
-      .expect("get plugin");
+      .expect("get extension");
     let metadata = stored.metadata.as_ref().expect("metadata");
-    assert_eq!(metadata.name, "plugin-plug-1");
+    assert_eq!(metadata.name, "extension-ext-1");
     assert_eq!(metadata.created_at_ms, 1);
     assert_eq!(metadata.source_node_id, "peer");
-    let body = plugin_body(&stored);
+    let body = extension_body(&stored);
     assert_eq!(body.artifact, artifact);
     assert_eq!(body.engine, "lua");
     assert_eq!(body.entry, "invoke");
@@ -631,14 +631,14 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn apply_resource_rejects_non_shared_plugin() {
+  async fn apply_resource_rejects_non_shared_extension() {
     let (_dir, mapper) = test_mapper();
     for scope in [
       ProtoResourceScope::NodeLocal,
       ProtoResourceScope::Unspecified,
     ] {
       let error = mapper
-        .apply_resource(&plugin_resource("plug-local", scope, b"x"))
+        .apply_resource(&extension_resource("ext-local", scope, b"x"))
         .await
         .unwrap_err();
       assert!(
@@ -649,32 +649,32 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn apply_resource_rejects_plugin_hash_mismatch() {
+  async fn apply_resource_rejects_extension_hash_mismatch() {
     let (_dir, mapper) = test_mapper();
-    let mut resource = plugin_resource("plug-hash", ProtoResourceScope::ClusterShared, b"real");
-    plugin_body_mut(&mut resource).content_hash = "wrong-hash".to_string();
+    let mut resource = extension_resource("ext-hash", ProtoResourceScope::ClusterShared, b"real");
+    extension_body_mut(&mut resource).content_hash = "wrong-hash".to_string();
 
     let error = mapper.apply_resource(&resource).await.unwrap_err();
-    assert!(matches!(error, MapperError::Plugin { .. }));
+    assert!(matches!(error, MapperError::Extension { .. }));
     assert!(matches!(
-      mapper.get(ResourceKind::Plugin, "plug-hash").await,
+      mapper.get(ResourceKind::Extension, "ext-hash").await,
       Err(MapperError::NotFound(_))
     ));
   }
 
-  fn plugin_body_mut(resource: &mut Resource) -> &mut PluginBody {
-    let Some(Body::Plugin(body)) = resource.body.as_mut() else {
-      panic!("expected a plugin body");
+  fn extension_body_mut(resource: &mut Resource) -> &mut ExtensionBody {
+    let Some(Body::Extension(body)) = resource.body.as_mut() else {
+      panic!("expected an extension body");
     };
     body
   }
 
   #[tokio::test]
-  async fn list_plugins_filters_by_scope_and_selector() {
+  async fn list_extensions_filters_by_scope_and_selector() {
     let (_dir, mapper) = test_mapper();
-    for (id, artifact) in [("plug-a", b"a" as &[u8]), ("plug-b", b"b")] {
+    for (id, artifact) in [("ext-a", b"a" as &[u8]), ("ext-b", b"b")] {
       mapper
-        .apply_resource(&plugin_resource(
+        .apply_resource(&extension_resource(
           id,
           ProtoResourceScope::ClusterShared,
           artifact,
@@ -684,18 +684,18 @@ mod tests {
     }
 
     let all = mapper
-      .list(ResourceKind::Plugin, HashMap::new(), None)
+      .list(ResourceKind::Extension, HashMap::new(), None)
       .await
       .unwrap();
     assert_eq!(all.len(), 2);
     // Listings stay artifact-free; `get` carries the full artifact.
     for resource in &all {
-      assert!(plugin_body(resource).artifact.is_empty());
+      assert!(extension_body(resource).artifact.is_empty());
     }
 
     let shared = mapper
       .list(
-        ResourceKind::Plugin,
+        ResourceKind::Extension,
         HashMap::new(),
         Some(ResourceScope::ClusterShared),
       )
@@ -704,7 +704,7 @@ mod tests {
     assert_eq!(shared.len(), 2);
     let local = mapper
       .list(
-        ResourceKind::Plugin,
+        ResourceKind::Extension,
         HashMap::new(),
         Some(ResourceScope::NodeLocal),
       )
@@ -712,10 +712,10 @@ mod tests {
       .unwrap();
     assert!(local.is_empty());
 
-    // Plugins carry no labels, so a non-empty selector matches nothing.
+    // Extensions carry no labels, so a non-empty selector matches nothing.
     let selected = mapper
       .list(
-        ResourceKind::Plugin,
+        ResourceKind::Extension,
         HashMap::from([("a".to_string(), "b".to_string())]),
         None,
       )
@@ -725,11 +725,11 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn local_shared_resources_include_plugin_artifacts() {
+  async fn local_shared_resources_include_extension_artifacts() {
     let (_dir, mapper) = test_mapper();
     mapper
-      .apply_resource(&plugin_resource(
-        "plug-sync",
+      .apply_resource(&extension_resource(
+        "ext-sync",
         ProtoResourceScope::ClusterShared,
         b"sync-me",
       ))
@@ -737,10 +737,10 @@ mod tests {
       .unwrap();
 
     let resources = mapper.local_shared_resources().await.unwrap();
-    let plugin = resources
+    let extension = resources
       .iter()
-      .find(|resource| matches!(resource.body, Some(Body::Plugin(_))))
-      .expect("a plugin resource");
-    assert_eq!(plugin_body(plugin).artifact, b"sync-me");
+      .find(|resource| matches!(resource.body, Some(Body::Extension(_))))
+      .expect("an extension resource");
+    assert_eq!(extension_body(extension).artifact, b"sync-me");
   }
 }

@@ -1,36 +1,40 @@
-# Plugin System Design
+# Extension System Design
+
+Short form: **ext** — used wherever a compact spelling is needed (capability
+annotation prefix `ext.<id>`, CLI shorthand, log fields); the feature name
+itself is **extension**.
 
 Status: architecture v1 (this document is the design contract for the initial
-implementation; the implementation ships no production plugins).
+implementation; the implementation ships no production extensions).
 
 ## 1. Goals and non-goals
 
-Plugins extend the agent workflow: modular skill execution, agent hooks,
-capability providers (e.g. an LLM API provider). The cluster must treat plugin
-code and plugin configuration as shared state: both are synchronized to every
-node, and every node independently decides — via label selectors — whether and
-how a plugin runs locally.
+Extensions extend the agent workflow: modular skill execution, agent hooks,
+capability providers (e.g. an LLM API provider). The cluster must treat
+extension code and extension configuration as shared state: both are
+synchronized to every node, and every node independently decides — via label
+selectors — whether and how an extension runs locally.
 
 Goals:
 
 - Two execution engines with one common invocation contract:
   - **WASM** for complex, performance- and stability-critical, properly
     versioned packages.
-  - **Embedded script (Lua)** for small, fast-iterating plugins.
-- Registered plugins are callable through a proto API on the unified node API
-  server.
-- Hook awareness is driven by configuration (the plugin manifest), not by
+  - **Embedded script (Lua)** for small, fast-iterating extensions.
+- Registered extensions are callable through a proto API on the unified node
+  API server.
+- Hook awareness is driven by configuration (the extension manifest), not by
   code changes on the host.
-- Cluster-wide sync of plugin packages and configs, reusing the existing
+- Cluster-wide sync of extension packages and configs, reusing the existing
   resource anti-entropy pipeline.
-- Label selectors in plugin config decide per-node activation.
-- Automatic routing: a call for a plugin that does not run locally is
+- Label selectors in extension config decide per-node activation.
+- Automatic routing: a call for an extension that does not run locally is
   forwarded to the best node that advertises it.
 
 Non-goals (v1):
 
-- No production plugins (an LLM provider is the motivating example only).
-- No plugin marketplace/distribution channel; packages enter the cluster
+- No production extensions (an LLM provider is the motivating example only).
+- No extension marketplace/distribution channel; packages enter the cluster
   through the resource API like skills/rules.
 - No host-service matrix beyond logging (HTTP and friends are declared as
   capabilities in the manifest but not implemented yet).
@@ -65,37 +69,37 @@ Alternatives considered and rejected:
 ```
                  ┌────────────────────────── node ───────────────────────────┐
                  │                                                           │
- CLI / other ───►│  PluginService (proto, cluster-key interceptor)           │
+ CLI / other ───►│  ExtensionService (proto, cluster-key interceptor)        │
  cluster nodes   │        │                                                  │
                  │        ▼                                                  │
-                 │  PluginManager ──reconcile──► PluginRegistry (storage)    │
-                 │        │  label selector            ▲                     │
+                 │  ExtensionManager ──reconcile──► ExtensionRegistry        │
+                 │        │  label selector       (storage) ▲                │
                  │        ▼                             │ anti-entropy       │
                  │  ┌─────────────┐   ┌─────────────┐  │ (ResourceKind::    │
-                 │  │ WasmEngine  │   │ LuaEngine   │  │  PLUGIN, §4)       │
+                 │  │ WasmEngine  │   │ LuaEngine   │  │  EXTENSION, §4)    │
                  │  └─────────────┘   └─────────────┘  │                    │
                  │        │                 │          │                    │
                  │  capability announcement ▼          │                    │
                  │  MembershipService: local register annotations           │
                  │        │                                                │
                  └────────┼────────────────────────────────────────────────┘
-                          │ gossip (plugin.<id>=<version>)
+                          │ gossip (ext.<id>=<version>)
                           ▼
                     other nodes → routing table for forwarding (§7)
 ```
 
 Data plane and control plane are deliberately separate:
 
-- **Control plane** (what exists, what should run): plugin records and configs
-  are cluster-shared resources; every node converges on the same set.
+- **Control plane** (what exists, what should run): extension records and
+  configs are cluster-shared resources; every node converges on the same set.
 - **Data plane** (execution): each node runs its own engine instances; calls
   are served locally or forwarded one hop to a capable peer.
 
 ## 4. Package model, storage and sync
 
-A plugin package is one resource:
+An extension package is one resource:
 
-- `ResourceKind::PLUGIN` with a `PluginBody`:
+- `ResourceKind::EXTENSION` with an `ExtensionBody`:
   - `version: u64` — monotonic, used by anti-entropy convergence.
   - `content_hash: string` — blake3 of `artifact`.
   - `engine: string` — `"wasm" | "lua"`.
@@ -103,44 +107,44 @@ A plugin package is one resource:
   - `artifact: bytes` — wasm module or Lua source.
   - `manifest: map<string, string>` — everything else: `semver`, `capabilities`
     (JSON array), `hooks` (JSON array of hook points), `selector` (JSON map),
-    `settings` (opaque JSON passed to the plugin).
+    `settings` (opaque JSON passed to the extension).
 - Generic metadata (`id`, `name`, `labels`, `scope`, `source_node_id`,
   timestamps) rides in `ResourceMetadata`, exactly like skills/rules.
 
-Storage (new `plugin` domain in `lycoris-storage`):
+Storage (new `extension` domain in `lycoris-storage`):
 
-- `PluginRecord` (redb): id, name, version, engine, entry, content_hash,
+- `ExtensionRecord` (redb): id, name, version, engine, entry, content_hash,
   scope, source_node_id, created/updated, manifest (BTreeMap — deterministic
   postcard encoding, same lesson as `WorkspaceRecord`). Implements
   `VersionedRecord`, so the existing apply pipeline (`should_apply_versioned`,
   per-domain mutex, content-before-metadata ordering) is reused unchanged.
-- `PluginBlobStore`: artifact bytes under `data_dir/plugins/blobs/<id>`,
+- `ExtensionBlobStore`: artifact bytes under `data_dir/extensions/blobs/<id>`,
   written *before* the metadata record (same failure atomicity as workspace),
   id whitelist identical to the content-store validation. Not git: artifacts
   are immutable, content-addressed bytes; history lives in the version
   sequence, not in a VCS.
 
-Sync: no new protocol. `ResourceMapper` learns the PLUGIN kind (list/get/
-apply/local_shared_resources), so plugin packages replicate through the
+Sync: no new protocol. `ResourceMapper` learns the EXTENSION kind (list/get/
+apply/local_shared_resources), so extension packages replicate through the
 existing 5-second resource anti-entropy and the `SyncResources` RPC.
 
 ## 5. Execution engines
 
-### 5.1 Common contract (`lycoris-plugin` crate)
+### 5.1 Common contract (`lycoris-extension` crate)
 
 ```rust
 pub enum EngineKind { Wasm, Lua }
 
-pub struct PluginPackage { /* record + artifact bytes */ }
+pub struct ExtensionPackage { /* record + artifact bytes */ }
 
 #[async_trait]
-pub trait PluginEngine: Send + Sync {
+pub trait ExtensionEngine: Send + Sync {
     fn kind(&self) -> EngineKind;
-    async fn load(&self, package: &PluginPackage) -> Result<Box<dyn PluginInstance>>;
+    async fn load(&self, package: &ExtensionPackage) -> Result<Box<dyn ExtensionInstance>>;
 }
 
 #[async_trait]
-pub trait PluginInstance: Send + Sync {
+pub trait ExtensionInstance: Send + Sync {
     /// `payload` is JSON; the return value is JSON.
     async fn invoke(&self, method: &str, payload: &[u8]) -> Result<Vec<u8>>;
 }
@@ -169,7 +173,7 @@ Host imports (`lycoris` module):
 Limits (from daemon config, §9): fuel per call (deterministic timeout),
 max linear memory, per-call wall-clock deadline enforced via fuel + async
 preemption. A guest that exceeds any limit traps; the trap surfaces as a
-structured `PluginError::GuestTrap`, never as a host panic.
+structured `ExtensionError::GuestTrap`, never as a host panic.
 
 ### 5.3 Lua engine
 
@@ -177,63 +181,63 @@ structured `PluginError::GuestTrap`, never as a host panic.
 
 - Sandbox: `Lua::new()` stdlib minus `io`/`debug`/`loadlib`; `os` restricted
   to `time`/`clock`; `package` path cleared. Each instance gets a fresh,
-  isolated `Lua` state — no shared globals between plugins.
+  isolated `Lua` state — no shared globals between extensions.
 - Shape: the chunk returns a table (or defines a global) with
   `invoke(method, payload) -> payload`; payloads cross the boundary as Lua
   values via mlua's serde bridge (JSON `Value` ⇄ Lua value).
 - Limits: instruction-count hook (`Lua::set_hook`) aborting after a configured
   instruction budget; `Lua::set_memory_limit`; per-call deadline.
 - A misbehaving script raises a Lua error, caught at the boundary and
-  returned as `PluginError::Script`; the host task is never poisoned.
+  returned as `ExtensionError::Script`; the host task is never poisoned.
 
-## 6. Selector-driven activation (`PluginManager`)
+## 6. Selector-driven activation (`ExtensionManager`)
 
-The manager reconciles the desired set (all synced plugin records) with the
-running set:
+The manager reconciles the desired set (all synced extension records) with
+the running set:
 
-1. Read the plugin's `selector` from its manifest.
+1. Read the extension's `selector` from its manifest.
 2. Evaluate it with the existing `matches_selector` against the **node's own
    labels** (the same labels the node registers into membership).
 3. Outcomes: match → load & serve; no match → ensure unloaded (the node
-   neither serves nor advertises the plugin).
+   neither serves nor advertises the extension).
 4. Engine-level config (`settings` in the manifest) is passed to the instance
    at load time.
 
 Reconcile triggers: a `tokio::sync::Notify` fired by the resource-apply path
-whenever a PLUGIN resource changes, plus a periodic 30 s safety-net pass.
+whenever an EXTENSION resource changes, plus a periodic 30 s safety-net pass.
 Loads are lazy-safe: a failed load is logged and retried on the next trigger;
 it never blocks reconcile.
 
 ## 7. Capability announcement and routing
 
 Announcement: after each reconcile, the manager computes the set
-`{plugin.<id> = <semver>}` for locally running plugins and pushes it into the
+`{ext.<id> = <semver>}` for locally running extensions and pushes it into the
 local member register's annotations via a new
 `MembershipService::update_local_metadata` (labels stay untouched; the
 heartbeat bump gossips the change through the existing Alive path). Capability
 annotations are runtime-derived; they are *not* persisted into the node's
 configured annotations.
 
-Routing for `PluginService.Invoke`:
+Routing for `ExtensionService.Invoke`:
 
-1. If the plugin runs locally → execute and return.
+1. If the extension runs locally → execute and return.
 2. Else collect candidates from membership registers: state `Active` and an
-   annotation `plugin.<id>` present. Order candidates by the existing peer
+   annotation `ext.<id>` present. Order candidates by the existing peer
    policy (`peers::targets`: primary first, most-recently-seen first, failure
    backoff) — v1's definition of "nearest".
 3. Forward via `PeerPool` with `origin_node_id` set. The receiving node
    executes locally and **never re-forwards** (hop limit 1): a request with
    `origin_node_id` set that still finds no local instance fails with
    `FAILED_PRECONDITION` instead of looping.
-4. No candidates → `NOT_FOUND` ("no node currently serves plugin X").
+4. No candidates → `NOT_FOUND` ("no node currently serves extension X").
 
-`Sync`/`Membership` stay mTLS-only; `PluginService` sits behind the
-cluster-key interceptor like `Cluster` — invoking plugins is an
+`Sync`/`Membership` stay mTLS-only; `ExtensionService` sits behind the
+cluster-key interceptor like `Cluster` — invoking extensions is an
 admission-level operation, and forwarded calls reuse the daemon's cluster key.
 
 ## 8. Version management policy
 
-- Convergence version: monotonic `u64` per plugin id (same model as
+- Convergence version: monotonic `u64` per extension id (same model as
   skills/rules) — this is what anti-entropy orders by.
 - Human version: `semver` string in the manifest, validated at ingest;
   announced in capability annotations so callers can make compatibility
@@ -249,7 +253,7 @@ admission-level operation, and forwarded calls reuse the daemon's cluster key.
 Daemon TOML (node-local engine limits only):
 
 ```toml
-[plugins]
+[extensions]
 wasm_fuel_per_call = 5_000_000
 wasm_max_memory_bytes = 67_108_864   # 64 MiB
 lua_instructions_per_call = 1_000_000
@@ -257,15 +261,15 @@ lua_max_memory_bytes = 33_554_432    # 32 MiB
 invoke_timeout_ms = 10_000
 ```
 
-Everything per-plugin (selector, hooks, capabilities, settings) lives in the
-cluster-synced manifest, not in node config — nodes differ only through
+Everything per-extension (selector, hooks, capabilities, settings) lives in
+the cluster-synced manifest, not in node config — nodes differ only through
 labels, which is what makes selector-based activation meaningful.
 
 Hook dispatch: the manifest's `hooks` array names hook points
 (`"skill.invoke.pre"`, `"llm.call.post"`, …). The daemon owns a
 `HookDispatcher`: workflow code emits `(point, context_json)`; the dispatcher
 resolves subscribers from the synced registry (selector-filtered), invokes
-them in manifest order through the same `PluginManager::invoke` path (so a
+them in manifest order through the same `ExtensionManager::invoke` path (so a
 hook may run remotely), and applies each hook's `on_error` policy
 (`"abort"` | `"ignore"`). v1 ships the dispatcher and its tests; concrete
 hook points are declared by future workflow code.
@@ -276,7 +280,7 @@ hook points are declared by future workflow code.
   Declared `capabilities` in the manifest are the extension points for future
   host services and are validated on load (unknown capability → load error).
 - Artifact integrity: `content_hash` (blake3) is verified at ingest (apply
-  pipeline) and again at load time; a mismatch quarantines the plugin
+  pipeline) and again at load time; a mismatch quarantines the extension
   (not loaded, warning logged).
 - Both engines impose hard instruction/fuel and memory budgets; a runaway
   guest cannot block the tokio runtime (execution happens on
@@ -286,28 +290,28 @@ hook points are declared by future workflow code.
 
 ## 11. Testing strategy
 
-- `lycoris-plugin`: Lua fixture (echo/transform script), WAT fixture compiled
-  with the `wat` crate implementing `lycoris-abi-v1` (bump allocator + echo),
-  sandbox escape attempts (io/os/debug absent), budget enforcement
+- `lycoris-extension`: Lua fixture (echo/transform script), WAT fixture
+  compiled with the `wat` crate implementing `lycoris-abi-v1` (bump allocator
+  + echo), sandbox escape attempts (io/os/debug absent), budget enforcement
   (infinite loop → budget error; balloon allocation → memory error).
-- Storage: plugin apply pipeline reuses the versioned tests' shape; blob
+- Storage: extension apply pipeline reuses the versioned tests' shape; blob
   store id validation and content-before-metadata ordering.
 - Daemon: selector activation (labels match / mismatch), capability
   annotation gossip, routing (local hit, forwarded hit with hop-limit-1,
   no-candidate `NOT_FOUND`), manifest validation failures.
-- Integration: two-node test — plugin runs on node B only; invoke on node A
-  returns B's result; registry convergence via existing resource sync.
-- E2E fixture: a tiny Lua plugin registered through the CLI path
-  (`cluster get plugins` lists it) — fixtures are test assets, not
-  production plugins.
+- Integration: two-node test — extension runs on node B only; invoke on node
+  A returns B's result; registry convergence via existing resource sync.
+- E2E fixture: a tiny Lua extension registered through the CLI path
+  (`cluster get extensions` lists it) — fixtures are test assets, not
+  production extensions.
 
 ## 12. Rollout plan (this task)
 
-1. `crates/plugin`: manifest model, engine trait, Lua engine, WASM engine,
+1. `crates/extension`: manifest model, engine trait, Lua engine, WASM engine,
    limits, unit tests.
-2. proto (`PLUGIN` kind + `PluginService`) + storage plugin domain + blob
-   store + mapper wiring.
-3. daemon: `PluginManager`, capability announcement, routing/forwarding,
+2. proto (`EXTENSION` kind + `ExtensionService`) + storage extension domain +
+   blob store + mapper wiring.
+3. daemon: `ExtensionManager`, capability announcement, routing/forwarding,
    `HookDispatcher`, config section, integration tests.
-4. shell (`plugins` kind for `cluster get`), docs (README, crate READMEs,
+4. shell (`extensions` kind for `cluster get`), docs (README, crate READMEs,
    AGENTS.md), e2e fixture.

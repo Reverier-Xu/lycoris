@@ -4,8 +4,8 @@
 mod agent;
 mod bytes;
 mod error;
+mod extension;
 mod node;
-mod plugin;
 mod resource_id;
 mod table;
 mod versioned;
@@ -18,9 +18,9 @@ pub use agent::{
   SessionStorage,
 };
 pub use error::StorageError;
+pub use extension::{ExtensionBlobStore, ExtensionDomain, ExtensionRecord, ExtensionStorageError};
 pub use lycoris_core::ResourceScope;
 pub use node::{LocalStorage, MetaStorage, NodeDomain, PeerRecord, PeerStorage};
-pub use plugin::{PluginBlobStore, PluginDomain, PluginRecord, PluginStorageError};
 use redb::Database;
 pub use resource_id::InvalidResourceId;
 pub use table::RedbTableStorage;
@@ -34,13 +34,13 @@ pub use workspace::{
 /// `Storage` is the top-level entry point for all persistent state. The
 /// underlying `redb::Database` is shared (via `Arc`) by lightweight, cloneable
 /// domain handles for node-local state, agent orchestration state, workspace
-/// state, and plugin packages.
+/// state, and extension packages.
 #[derive(Debug, Clone)]
 pub struct Storage {
   node: NodeDomain,
   agent: AgentDomain,
   workspace: WorkspaceDomain,
-  plugins: PluginDomain,
+  extensions: ExtensionDomain,
 }
 
 impl Storage {
@@ -77,7 +77,7 @@ impl Storage {
       node: NodeDomain::new(db.clone()),
       agent: AgentDomain::new(db.clone(), data_dir.clone()),
       workspace: WorkspaceDomain::new(db.clone(), data_dir.clone()),
-      plugins: PluginDomain::new(db, data_dir),
+      extensions: ExtensionDomain::new(db, data_dir),
     })
   }
 
@@ -96,9 +96,9 @@ impl Storage {
     &self.workspace
   }
 
-  /// Access the plugin storage domain.
-  pub fn plugins(&self) -> &PluginDomain {
-    &self.plugins
+  /// Access the extension storage domain.
+  pub fn extensions(&self) -> &ExtensionDomain {
+    &self.extensions
   }
 }
 

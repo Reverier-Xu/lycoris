@@ -146,7 +146,7 @@ fn render_generic(resource: &ProtoResource) {
       println!("  sessions:       {:?}", body.session_ids);
       println!("  metadata:       {:?}", body.metadata);
     }
-    Some(Body::Node(_)) | Some(Body::Plugin(_)) | None => {}
+    Some(Body::Node(_)) | Some(Body::Extension(_)) | None => {}
   }
 }
 

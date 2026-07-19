@@ -12,7 +12,7 @@
 //! Enforcement: fuel per call gives a deterministic execution bound,
 //! [`StoreLimits`] caps linear memory, and every invocation is wrapped in a
 //! wall-clock deadline. A guest exceeding any limit traps, and the trap
-//! surfaces as [`PluginError::GuestTrap`], never as a host panic.
+//! surfaces as [`ExtensionError::GuestTrap`], never as a host panic.
 
 use std::time::Duration;
 
@@ -24,9 +24,9 @@ use wasmtime::{
 };
 
 use crate::{
-  engine::{EngineKind, EngineLimits, PluginEngine, PluginInstance},
-  error::{PluginError, Result},
-  package::PluginPackage,
+  engine::{EngineKind, EngineLimits, ExtensionEngine, ExtensionInstance},
+  error::{ExtensionError, Result},
+  package::ExtensionPackage,
 };
 
 /// Host module name exposed to guests.
@@ -38,11 +38,11 @@ const INVOKE_EXPORT: &str = "lycoris_invoke";
 /// Name of the exported guest linear memory.
 const MEMORY_EXPORT: &str = "memory";
 
-/// Per-instance store state: the resource limits plus the plugin id for
+/// Per-instance store state: the resource limits plus the extension id for
 /// log attribution.
 struct WasmState {
   limits: StoreLimits,
-  plugin_id: String,
+  extension_id: String,
 }
 
 /// The WASM execution engine.
@@ -59,7 +59,7 @@ impl WasmEngine {
     // a deprecated no-op); fuel metering still needs opting into.
     config.consume_fuel(true);
     let engine = Engine::new(&config)
-      .map_err(|err| PluginError::Engine(format!("failed to create wasmtime engine: {err}")))?;
+      .map_err(|err| ExtensionError::Engine(format!("failed to create wasmtime engine: {err}")))?;
     Ok(Self { engine, limits })
   }
 
@@ -71,43 +71,44 @@ impl WasmEngine {
         HOST_MODULE,
         "log",
         |mut caller: Caller<'_, WasmState>, level: i32, ptr: i32, len: i32| {
-          let plugin_id = caller.data().plugin_id.clone();
+          let extension_id = caller.data().extension_id.clone();
           let message = read_guest_string(&mut caller, ptr, len)
             .unwrap_or_else(|| "<out-of-bounds log message>".to_string());
           match level {
-            0 => tracing::trace!(plugin = plugin_id, "{message}"),
-            1 => tracing::debug!(plugin = plugin_id, "{message}"),
-            3 => tracing::warn!(plugin = plugin_id, "{message}"),
-            4 => tracing::error!(plugin = plugin_id, "{message}"),
+            0 => tracing::trace!(extension = extension_id, "{message}"),
+            1 => tracing::debug!(extension = extension_id, "{message}"),
+            3 => tracing::warn!(extension = extension_id, "{message}"),
+            4 => tracing::error!(extension = extension_id, "{message}"),
             // 2 is info; out-of-range levels fall back to info as well.
-            _ => tracing::info!(plugin = plugin_id, "{message}"),
+            _ => tracing::info!(extension = extension_id, "{message}"),
           }
         },
       )
       .map_err(|err| {
-        PluginError::Engine(format!("failed to register the lycoris host module: {err}"))
+        ExtensionError::Engine(format!("failed to register the lycoris host module: {err}"))
       })?;
     Ok(linker)
   }
 }
 
 #[async_trait]
-impl PluginEngine for WasmEngine {
+impl ExtensionEngine for WasmEngine {
   fn kind(&self) -> EngineKind {
     EngineKind::Wasm
   }
 
-  async fn load(&self, package: &PluginPackage) -> Result<Box<dyn PluginInstance>> {
+  async fn load(&self, package: &ExtensionPackage) -> Result<Box<dyn ExtensionInstance>> {
     package.verify()?;
     if package.engine != EngineKind::Wasm {
-      return Err(PluginError::Engine(format!(
-        "plugin {} targets {:?}, not the wasm engine",
+      return Err(ExtensionError::Engine(format!(
+        "extension {} targets {:?}, not the wasm engine",
         package.id, package.engine
       )));
     }
 
-    let module = Module::new(&self.engine, &package.artifact)
-      .map_err(|err| PluginError::Engine(format!("failed to compile the wasm module: {err:#}")))?;
+    let module = Module::new(&self.engine, &package.artifact).map_err(|err| {
+      ExtensionError::Engine(format!("failed to compile the wasm module: {err:#}"))
+    })?;
     check_imports(&module)?;
     check_exports(&module)?;
 
@@ -115,7 +116,7 @@ impl PluginEngine for WasmEngine {
       limits: StoreLimitsBuilder::new()
         .memory_size(self.limits.wasm_max_memory_bytes)
         .build(),
-      plugin_id: package.id.clone(),
+      extension_id: package.id.clone(),
     };
     let mut store = Store::new(&self.engine, state);
     store.limiter(|state| &mut state.limits);
@@ -124,19 +125,21 @@ impl PluginEngine for WasmEngine {
       .linker()?
       .instantiate_async(&mut store, &module)
       .await
-      .map_err(|err| PluginError::GuestTrap(format!("failed to instantiate the guest: {err}")))?;
+      .map_err(|err| {
+        ExtensionError::GuestTrap(format!("failed to instantiate the guest: {err}"))
+      })?;
 
     // Precise signature checks; the name/kind precheck above keeps the
     // common failure messages readable.
     let memory = instance
       .get_memory(&mut store, MEMORY_EXPORT)
-      .ok_or_else(|| PluginError::Engine("guest exports no memory".to_string()))?;
+      .ok_or_else(|| ExtensionError::Engine("guest exports no memory".to_string()))?;
     let alloc = instance
       .get_typed_func::<i32, i32>(&mut store, ALLOC_EXPORT)
-      .map_err(|err| PluginError::Engine(format!("invalid lycoris_alloc signature: {err}")))?;
+      .map_err(|err| ExtensionError::Engine(format!("invalid lycoris_alloc signature: {err}")))?;
     let invoke = instance
       .get_typed_func::<(i32, i32, i32, i32), i64>(&mut store, INVOKE_EXPORT)
-      .map_err(|err| PluginError::Engine(format!("invalid lycoris_invoke signature: {err}")))?;
+      .map_err(|err| ExtensionError::Engine(format!("invalid lycoris_invoke signature: {err}")))?;
 
     Ok(Box::new(WasmInstance {
       store: Mutex::new(store),
@@ -149,7 +152,7 @@ impl PluginEngine for WasmEngine {
   }
 }
 
-/// A loaded WASM plugin: one store holding one instantiated guest.
+/// A loaded WASM extension: one store holding one instantiated guest.
 struct WasmInstance {
   store: Mutex<Store<WasmState>>,
   memory: Memory,
@@ -160,17 +163,17 @@ struct WasmInstance {
 }
 
 #[async_trait]
-impl PluginInstance for WasmInstance {
+impl ExtensionInstance for WasmInstance {
   async fn invoke(&self, method: &str, payload: &[u8]) -> Result<Vec<u8>> {
     // The payload contract is JSON bytes end-to-end; reject junk early.
     serde_json::from_slice::<serde_json::Value>(payload).map_err(|err| {
-      PluginError::InvalidPayload(format!("request payload is not valid JSON: {err}"))
+      ExtensionError::InvalidPayload(format!("request payload is not valid JSON: {err}"))
     })?;
 
     let result = tokio::time::timeout(self.deadline, self.invoke_inner(method, payload)).await;
     match result {
       Ok(output) => output,
-      Err(_) => Err(PluginError::Timeout(self.deadline)),
+      Err(_) => Err(ExtensionError::Timeout(self.deadline)),
     }
   }
 }
@@ -179,16 +182,16 @@ impl WasmInstance {
   /// Run one guest invocation: alloc, write request, call, read response.
   async fn invoke_inner(&self, method: &str, payload: &[u8]) -> Result<Vec<u8>> {
     let method_len = i32::try_from(method.len()).map_err(|_| {
-      PluginError::InvalidPayload("method name exceeds the guest addressable size".to_string())
+      ExtensionError::InvalidPayload("method name exceeds the guest addressable size".to_string())
     })?;
     let payload_len = i32::try_from(payload.len()).map_err(|_| {
-      PluginError::InvalidPayload("payload exceeds the guest addressable size".to_string())
+      ExtensionError::InvalidPayload("payload exceeds the guest addressable size".to_string())
     })?;
 
     let mut store = self.store.lock().await;
     store
       .set_fuel(self.fuel)
-      .map_err(|err| PluginError::Engine(format!("failed to set fuel: {err}")))?;
+      .map_err(|err| ExtensionError::Engine(format!("failed to set fuel: {err}")))?;
 
     let method_ptr = self
       .alloc
@@ -222,20 +225,22 @@ impl WasmInstance {
     // The response buffer address packs as (ptr << 32) | len.
     let packed = packed as u64;
     let response_ptr = usize::try_from(packed >> 32)
-      .map_err(|err| PluginError::Engine(format!("invalid response pointer: {err}")))?;
+      .map_err(|err| ExtensionError::Engine(format!("invalid response pointer: {err}")))?;
     let response_len = usize::try_from(packed & 0xFFFF_FFFF)
-      .map_err(|err| PluginError::Engine(format!("invalid response length: {err}")))?;
+      .map_err(|err| ExtensionError::Engine(format!("invalid response length: {err}")))?;
     let data = self.memory.data(&*store);
     let response = data
       .get(response_ptr..response_ptr.saturating_add(response_len))
       .ok_or_else(|| {
-        PluginError::Engine("guest returned an out-of-bounds response buffer pointer".to_string())
+        ExtensionError::Engine(
+          "guest returned an out-of-bounds response buffer pointer".to_string(),
+        )
       })?
       .to_vec();
 
     // Engines validate that guest output is well-formed JSON.
     serde_json::from_slice::<serde_json::Value>(&response).map_err(|err| {
-      PluginError::InvalidPayload(format!("guest output is not valid JSON: {err}"))
+      ExtensionError::InvalidPayload(format!("guest output is not valid JSON: {err}"))
     })?;
     Ok(response)
   }
@@ -257,7 +262,7 @@ fn read_guest_string(caller: &mut Caller<'_, WasmState>, ptr: i32, len: i32) -> 
 fn check_imports(module: &Module) -> Result<()> {
   for import in module.imports() {
     if import.module() != HOST_MODULE || import.name() != "log" {
-      return Err(PluginError::Engine(format!(
+      return Err(ExtensionError::Engine(format!(
         "unsupported import {}.{}: only lycoris.log is provided",
         import.module(),
         import.name()
@@ -267,7 +272,7 @@ fn check_imports(module: &Module) -> Result<()> {
       ExternType::Func(ty)
         if signature_matches(&ty, &[ValType::I32, ValType::I32, ValType::I32], &[]) => {}
       _ => {
-        return Err(PluginError::Engine(
+        return Err(ExtensionError::Engine(
           "lycoris.log must have signature (i32, i32, i32) -> ()".to_string(),
         ));
       }
@@ -282,7 +287,7 @@ fn check_exports(module: &Module) -> Result<()> {
     module.get_export(MEMORY_EXPORT),
     Some(ExternType::Memory(_))
   ) {
-    return Err(PluginError::Engine(
+    return Err(ExtensionError::Engine(
       "guest does not export a memory named \"memory\"".to_string(),
     ));
   }
@@ -302,7 +307,7 @@ fn check_func_export(
 ) -> Result<()> {
   match module.get_export(name) {
     Some(ExternType::Func(ty)) if signature_matches(&ty, params, results) => Ok(()),
-    _ => Err(PluginError::Engine(format!(
+    _ => Err(ExtensionError::Engine(format!(
       "guest does not export {name} with the lycoris-abi-v1 signature"
     ))),
   }
@@ -325,11 +330,11 @@ fn signature_matches(ty: &FuncType, params: &[ValType], results: &[ValType]) -> 
   params_match && results_match
 }
 
-/// Build a closure mapping guest failures to [`PluginError::GuestTrap`]. The
+/// Build a closure mapping guest failures to [`ExtensionError::GuestTrap`]. The
 /// alternate Display keeps the whole anyhow chain so the trap reason (fuel
 /// exhaustion, `unreachable`, ...) survives in the message.
-fn guest_trap<E: std::fmt::Display>(context: &'static str) -> impl Fn(E) -> PluginError {
-  move |err| PluginError::GuestTrap(format!("{context}: {err:#}"))
+fn guest_trap<E: std::fmt::Display>(context: &'static str) -> impl Fn(E) -> ExtensionError {
+  move |err| ExtensionError::GuestTrap(format!("{context}: {err:#}"))
 }
 
 #[cfg(test)]
@@ -337,7 +342,7 @@ mod tests {
   use std::collections::BTreeMap;
 
   use super::*;
-  use crate::manifest::PluginManifest;
+  use crate::manifest::ExtensionManifest;
 
   /// Bump-allocator echo guest: returns the payload bytes unchanged and
   /// exercises the `lycoris.log` host import on every call.
@@ -416,18 +421,18 @@ mod tests {
         (i64.or (i64.shl (i64.const 16) (i64.const 32)) (i64.const 8))))
   "#;
 
-  fn manifest() -> PluginManifest {
-    PluginManifest::from_map(&BTreeMap::from([(
+  fn manifest() -> ExtensionManifest {
+    ExtensionManifest::from_map(&BTreeMap::from([(
       "semver".to_string(),
       "0.1.0".to_string(),
     )]))
     .unwrap()
   }
 
-  fn package_wat(wat_source: &str) -> PluginPackage {
-    PluginPackage::new(
+  fn package_wat(wat_source: &str) -> ExtensionPackage {
+    ExtensionPackage::new(
       "test".to_string(),
-      "test-plugin".to_string(),
+      "test-extension".to_string(),
       1,
       EngineKind::Wasm,
       String::new(),
@@ -436,11 +441,11 @@ mod tests {
     )
   }
 
-  async fn load(wat_source: &str) -> Box<dyn PluginInstance> {
+  async fn load(wat_source: &str) -> Box<dyn ExtensionInstance> {
     load_with_limits(wat_source, EngineLimits::default()).await
   }
 
-  async fn load_with_limits(wat_source: &str, limits: EngineLimits) -> Box<dyn PluginInstance> {
+  async fn load_with_limits(wat_source: &str, limits: EngineLimits) -> Box<dyn ExtensionInstance> {
     WasmEngine::new(limits)
       .unwrap()
       .load(&package_wat(wat_source))
@@ -474,7 +479,7 @@ mod tests {
   async fn guest_traps_map_to_the_guest_trap_variant() {
     let instance = load(TRAP_WAT).await;
     let result = instance.invoke("m", b"{}").await;
-    assert!(matches!(result, Err(PluginError::GuestTrap(_))));
+    assert!(matches!(result, Err(ExtensionError::GuestTrap(_))));
   }
 
   #[tokio::test]
@@ -485,7 +490,7 @@ mod tests {
     };
     let instance = load_with_limits(LOOP_WAT, limits).await;
     let result = instance.invoke("m", b"{}").await;
-    let Err(PluginError::GuestTrap(message)) = result else {
+    let Err(ExtensionError::GuestTrap(message)) = result else {
       panic!("expected a guest trap, got {result:?}");
     };
     assert!(
@@ -512,7 +517,7 @@ mod tests {
       .unwrap()
       .load(&package_wat(balloon))
       .await;
-    assert!(matches!(result, Err(PluginError::GuestTrap(_))));
+    assert!(matches!(result, Err(ExtensionError::GuestTrap(_))));
   }
 
   #[tokio::test]
@@ -527,7 +532,7 @@ mod tests {
       .unwrap()
       .load(&package_wat(missing_alloc))
       .await;
-    assert!(matches!(result, Err(PluginError::Engine(err)) if err.contains("lycoris_alloc")));
+    assert!(matches!(result, Err(ExtensionError::Engine(err)) if err.contains("lycoris_alloc")));
   }
 
   #[tokio::test]
@@ -543,7 +548,7 @@ mod tests {
       .unwrap()
       .load(&package_wat(missing_memory))
       .await;
-    assert!(matches!(result, Err(PluginError::Engine(err)) if err.contains("memory")));
+    assert!(matches!(result, Err(ExtensionError::Engine(err)) if err.contains("memory")));
   }
 
   #[tokio::test]
@@ -560,7 +565,7 @@ mod tests {
       .unwrap()
       .load(&package_wat(wrong_signature))
       .await;
-    assert!(matches!(result, Err(PluginError::Engine(_))));
+    assert!(matches!(result, Err(ExtensionError::Engine(_))));
   }
 
   #[tokio::test]
@@ -578,21 +583,23 @@ mod tests {
       .unwrap()
       .load(&package_wat(wasi_module))
       .await;
-    assert!(matches!(result, Err(PluginError::Engine(err)) if err.contains("unsupported import")));
+    assert!(
+      matches!(result, Err(ExtensionError::Engine(err)) if err.contains("unsupported import"))
+    );
   }
 
   #[tokio::test]
   async fn non_json_guest_output_is_an_invalid_payload() {
     let instance = load(NON_JSON_WAT).await;
     let result = instance.invoke("m", b"{}").await;
-    assert!(matches!(result, Err(PluginError::InvalidPayload(_))));
+    assert!(matches!(result, Err(ExtensionError::InvalidPayload(_))));
   }
 
   #[tokio::test]
   async fn non_json_input_is_an_invalid_payload() {
     let instance = load(ECHO_WAT).await;
     let result = instance.invoke("m", b"not json").await;
-    assert!(matches!(result, Err(PluginError::InvalidPayload(_))));
+    assert!(matches!(result, Err(ExtensionError::InvalidPayload(_))));
   }
 
   #[tokio::test]
@@ -603,7 +610,7 @@ mod tests {
       .unwrap()
       .load(&package)
       .await;
-    assert!(matches!(result, Err(PluginError::Engine(_))));
+    assert!(matches!(result, Err(ExtensionError::Engine(_))));
   }
 
   #[tokio::test]
@@ -616,7 +623,7 @@ mod tests {
       .await;
     assert!(matches!(
       result,
-      Err(PluginError::ContentHashMismatch { .. })
+      Err(ExtensionError::ContentHashMismatch { .. })
     ));
   }
 }

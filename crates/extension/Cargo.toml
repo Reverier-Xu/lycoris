@@ -1,5 +1,5 @@
 [package]
-name = "lycoris-plugin"
+name = "lycoris-extension"
 
 authors.workspace      = true
 description.workspace  = true
