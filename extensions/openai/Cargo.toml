@@ -1,0 +1,31 @@
+[package]
+name = "lycoris-ext-openai"
+
+authors.workspace      = true
+description.workspace  = true
+edition.workspace      = true
+homepage.workspace     = true
+license.workspace      = true
+readme.workspace       = true
+repository.workspace   = true
+rust-version.workspace = true
+version.workspace      = true
+
+[lib]
+# cdylib is the registrable wasm artifact; rlib keeps the pure core
+# reachable from host-side tests.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+lycoris-extension-guest = { workspace = true }
+serde                   = { workspace = true }
+serde_json              = { workspace = true }
+
+[dev-dependencies]
+lycoris-extension = { workspace = true }
+tokio             = { workspace = true }
+
+[lints.rust]
+# Same split as lycoris-extension-guest: deny, not the workspace forbid, so
+# the macro-generated ABI shims can carry their documented unsafe blocks.
+unsafe_code = "deny"
