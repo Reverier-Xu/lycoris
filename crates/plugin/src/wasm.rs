@@ -99,10 +99,10 @@ impl PluginEngine for WasmEngine {
 
   async fn load(&self, package: &PluginPackage) -> Result<Box<dyn PluginInstance>> {
     package.verify()?;
-    if package.manifest.engine != EngineKind::Wasm {
+    if package.engine != EngineKind::Wasm {
       return Err(PluginError::Engine(format!(
         "plugin {} targets {:?}, not the wasm engine",
-        package.id, package.manifest.engine
+        package.id, package.engine
       )));
     }
 
@@ -417,10 +417,10 @@ mod tests {
   "#;
 
   fn manifest() -> PluginManifest {
-    PluginManifest::from_map(&BTreeMap::from([
-      ("engine".to_string(), "wasm".to_string()),
-      ("semver".to_string(), "0.1.0".to_string()),
-    ]))
+    PluginManifest::from_map(&BTreeMap::from([(
+      "semver".to_string(),
+      "0.1.0".to_string(),
+    )]))
     .unwrap()
   }
 
@@ -429,6 +429,8 @@ mod tests {
       "test".to_string(),
       "test-plugin".to_string(),
       1,
+      EngineKind::Wasm,
+      String::new(),
       manifest(),
       wat::parse_str(wat_source).unwrap(),
     )
@@ -596,7 +598,7 @@ mod tests {
   #[tokio::test]
   async fn load_rejects_a_wrong_engine_kind() {
     let mut package = package_wat(ECHO_WAT);
-    package.manifest = manifest_for("lua");
+    package.engine = EngineKind::Lua;
     let result = WasmEngine::new(EngineLimits::default())
       .unwrap()
       .load(&package)
@@ -616,13 +618,5 @@ mod tests {
       result,
       Err(PluginError::ContentHashMismatch { .. })
     ));
-  }
-
-  fn manifest_for(engine: &str) -> PluginManifest {
-    PluginManifest::from_map(&BTreeMap::from([
-      ("engine".to_string(), engine.to_string()),
-      ("semver".to_string(), "0.1.0".to_string()),
-    ]))
-    .unwrap()
   }
 }

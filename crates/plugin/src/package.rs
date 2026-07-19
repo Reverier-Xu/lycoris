@@ -6,9 +6,13 @@
 //! again at load time (design document sections 4 and 10).
 
 use crate::{
+  engine::EngineKind,
   error::{PluginError, Result},
   manifest::PluginManifest,
 };
+
+/// Entry point assumed when the record leaves `entry` empty.
+pub const DEFAULT_ENTRY: &str = "invoke";
 
 /// A plugin package ready to be stored, synced or loaded.
 #[derive(Debug, Clone)]
@@ -19,6 +23,10 @@ pub struct PluginPackage {
   pub name: String,
   /// Monotonic convergence version ordered by anti-entropy.
   pub version: u64,
+  /// Execution engine for the artifact.
+  pub engine: EngineKind,
+  /// Exported entry point name (`invoke` unless overridden).
+  pub entry: String,
   /// Validated manifest.
   pub manifest: PluginManifest,
   /// Raw artifact: a WASM module or Lua source.
@@ -28,15 +36,24 @@ pub struct PluginPackage {
 }
 
 impl PluginPackage {
-  /// Build a package, computing the content hash of the artifact.
+  /// Build a package, computing the content hash of the artifact. An empty
+  /// `entry` falls back to [`DEFAULT_ENTRY`].
   pub fn new(
-    id: String, name: String, version: u64, manifest: PluginManifest, artifact: Vec<u8>,
+    id: String, name: String, version: u64, engine: EngineKind, entry: String,
+    manifest: PluginManifest, artifact: Vec<u8>,
   ) -> Self {
     let content_hash = hash_artifact(&artifact);
+    let entry = if entry.is_empty() {
+      DEFAULT_ENTRY.to_string()
+    } else {
+      entry
+    };
     Self {
       id,
       name,
       version,
+      engine,
+      entry,
       manifest,
       artifact,
       content_hash,
@@ -69,22 +86,28 @@ mod tests {
   use crate::manifest::PluginManifest;
 
   fn manifest() -> PluginManifest {
-    PluginManifest::from_map(&BTreeMap::from([
-      ("engine".to_string(), "lua".to_string()),
-      ("semver".to_string(), "0.1.0".to_string()),
-    ]))
+    PluginManifest::from_map(&BTreeMap::from([(
+      "semver".to_string(),
+      "0.1.0".to_string(),
+    )]))
     .unwrap()
+  }
+
+  fn package(artifact: &[u8]) -> PluginPackage {
+    PluginPackage::new(
+      "p1".to_string(),
+      "echo".to_string(),
+      1,
+      EngineKind::Lua,
+      String::new(),
+      manifest(),
+      artifact.to_vec(),
+    )
   }
 
   #[test]
   fn new_computes_the_blake3_content_hash() {
-    let package = PluginPackage::new(
-      "p1".to_string(),
-      "echo".to_string(),
-      1,
-      manifest(),
-      b"return {}".to_vec(),
-    );
+    let package = package(b"return {}");
     assert_eq!(
       package.content_hash,
       blake3::hash(b"return {}").to_hex().to_string()
@@ -92,26 +115,20 @@ mod tests {
   }
 
   #[test]
+  fn new_defaults_an_empty_entry_to_invoke() {
+    let package = package(b"return {}");
+    assert_eq!(package.entry, DEFAULT_ENTRY);
+  }
+
+  #[test]
   fn verify_accepts_an_intact_artifact() {
-    let package = PluginPackage::new(
-      "p1".to_string(),
-      "echo".to_string(),
-      1,
-      manifest(),
-      b"x".to_vec(),
-    );
+    let package = package(b"x");
     assert!(package.verify().is_ok());
   }
 
   #[test]
   fn verify_rejects_a_tampered_artifact() {
-    let mut package = PluginPackage::new(
-      "p1".to_string(),
-      "echo".to_string(),
-      1,
-      manifest(),
-      b"x".to_vec(),
-    );
+    let mut package = package(b"x");
     package.artifact = b"y".to_vec();
     assert!(matches!(
       package.verify(),
@@ -121,13 +138,7 @@ mod tests {
 
   #[test]
   fn verify_rejects_a_forged_hash() {
-    let mut package = PluginPackage::new(
-      "p1".to_string(),
-      "echo".to_string(),
-      1,
-      manifest(),
-      b"x".to_vec(),
-    );
+    let mut package = package(b"x");
     package.content_hash = "0".repeat(64);
     assert!(matches!(
       package.verify(),

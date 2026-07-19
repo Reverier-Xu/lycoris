@@ -24,7 +24,7 @@ pub enum EngineKind {
 }
 
 impl EngineKind {
-  /// The canonical wire representation used in manifests and records.
+  /// The canonical wire representation used in records.
   pub fn as_str(self) -> &'static str {
     match self {
       Self::Wasm => "wasm",
@@ -85,7 +85,7 @@ pub trait PluginEngine: Send + Sync {
   fn kind(&self) -> EngineKind;
 
   /// Load a package into an instance, verifying the content hash, the
-  /// manifest engine kind and all engine-specific shape (ABI exports for
+  /// package engine kind and all engine-specific shape (ABI exports for
   /// WASM, entry function presence for Lua).
   async fn load(&self, package: &PluginPackage) -> Result<Box<dyn PluginInstance>>;
 }

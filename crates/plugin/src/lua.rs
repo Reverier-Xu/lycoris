@@ -54,15 +54,15 @@ impl PluginEngine for LuaEngine {
 
   async fn load(&self, package: &PluginPackage) -> Result<Box<dyn PluginInstance>> {
     package.verify()?;
-    if package.manifest.engine != EngineKind::Lua {
+    if package.engine != EngineKind::Lua {
       return Err(PluginError::Engine(format!(
         "plugin {} targets {:?}, not the lua engine",
-        package.id, package.manifest.engine
+        package.id, package.engine
       )));
     }
     let source = String::from_utf8(package.artifact.clone())
       .map_err(|err| PluginError::Engine(format!("lua artifact is not utf-8: {err}")))?;
-    let entry = package.manifest.entry.clone();
+    let entry = package.entry.clone();
     let limits = self.limits;
 
     // Chunk evaluation runs arbitrary top-level code, so it happens on a
@@ -262,10 +262,10 @@ mod tests {
   use crate::manifest::PluginManifest;
 
   fn manifest() -> PluginManifest {
-    PluginManifest::from_map(&BTreeMap::from([
-      ("engine".to_string(), "lua".to_string()),
-      ("semver".to_string(), "0.1.0".to_string()),
-    ]))
+    PluginManifest::from_map(&BTreeMap::from([(
+      "semver".to_string(),
+      "0.1.0".to_string(),
+    )]))
     .unwrap()
   }
 
@@ -274,6 +274,8 @@ mod tests {
       "test".to_string(),
       "test-plugin".to_string(),
       1,
+      EngineKind::Lua,
+      String::new(),
       manifest(),
       source.as_bytes().to_vec(),
     )
@@ -324,17 +326,13 @@ mod tests {
 
   #[tokio::test]
   async fn custom_entry_name_is_respected() {
-    let mut map = BTreeMap::from([
-      ("engine".to_string(), "lua".to_string()),
-      ("semver".to_string(), "0.1.0".to_string()),
-    ]);
-    map.insert("entry".to_string(), "handle".to_string());
-    let manifest = PluginManifest::from_map(&map).unwrap();
     let package = PluginPackage::new(
       "test".to_string(),
       "test-plugin".to_string(),
       1,
-      manifest,
+      EngineKind::Lua,
+      "handle".to_string(),
+      manifest(),
       b"function handle(method, payload) return payload end".to_vec(),
     );
     let instance = LuaEngine::new(EngineLimits::default())
@@ -488,18 +486,8 @@ mod tests {
 
   #[tokio::test]
   async fn load_rejects_a_wrong_engine_kind() {
-    let map = BTreeMap::from([
-      ("engine".to_string(), "wasm".to_string()),
-      ("semver".to_string(), "0.1.0".to_string()),
-    ]);
-    let manifest = PluginManifest::from_map(&map).unwrap();
-    let package = PluginPackage::new(
-      "test".to_string(),
-      "test-plugin".to_string(),
-      1,
-      manifest,
-      b"function invoke() end".to_vec(),
-    );
+    let mut package = package("function invoke() end");
+    package.engine = EngineKind::Wasm;
     let result = LuaEngine::new(EngineLimits::default()).load(&package).await;
     assert!(matches!(result, Err(PluginError::Engine(_))));
   }

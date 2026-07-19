@@ -5,35 +5,27 @@
 //!
 //! | key            | value                                        |
 //! | -------------- | -------------------------------------------- |
-//! | `engine`       | `"wasm"` or `"lua"` (required)               |
-//! | `entry`        | entry point name, default `invoke`           |
 //! | `semver`       | human-facing SemVer string (required)        |
 //! | `capabilities` | JSON array of capability names             |
 //! | `hooks`        | JSON array of `{point, on_error}` objects    |
 //! | `selector`     | JSON object of string -> string label terms  |
 //! | `settings`     | opaque JSON passed to the plugin uninterpreted |
 //!
+//! `engine` and `entry` are *not* manifest keys: they ride as top-level
+//! fields of the plugin record next to this map (design document section 4).
 //! Unknown keys are ignored so newer manifests stay readable by older nodes.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{
-  engine::EngineKind,
-  error::{PluginError, Result},
-};
+use crate::error::{PluginError, Result};
 
-const ENGINE_KEY: &str = "engine";
-const ENTRY_KEY: &str = "entry";
 const SEMVER_KEY: &str = "semver";
 const CAPABILITIES_KEY: &str = "capabilities";
 const HOOKS_KEY: &str = "hooks";
 const SELECTOR_KEY: &str = "selector";
 const SETTINGS_KEY: &str = "settings";
-
-/// Entry point assumed when the manifest omits `entry`.
-pub const DEFAULT_ENTRY: &str = "invoke";
 
 /// Capabilities the host currently knows how to honour. Anything else is
 /// rejected (design document section 10).
@@ -61,12 +53,12 @@ pub struct HookDecl {
 }
 
 /// A validated plugin manifest.
+///
+/// Carries only the keys of the wire manifest map; the engine kind and entry
+/// point are top-level record fields and live on
+/// [`PluginPackage`](crate::PluginPackage).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginManifest {
-  /// Execution engine for the artifact.
-  pub engine: EngineKind,
-  /// Exported entry point name (`invoke` unless overridden).
-  pub entry: String,
   /// Human-facing SemVer, validated at ingest.
   pub semver: semver::Version,
   /// Declared host-service capabilities; unknown names are rejected.
@@ -82,14 +74,6 @@ pub struct PluginManifest {
 impl PluginManifest {
   /// Parse and validate a manifest from its wire representation.
   pub fn from_map(map: &BTreeMap<String, String>) -> Result<Self> {
-    let engine: EngineKind = required(map, ENGINE_KEY)?.parse()?;
-
-    let entry = match map.get(ENTRY_KEY) {
-      Some(entry) if !entry.is_empty() => entry.clone(),
-      Some(_) => return Err(PluginError::Manifest("entry must not be empty".to_string())),
-      None => DEFAULT_ENTRY.to_string(),
-    };
-
     let semver_raw = required(map, SEMVER_KEY)?;
     let semver = semver::Version::parse(semver_raw)
       .map_err(|err| PluginError::Manifest(format!("invalid semver {semver_raw:?}: {err}")))?;
@@ -133,8 +117,6 @@ impl PluginManifest {
     };
 
     Ok(Self {
-      engine,
-      entry,
       semver,
       capabilities,
       hooks,
@@ -147,8 +129,6 @@ impl PluginManifest {
   /// deterministic: selector keys are emitted in sorted order.
   pub fn to_map(&self) -> Result<BTreeMap<String, String>> {
     let mut map = BTreeMap::new();
-    map.insert(ENGINE_KEY.to_string(), self.engine.as_str().to_string());
-    map.insert(ENTRY_KEY.to_string(), self.entry.clone());
     map.insert(SEMVER_KEY.to_string(), self.semver.to_string());
     map.insert(
       CAPABILITIES_KEY.to_string(),
@@ -190,8 +170,6 @@ mod tests {
 
   fn full_map() -> BTreeMap<String, String> {
     BTreeMap::from([
-      ("engine".to_string(), "lua".to_string()),
-      ("entry".to_string(), "handle".to_string()),
       ("semver".to_string(), "1.2.3-rc.1".to_string()),
       ("capabilities".to_string(), r#"["log"]"#.to_string()),
       (
@@ -213,8 +191,6 @@ mod tests {
   #[test]
   fn parses_a_full_manifest() {
     let manifest = PluginManifest::from_map(&full_map()).unwrap();
-    assert_eq!(manifest.engine, EngineKind::Lua);
-    assert_eq!(manifest.entry, "handle");
     assert_eq!(manifest.semver.to_string(), "1.2.3-rc.1");
     assert_eq!(manifest.capabilities, vec!["log".to_string()]);
     assert_eq!(
@@ -242,13 +218,8 @@ mod tests {
 
   #[test]
   fn applies_defaults_for_missing_optional_keys() {
-    let map = BTreeMap::from([
-      ("engine".to_string(), "wasm".to_string()),
-      ("semver".to_string(), "0.1.0".to_string()),
-    ]);
+    let map = BTreeMap::from([("semver".to_string(), "0.1.0".to_string())]);
     let manifest = PluginManifest::from_map(&map).unwrap();
-    assert_eq!(manifest.engine, EngineKind::Wasm);
-    assert_eq!(manifest.entry, DEFAULT_ENTRY);
     assert!(manifest.capabilities.is_empty());
     assert!(manifest.hooks.is_empty());
     assert!(manifest.selector.is_empty());
@@ -256,20 +227,22 @@ mod tests {
   }
 
   #[test]
-  fn rejects_a_missing_engine() {
-    let map = BTreeMap::from([("semver".to_string(), "0.1.0".to_string())]);
-    assert!(matches!(
-      PluginManifest::from_map(&map),
-      Err(PluginError::Manifest(_))
-    ));
+  fn ignores_unknown_keys() {
+    // `engine` and `entry` are record fields, not manifest keys; leftover or
+    // newer keys must not break parsing.
+    let map = BTreeMap::from([
+      ("engine".to_string(), "lua".to_string()),
+      ("entry".to_string(), "handle".to_string()),
+      ("future-key".to_string(), "anything".to_string()),
+      ("semver".to_string(), "0.1.0".to_string()),
+    ]);
+    let manifest = PluginManifest::from_map(&map).unwrap();
+    assert_eq!(manifest.semver.to_string(), "0.1.0");
   }
 
   #[test]
-  fn rejects_an_unknown_engine() {
-    let map = BTreeMap::from([
-      ("engine".to_string(), "python".to_string()),
-      ("semver".to_string(), "0.1.0".to_string()),
-    ]);
+  fn rejects_a_missing_semver() {
+    let map = BTreeMap::new();
     assert!(matches!(
       PluginManifest::from_map(&map),
       Err(PluginError::Manifest(_))
@@ -279,10 +252,7 @@ mod tests {
   #[test]
   fn rejects_bad_semver() {
     for bad in ["1.0", "not-a-version", "1.2.3.4"] {
-      let map = BTreeMap::from([
-        ("engine".to_string(), "lua".to_string()),
-        ("semver".to_string(), bad.to_string()),
-      ]);
+      let map = BTreeMap::from([("semver".to_string(), bad.to_string())]);
       let result = PluginManifest::from_map(&map);
       assert!(
         matches!(result, Err(PluginError::Manifest(_))),
@@ -294,7 +264,6 @@ mod tests {
   #[test]
   fn rejects_unknown_capabilities() {
     let map = BTreeMap::from([
-      ("engine".to_string(), "lua".to_string()),
       ("semver".to_string(), "0.1.0".to_string()),
       ("capabilities".to_string(), r#"["log","http"]"#.to_string()),
     ]);
@@ -305,7 +274,6 @@ mod tests {
   #[test]
   fn rejects_malformed_capabilities_json() {
     let map = BTreeMap::from([
-      ("engine".to_string(), "lua".to_string()),
       ("semver".to_string(), "0.1.0".to_string()),
       ("capabilities".to_string(), "not json".to_string()),
     ]);
@@ -323,7 +291,6 @@ mod tests {
       r#"[{"point":"x","on_error":"retry"}]"#,
     ] {
       let map = BTreeMap::from([
-        ("engine".to_string(), "lua".to_string()),
         ("semver".to_string(), "0.1.0".to_string()),
         ("hooks".to_string(), bad.to_string()),
       ]);
@@ -338,7 +305,6 @@ mod tests {
   #[test]
   fn rejects_a_selector_with_non_string_values() {
     let map = BTreeMap::from([
-      ("engine".to_string(), "lua".to_string()),
       ("semver".to_string(), "0.1.0".to_string()),
       ("selector".to_string(), r#"{"gpu":true}"#.to_string()),
     ]);
@@ -351,7 +317,6 @@ mod tests {
   #[test]
   fn rejects_non_json_settings() {
     let map = BTreeMap::from([
-      ("engine".to_string(), "lua".to_string()),
       ("semver".to_string(), "0.1.0".to_string()),
       ("settings".to_string(), "{broken".to_string()),
     ]);
