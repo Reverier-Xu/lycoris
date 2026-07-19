@@ -328,6 +328,7 @@ message LeaveResponse {
 // daemon's own cluster key.
 service Extension {
   rpc Invoke(ExtensionInvokeRequest) returns (ExtensionInvokeResponse);
+  rpc RegisterExtension(RegisterExtensionRequest) returns (RegisterExtensionResponse);
 }
 
 message ExtensionInvokeRequest {
@@ -348,4 +349,41 @@ message ExtensionInvokeResponse {
   // Id of the node that actually executed the call (the serving node for a
   // direct call, the capable peer for a forwarded one).
   string executed_by = 2;
+}
+
+// Extension registration: the admission-side write path that brings a package
+// into the cluster (extension system design, section 4). The receiving node
+// validates the request, persists blob-then-metadata exactly like the
+// anti-entropy apply pipeline, and lets the package converge to every node as
+// a ClusterShared EXTENSION resource.
+//
+// Rejections surface in two shapes: validation failures (id outside the
+// resource-id whitelist, unknown engine, unparseable manifest or missing
+// `semver`, empty artifact) return `accepted = false` with the reason; a
+// `version` that does not strictly increase over the stored record is a
+// FAILED_PRECONDITION status.
+message RegisterExtensionRequest {
+  string id = 1;
+  string name = 2;
+  // Monotonic convergence version (design section 8): strictly increasing per
+  // id; re-registering the same or a lower version is rejected.
+  uint64 version = 3;
+  // "wasm" or "lua".
+  string engine = 4;
+  // Exported entry point; empty defaults to "invoke".
+  string entry = 5;
+  bytes artifact = 6;
+  // Manifest wire format (semver, capabilities, hooks, selector, settings);
+  // unknown keys are preserved for forward compatibility.
+  map<string, string> manifest = 7;
+  // Generic metadata labels matched by list selectors.
+  map<string, string> labels = 8;
+}
+
+message RegisterExtensionResponse {
+  bool accepted = 1;
+  // Rejection reason when `accepted` is false.
+  string reason = 2;
+  // blake3 hex digest of the accepted artifact.
+  string content_hash = 3;
 }

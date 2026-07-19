@@ -22,7 +22,7 @@ pub use extension::{ExtensionBlobStore, ExtensionDomain, ExtensionRecord, Extens
 pub use lycoris_core::ResourceScope;
 pub use node::{LocalStorage, MetaStorage, NodeDomain, PeerRecord, PeerStorage};
 use redb::Database;
-pub use resource_id::InvalidResourceId;
+pub use resource_id::{InvalidResourceId, validate as validate_resource_id};
 pub use table::RedbTableStorage;
 pub use versioned::{ContentHashMismatch, VersionedRecord, should_apply_versioned};
 pub use workspace::{
@@ -103,6 +103,6 @@ impl Storage {
 }
 
 /// Compute the canonical blake3 content hash used across all storage domains.
-pub(crate) fn hash_content(content: &[u8]) -> String {
+pub fn hash_content(content: &[u8]) -> String {
   blake3::hash(content).to_hex().to_string()
 }

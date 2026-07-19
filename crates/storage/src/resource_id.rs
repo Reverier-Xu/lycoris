@@ -13,7 +13,10 @@
 pub struct InvalidResourceId(pub String);
 
 /// Validate a resource id before it is used to build a content file path.
-pub(crate) fn validate(id: &str) -> Result<(), InvalidResourceId> {
+///
+/// Public so admission-side write paths (extension registration) can reject a
+/// bad id with the same whitelist before anything reaches the stores.
+pub fn validate(id: &str) -> Result<(), InvalidResourceId> {
   let valid = !id.is_empty()
     && !id.starts_with('.')
     && !id.contains("..")

@@ -8,8 +8,8 @@ use lycoris_proto::{
   node::{
     ExtensionInvokeRequest, ExtensionInvokeResponse, FetchRegistersRequest, GetResourceRequest,
     JoinRequest, LeaveRequest, ListResourcesRequest, NodeInfo as ProtoNodeInfo, ProbeRequest,
-    ProbeResponse, PushNodeRequest, PushRegistersRequest, RegisterRequest,
-    Resource as ProtoResource, ResourceKind as ProtoResourceKind,
+    ProbeResponse, PushNodeRequest, PushRegistersRequest, RegisterExtensionRequest,
+    RegisterRequest, Resource as ProtoResource, ResourceKind as ProtoResourceKind,
     ResourceScope as ProtoResourceScope, SetPrimaryEndpointRequest, StateMessage, StateResponse,
     SyncNodesRequest, SyncNodesResponse, SyncResourcesRequest, cluster_client::ClusterClient,
     extension_client::ExtensionClient, membership_client::MembershipClient,
@@ -198,6 +198,20 @@ impl ExtensionClientHandle {
     let request = attach_cluster_key(self.cluster_key.as_ref(), request)?;
     let response = self.inner.invoke(request).await?;
     Ok(response.into_inner())
+  }
+
+  /// Register an extension package on the connected node (extension system
+  /// design, section 4). Returns the accepted artifact's blake3 content hash.
+  /// Validation failures surface as [`ClientError::Rejected`] carrying the
+  /// node's reason; a version that does not strictly increase surfaces as a
+  /// failed-precondition status.
+  pub async fn register(
+    &mut self, request: RegisterExtensionRequest,
+  ) -> Result<String, ClientError> {
+    let request = attach_cluster_key(self.cluster_key.as_ref(), Request::new(request))?;
+    let response = self.inner.register_extension(request).await?.into_inner();
+    accepted("register_extension", response.accepted, response.reason)?;
+    Ok(response.content_hash)
   }
 }
 

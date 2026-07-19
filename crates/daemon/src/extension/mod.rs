@@ -27,7 +27,7 @@
 pub mod hooks;
 
 use std::{
-  collections::{HashMap, HashSet},
+  collections::{BTreeMap, HashMap, HashSet},
   sync::Arc,
   time::Duration,
 };
@@ -39,7 +39,10 @@ use lycoris_extension::{
   DEFAULT_ENTRY, EngineKind, EngineLimits, ExtensionEngine, ExtensionError, ExtensionInstance,
   ExtensionManifest, ExtensionPackage, LuaEngine, WasmEngine,
 };
-use lycoris_storage::{ExtensionRecord, ExtensionStorageError, Storage};
+use lycoris_storage::{
+  ExtensionRecord, ExtensionStorageError, ResourceScope, Storage, hash_content,
+  validate_resource_id,
+};
 use thiserror::Error;
 use tokio::{
   sync::{Mutex, Notify},
@@ -92,6 +95,54 @@ pub enum ExtensionManagerError {
   /// The engine boundary reported a failure.
   #[error(transparent)]
   Extension(#[from] ExtensionError),
+  /// The extension storage domain reported a failure.
+  #[error(transparent)]
+  Storage(#[from] ExtensionStorageError),
+}
+
+/// An extension registration request at the domain boundary, free of tonic
+/// types (the rpc shell maps the wire request onto this struct).
+#[derive(Debug)]
+pub struct ExtensionRegistration {
+  pub id: String,
+  pub name: String,
+  /// Monotonic convergence version; must strictly increase over the stored
+  /// record when the id is already registered (design section 8).
+  pub version: u64,
+  /// `"wasm"` or `"lua"`.
+  pub engine: String,
+  /// Exported entry point; empty defaults to [`DEFAULT_ENTRY`].
+  pub entry: String,
+  pub artifact: Vec<u8>,
+  /// Manifest wire map (`semver` required); unknown keys are preserved.
+  pub manifest: BTreeMap<String, String>,
+  /// Generic metadata labels matched by list selectors.
+  pub labels: BTreeMap<String, String>,
+}
+
+/// Errors surfaced by [`ExtensionManager::register`].
+#[derive(Debug, Error)]
+pub enum RegisterExtensionError {
+  /// The id falls outside the resource-id whitelist shared with the content
+  /// stores (no path-safe file name could be built from it).
+  #[error("invalid extension id: {0:?}")]
+  InvalidId(String),
+  /// The engine name is not one of the known engines, or the manifest failed
+  /// validation (missing/invalid `semver`, bad JSON, unknown capability).
+  #[error(transparent)]
+  Manifest(#[from] ExtensionError),
+  /// An extension without an artifact cannot run anywhere.
+  #[error("extension artifact must not be empty")]
+  EmptyArtifact,
+  /// The id is already registered at an equal or higher version.
+  #[error(
+    "extension {id:?} is already registered at version {current}; version must strictly increase (got {received})"
+  )]
+  VersionNotIncreasing {
+    id: String,
+    current: u64,
+    received: u64,
+  },
   /// The extension storage domain reported a failure.
   #[error(transparent)]
   Storage(#[from] ExtensionStorageError),
@@ -192,6 +243,86 @@ impl ExtensionManager {
   /// an EXTENSION resource was applied (design section 6).
   pub fn notify(&self) -> Arc<Notify> {
     self.notify.clone()
+  }
+
+  /// Register an extension package from the admission path (design section
+  /// 4): validate id/engine/manifest/artifact, persist the record with the
+  /// same blob-before-metadata ordering as the anti-entropy apply pipeline,
+  /// then fire the reconcile notify so a selector-matching extension loads
+  /// immediately instead of waiting for the next sync round.
+  ///
+  /// The record is `ClusterShared` with this node as the source, so resource
+  /// anti-entropy converges it to every node. `created_at_ms` of an existing
+  /// id is preserved; the new `version` must strictly increase over it.
+  /// Returns the artifact's blake3 content hash.
+  pub fn register(
+    &self, registration: ExtensionRegistration,
+  ) -> Result<String, RegisterExtensionError> {
+    validate_resource_id(&registration.id)
+      .map_err(|_| RegisterExtensionError::InvalidId(registration.id.clone()))?;
+    let engine: EngineKind = registration.engine.parse()?;
+    // Parse-and-keep: validation guarantees the manifest is well-formed
+    // (`semver` included); the raw map is stored so unknown keys survive for
+    // forward compatibility (design section 4).
+    ExtensionManifest::from_map(&registration.manifest)?;
+    if registration.artifact.is_empty() {
+      return Err(RegisterExtensionError::EmptyArtifact);
+    }
+
+    let content_hash = hash_content(&registration.artifact);
+    let now = now_ms();
+    let existing = self.storage.extensions().get(&registration.id)?;
+    if let Some(existing) = &existing
+      && registration.version <= existing.version
+    {
+      return Err(RegisterExtensionError::VersionNotIncreasing {
+        id: registration.id.clone(),
+        current: existing.version,
+        received: registration.version,
+      });
+    }
+
+    let entry = if registration.entry.is_empty() {
+      DEFAULT_ENTRY.to_string()
+    } else {
+      registration.entry
+    };
+    let record = ExtensionRecord {
+      id: registration.id.clone(),
+      name: registration.name,
+      version: registration.version,
+      engine: engine.as_str().to_string(),
+      entry,
+      content_hash: content_hash.clone(),
+      scope: ResourceScope::ClusterShared,
+      source_node_id: Some(self.membership.local_node_id().to_string()),
+      created_at_ms: existing.map(|record| record.created_at_ms).unwrap_or(now),
+      updated_at_ms: now,
+      manifest: registration.manifest,
+      labels: registration.labels,
+    };
+    let applied = self
+      .storage
+      .extensions()
+      .apply_remote_extension(record, &registration.artifact)?;
+    if !applied {
+      // Lost a race against a concurrent registration or sync apply that
+      // landed an equal or newer version first.
+      let current = self
+        .storage
+        .extensions()
+        .get(&registration.id)?
+        .map(|record| record.version)
+        .unwrap_or(registration.version);
+      return Err(RegisterExtensionError::VersionNotIncreasing {
+        id: registration.id,
+        current,
+        received: registration.version,
+      });
+    }
+
+    self.notify.notify_one();
+    Ok(content_hash)
   }
 
   /// Invoke a locally running extension. `payload` is JSON; the return value
