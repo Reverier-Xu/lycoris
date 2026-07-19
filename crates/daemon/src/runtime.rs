@@ -5,10 +5,11 @@ use lycoris_core::{ClusterKey, now_ms};
 use lycoris_storage::{Storage, StorageError};
 use lycoris_tls::{TlsError, ensure_tls_bundle, install_crypto_provider};
 use thiserror::Error;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
 use crate::{
   extension::ExtensionManager,
+  llm::LlmRouter,
   membership::{LOCAL_INCARNATION_KEY, MemberRegister, MembershipService, SwimConfig},
   resource::ResourceMapper,
   rpc::{extension::ExtensionService, server::ClusterService},
@@ -113,10 +114,40 @@ pub async fn run(config: DaemonConfig) -> Result<(), RuntimeError> {
   run_with_shutdown(config, shutdown_tx, shutdown_rx, cluster_key).await
 }
 
+/// In-process handles of a running node: the typed call surfaces the design
+/// reserves for in-daemon consumers (llm-provider design, section 2 — the
+/// typed trait serves in-process callers, and section 8 keeps a typed proto
+/// service out of scope). Handed out through
+/// [`run_with_shutdown_and_handles`] so tests and future in-daemon consumers
+/// (agent workflows) share the live subsystem state instead of reconstructing
+/// it behind the runtime's back.
+pub struct NodeHandles {
+  /// The typed LLM facade over the node's extension subsystem.
+  pub llm: LlmRouter,
+}
+
 /// Run the daemon until the supplied shutdown signal becomes `true`.
 pub async fn run_with_shutdown(
   config: DaemonConfig, shutdown_tx: watch::Sender<bool>, shutdown: watch::Receiver<bool>,
   cluster_key: Option<ClusterKey>,
+) -> Result<(), RuntimeError> {
+  run_inner(config, shutdown_tx, shutdown, cluster_key, None).await
+}
+
+/// Same as [`run_with_shutdown`], additionally sending the node's in-process
+/// typed facades through `handles` once startup has assembled them (before
+/// the server starts listening).
+pub async fn run_with_shutdown_and_handles(
+  config: DaemonConfig, shutdown_tx: watch::Sender<bool>, shutdown: watch::Receiver<bool>,
+  cluster_key: Option<ClusterKey>, handles: oneshot::Sender<NodeHandles>,
+) -> Result<(), RuntimeError> {
+  run_inner(config, shutdown_tx, shutdown, cluster_key, Some(handles)).await
+}
+
+/// Run the daemon until the supplied shutdown signal becomes `true`.
+async fn run_inner(
+  config: DaemonConfig, shutdown_tx: watch::Sender<bool>, shutdown: watch::Receiver<bool>,
+  cluster_key: Option<ClusterKey>, handles: Option<oneshot::Sender<NodeHandles>>,
 ) -> Result<(), RuntimeError> {
   let data_dir = PathBuf::from(&config.data_dir);
   std::fs::create_dir_all(&data_dir)?;
@@ -216,6 +247,16 @@ pub async fn run_with_shutdown(
     .with_cluster_sync(cluster_sync.clone())
     .with_shutdown(shutdown_tx);
   let extension_service = ExtensionService::new(extension_manager.clone());
+
+  // Typed in-process facades over the assembled subsystems (llm-provider
+  // design, section 2), handed to the caller when it asked for handles. A
+  // receiver that went away (e.g. a test that failed early) is not a
+  // startup failure.
+  if let Some(handles) = handles {
+    let _ = handles.send(NodeHandles {
+      llm: LlmRouter::new(extension_manager.clone(), storage.clone()),
+    });
+  }
 
   let mut background = tokio::task::JoinSet::new();
 

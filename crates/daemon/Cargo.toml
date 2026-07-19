@@ -12,6 +12,7 @@ rust-version.workspace = true
 version.workspace      = true
 
 [dependencies]
+async-trait.workspace        = true
 lycoris-client.workspace     = true
 lycoris-config.workspace     = true
 lycoris-core.workspace       = true
@@ -20,17 +21,18 @@ lycoris-membership.workspace = true
 lycoris-proto.workspace      = true
 lycoris-storage.workspace    = true
 lycoris-tls.workspace        = true
-serde_json.workspace     = true
-thiserror.workspace      = true
-tokio.workspace          = true
-tonic.workspace          = true
-tracing.workspace        = true
+serde.workspace              = true
+serde_json.workspace         = true
+thiserror.workspace          = true
+tokio.workspace              = true
+tonic.workspace              = true
+tracing.workspace            = true
 
 [dev-dependencies]
-blake3.workspace     = true
-rcgen.workspace      = true
-rustls.workspace     = true
-tempfile.workspace   = true
+blake3.workspace   = true
+rcgen.workspace    = true
+rustls.workspace   = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

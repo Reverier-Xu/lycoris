@@ -4191,6 +4191,7 @@ dependencies = [
 name = "lycoris-daemon"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "blake3",
  "lycoris-client",
  "lycoris-config",
@@ -4202,6 +4203,7 @@ dependencies = [
  "lycoris-tls",
  "rcgen",
  "rustls",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
