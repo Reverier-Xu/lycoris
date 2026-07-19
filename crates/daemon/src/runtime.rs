@@ -147,6 +147,13 @@ pub async fn run_with_shutdown(
     node.peers().set_primary(first_peer, &config.node.address)?;
   }
 
+  // Config labels are merged into the node-local store before the register
+  // reads it back (set semantics: config keys overwrite stored values, other
+  // stored keys are kept), so the local register, gossip and the extension
+  // manager's selector evaluation all keep reading labels from the single
+  // storage source.
+  apply_config_labels(node.local(), &config.node.labels)?;
+
   // The local incarnation is persisted across restarts (P5b) and bumped on
   // every boot: rejoining with the next incarnation makes the fresh Active
   // register dominate — and thereby refute — any suspect/offline rumor the
@@ -302,6 +309,19 @@ fn spawn_until_shutdown(
   });
 }
 
+/// Merge the `[node] labels` config map into the node-local store with set
+/// semantics: config keys overwrite stored values, keys the config does not
+/// mention keep their stored values. Storage stays the single label source the
+/// local register and selector evaluation read from.
+fn apply_config_labels(
+  local: &lycoris_storage::LocalStorage, labels: &std::collections::HashMap<String, String>,
+) -> Result<(), RuntimeError> {
+  for (key, value) in labels {
+    local.set_label(key, value)?;
+  }
+  Ok(())
+}
+
 async fn wait_shutdown(mut shutdown: watch::Receiver<bool>) {
   while !*shutdown.borrow() {
     if shutdown.changed().await.is_err() {
@@ -350,5 +370,61 @@ fn load_cluster_key(data_dir: &str) -> Option<ClusterKey> {
       );
       None
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use std::collections::HashMap;
+
+  use lycoris_storage::Storage;
+  use tempfile::TempDir;
+
+  use super::apply_config_labels;
+
+  #[test]
+  fn apply_config_labels_writes_new_keys() {
+    let dir = TempDir::new().unwrap();
+    let storage = Storage::open(dir.path().join("lycoris.redb")).unwrap();
+    let labels = HashMap::from([("role".to_string(), "runner".to_string())]);
+
+    apply_config_labels(storage.node().local(), &labels).unwrap();
+
+    assert_eq!(storage.node().local().labels().unwrap(), labels);
+  }
+
+  #[test]
+  fn apply_config_labels_overwrites_config_keys_and_keeps_the_rest() {
+    let dir = TempDir::new().unwrap();
+    let storage = Storage::open(dir.path().join("lycoris.redb")).unwrap();
+    // A value stored out-of-band (previous config, older deployment) is
+    // overwritten when the config names the key and kept when it does not.
+    storage.node().local().set_label("role", "worker").unwrap();
+    storage.node().local().set_label("zone", "eu").unwrap();
+    let config_labels = HashMap::from([("role".to_string(), "runner".to_string())]);
+
+    apply_config_labels(storage.node().local(), &config_labels).unwrap();
+
+    assert_eq!(
+      storage.node().local().labels().unwrap(),
+      HashMap::from([
+        ("role".to_string(), "runner".to_string()),
+        ("zone".to_string(), "eu".to_string()),
+      ])
+    );
+  }
+
+  #[test]
+  fn apply_config_labels_with_an_empty_map_changes_nothing() {
+    let dir = TempDir::new().unwrap();
+    let storage = Storage::open(dir.path().join("lycoris.redb")).unwrap();
+    storage.node().local().set_label("zone", "eu").unwrap();
+
+    apply_config_labels(storage.node().local(), &HashMap::new()).unwrap();
+
+    assert_eq!(
+      storage.node().local().labels().unwrap(),
+      HashMap::from([("zone".to_string(), "eu".to_string())])
+    );
   }
 }

@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 
 use serde::{Deserialize, Serialize};
 
@@ -12,9 +12,12 @@ use crate::{
 ///
 /// This file only contains information that is specific to the current node and
 /// required to join the cluster (identity, listen address, TLS material
-/// location, data directory). All dynamic runtime state such as peer list,
-/// primary endpoint, node labels/annotations, and peer reachability is stored
-/// in the SQLite database under `data_dir`.
+/// location, data directory) plus the node's static scheduling labels. All
+/// dynamic runtime state such as peer list, primary endpoint, node
+/// annotations, and peer reachability is stored in the redb database under
+/// `data_dir`; the configured labels are merged into that store at startup
+/// (set semantics) so the local register and selector evaluation keep reading
+/// labels from a single source.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonConfig {
@@ -83,6 +86,11 @@ pub struct NodeConfig {
   pub id: String,
   #[serde(deserialize_with = "non_empty_string")]
   pub address: String,
+  /// Static node labels exposed to the cluster for scheduling and extension
+  /// selector activation. Merged into the node-local label store at startup
+  /// (config keys overwrite stored values; other stored keys are kept).
+  #[serde(default)]
+  pub labels: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -196,6 +204,38 @@ mod tests {
     assert_eq!(cfg.node.id, "node-01");
     assert_eq!(cfg.cluster.bootstrap_peers.len(), 1);
     assert_eq!(cfg.data_dir, "data");
+  }
+
+  #[test]
+  fn node_labels_default_to_empty() {
+    let cfg: DaemonConfig = toml::from_str(VALID_TOML).unwrap();
+    assert!(cfg.node.labels.is_empty());
+  }
+
+  #[test]
+  fn parse_node_labels() {
+    let toml = VALID_TOML.replace(
+      "address = \"https://127.0.0.1:5001\"",
+      "address = \"https://127.0.0.1:5001\"\nlabels = { role = \"runner\", zone = \"eu\" }",
+    );
+    let cfg: DaemonConfig = toml::from_str(&toml).unwrap();
+    assert_eq!(
+      cfg.node.labels,
+      HashMap::from([
+        ("role".to_string(), "runner".to_string()),
+        ("zone".to_string(), "eu".to_string()),
+      ])
+    );
+  }
+
+  #[test]
+  fn reject_non_string_node_label_value() {
+    let toml = VALID_TOML.replace(
+      "address = \"https://127.0.0.1:5001\"",
+      "address = \"https://127.0.0.1:5001\"\nlabels = { role = 1 }",
+    );
+    let result: Result<DaemonConfig, _> = toml::from_str(&toml);
+    assert!(result.is_err());
   }
 
   #[test]

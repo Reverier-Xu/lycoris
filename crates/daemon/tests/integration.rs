@@ -140,6 +140,7 @@ fn build_config(
     node: NodeConfig {
       id: id.to_string(),
       address: format!("https://127.0.0.1:{listen_port}"),
+      labels: HashMap::new(),
     },
     cluster: ClusterConfig {
       listen_address: format!("127.0.0.1:{listen_port}"),
@@ -1381,19 +1382,6 @@ async fn extension_invocation_routes_to_the_capable_node() {
   let cluster_key = ClusterKey::generate().expect("generate cluster key");
   let key_hex = cluster_key.to_hex();
 
-  // Node labels live only in the storage node-local domain — DaemonConfig has
-  // no label surface — so node-1's label is written directly before boot; the
-  // runtime registers exactly these labels into membership.
-  {
-    let storage =
-      Storage::open(data_dirs[1].path().join("lycoris.redb")).expect("open node-1 storage");
-    storage
-      .node()
-      .local()
-      .set_label("role", "runner")
-      .expect("set node-1 label");
-  }
-
   // Publish the extension on node-0: a cluster-shared record whose selector
   // matches only node-1's label, so resource anti-entropy converges it to
   // both nodes but only node-1 activates it.
@@ -1424,7 +1412,10 @@ async fn extension_invocation_routes_to_the_capable_node() {
     assert!(applied);
   }
 
-  let configs: Vec<DaemonConfig> = (0..node_count)
+  // node-1's label arrives through the `[node] labels` config surface; the
+  // runtime merges it into the node-local store at startup and registers
+  // exactly these labels into membership.
+  let mut configs: Vec<DaemonConfig> = (0..node_count)
     .map(|i| {
       let port = base_port + i as u16;
       let peer = format!("https://127.0.0.1:{}", base_port + ((i + 1) % 2) as u16);
@@ -1440,6 +1431,10 @@ async fn extension_invocation_routes_to_the_capable_node() {
       )
     })
     .collect();
+  configs[1]
+    .node
+    .labels
+    .insert("role".to_string(), "runner".to_string());
 
   for config in configs.clone() {
     spawn_runtime(config, cluster_key.clone());

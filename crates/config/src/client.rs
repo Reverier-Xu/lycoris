@@ -139,6 +139,7 @@ mod tests {
       node: NodeConfig {
         id: "node-1".to_string(),
         address: "https://127.0.0.1:5001".to_string(),
+        labels: std::collections::HashMap::new(),
       },
       cluster: ClusterConfig {
         listen_address: "0.0.0.0:5001".to_string(),
