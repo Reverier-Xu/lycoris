@@ -4230,6 +4230,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lycoris-extension-guest"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "lycoris-membership"
 version = "0.1.0"
 dependencies = [
