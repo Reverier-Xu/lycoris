@@ -597,7 +597,14 @@ impl ExtensionManager {
       EngineKind::Lua => &self.lua,
     };
     let semver = package.manifest.semver.to_string();
-    let instance = engine.load(&package).await?;
+    // The manifest's settings JSON is the whole settings document for now;
+    // the node-local overlay (`[extensions.local.<id>]`) merges in a later
+    // batch (llm-provider design section 5).
+    let settings: serde_json::Value =
+      serde_json::from_str(&package.manifest.settings).map_err(|err| {
+        ExtensionError::InvalidPayload(format!("manifest settings are not valid JSON: {err}"))
+      })?;
+    let instance = engine.load(&package, settings).await?;
     Ok(LoadedExtension {
       version: record.version,
       semver,

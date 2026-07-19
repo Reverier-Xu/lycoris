@@ -135,7 +135,9 @@ mod tests {
   use crate::membership::{MemberRegister, MembershipService};
 
   const ECHO_SOURCE: &[u8] = b"function invoke(method, payload) return payload end";
-  const FAILING_SOURCE: &[u8] = b"function invoke(method, payload) error(\"boom\") end";
+  // Fails every method but `configure`: a hook guest must load (configure
+  // succeeds) so the failure surfaces at hook invocation time.
+  const FAILING_SOURCE: &[u8] = b"function invoke(method, payload) if method ~= \"configure\" then error(\"boom\") else return {ok = true} end end";
 
   fn test_dispatcher(dir: &TempDir) -> (Storage, Arc<ExtensionManager>, HookDispatcher) {
     let storage = Storage::open(dir.path().join("lycoris.redb")).unwrap();

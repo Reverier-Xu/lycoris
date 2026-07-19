@@ -89,7 +89,14 @@ pub trait ExtensionEngine: Send + Sync {
   /// Load a package into an instance, verifying the content hash, the
   /// package engine kind and all engine-specific shape (ABI exports for
   /// WASM, entry function presence for Lua).
-  async fn load(&self, package: &ExtensionPackage) -> Result<Box<dyn ExtensionInstance>>;
+  ///
+  /// After instantiation the engine itself delivers `settings` to the guest
+  /// by invoking the `configure` method (llm-provider design section 5);
+  /// only a successfully configured — or configure-less — instance is handed
+  /// back. See [`configure_instance`] for the compatibility policy.
+  async fn load(
+    &self, package: &ExtensionPackage, settings: serde_json::Value,
+  ) -> Result<Box<dyn ExtensionInstance>>;
 }
 
 /// A loaded extension ready to serve invocations.
@@ -98,4 +105,82 @@ pub trait ExtensionInstance: Send + Sync {
   /// Invoke the extension's entry point. `payload` is JSON; the return value is
   /// JSON.
   async fn invoke(&self, method: &str, payload: &[u8]) -> Result<Vec<u8>>;
+}
+
+/// Method name carrying the resolved per-node settings (llm-provider design
+/// section 5).
+pub const CONFIGURE_METHOD: &str = "configure";
+
+/// Deliver the resolved settings to a freshly instantiated guest by invoking
+/// its `configure` method, and classify the outcome:
+///
+/// - success — the guest accepted the settings (the response payload is not
+///   interpreted: a guest rejecting settings raises instead of returning an
+///   error document, keeping "success" unambiguous);
+/// - a *method not found* class failure — the guest predates the configure
+///   convention (a Lua dispatch `error("unknown method: ...")`, or a wasm guest
+///   shim reporting the same through its error channel); this is not a failure:
+///   the instance simply runs without settings, so it is logged at debug level
+///   and load proceeds;
+/// - any other failure — the guest has `configure` and it failed: the load
+///   fails, so a misconfigured extension never serves traffic.
+///
+/// Detection is a substring match on the error message — the simplest
+/// workable convention until the ABI grows a typed "no such method" signal.
+pub(crate) async fn configure_instance(
+  instance: &dyn ExtensionInstance, extension_id: &str, settings: &serde_json::Value,
+) -> Result<()> {
+  let payload = serde_json::to_vec(settings).map_err(|err| {
+    ExtensionError::InvalidPayload(format!("failed to encode the configure payload: {err}"))
+  })?;
+  match instance.invoke(CONFIGURE_METHOD, &payload).await {
+    Ok(_) => Ok(()),
+    Err(error) if is_method_not_found(&error) => {
+      tracing::debug!(extension = %extension_id, %error, "guest does not implement configure; continuing without settings delivery");
+      Ok(())
+    }
+    Err(error) => Err(error),
+  }
+}
+
+/// Classify an invoke failure as the guest not implementing the method.
+fn is_method_not_found(error: &ExtensionError) -> bool {
+  let message = match error {
+    ExtensionError::Script(message) | ExtensionError::GuestTrap(message) => message,
+    _ => return false,
+  };
+  message.to_ascii_lowercase().contains("unknown method")
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn method_not_found_matches_the_guest_error_channels() {
+    for error in [
+      ExtensionError::Script("runtime error: unknown method: configure".to_string()),
+      ExtensionError::GuestTrap("guest failed: Unknown Method configure".to_string()),
+    ] {
+      assert!(
+        is_method_not_found(&error),
+        "expected tolerance for {error}"
+      );
+    }
+  }
+
+  #[test]
+  fn method_not_found_rejects_real_failures() {
+    for error in [
+      ExtensionError::Script("runtime error: bad settings".to_string()),
+      ExtensionError::GuestTrap("wasm `unreachable` instruction executed".to_string()),
+      ExtensionError::Timeout(Duration::from_secs(1)),
+      ExtensionError::Engine("failed to prepare lua state".to_string()),
+    ] {
+      assert!(
+        !is_method_not_found(&error),
+        "expected a failure for {error}"
+      );
+    }
+  }
 }

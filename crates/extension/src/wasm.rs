@@ -136,8 +136,10 @@ impl ExtensionEngine for WasmEngine {
     EngineKind::Wasm
   }
 
-  async fn load(&self, package: &ExtensionPackage) -> Result<Box<dyn ExtensionInstance>> {
-    Ok(Box::new(self.load_instance(package).await?))
+  async fn load(
+    &self, package: &ExtensionPackage, settings: serde_json::Value,
+  ) -> Result<Box<dyn ExtensionInstance>> {
+    Ok(Box::new(self.load_instance(package, settings).await?))
   }
 }
 
@@ -146,7 +148,9 @@ impl WasmEngine {
   /// package engine kind and the ABI shape, then instantiate. Split from the
   /// trait method so tests can reach instance internals (the http egress
   /// policy) without a downcast.
-  async fn load_instance(&self, package: &ExtensionPackage) -> Result<WasmInstance> {
+  async fn load_instance(
+    &self, package: &ExtensionPackage, settings: serde_json::Value,
+  ) -> Result<WasmInstance> {
     package.verify()?;
     if package.engine != EngineKind::Wasm {
       return Err(ExtensionError::Engine(format!(
@@ -196,7 +200,7 @@ impl WasmEngine {
       .get_typed_func::<(i32, i32, i32, i32), i64>(&mut store, INVOKE_EXPORT)
       .map_err(|err| ExtensionError::Engine(format!("invalid lycoris_invoke signature: {err}")))?;
 
-    Ok(WasmInstance {
+    let instance = WasmInstance {
       store: Mutex::new(store),
       memory,
       alloc,
@@ -204,8 +208,49 @@ impl WasmEngine {
       fuel: self.limits.wasm_fuel_per_call,
       deadline: self.limits.invoke_timeout,
       http_allow_hosts,
-    })
+    };
+
+    // Apply the egress policy from the resolved settings before the guest
+    // serves anything (llm-provider design section 4).
+    *instance
+      .http_allow_hosts
+      .write()
+      .map_err(|err| ExtensionError::Engine(format!("http allowlist lock poisoned: {err}")))? =
+      parse_http_allow_hosts(&settings)?;
+
+    // Deliver the settings through the configure method; a guest with a
+    // failing configure never becomes servable (llm-provider design
+    // section 5).
+    crate::engine::configure_instance(&instance, &package.id, &settings).await?;
+
+    Ok(instance)
   }
+}
+
+/// Extract the `http_allow_hosts` egress policy from resolved settings:
+/// absent or null allows every host; a present list restricts the http
+/// import to exactly those host names.
+///
+/// Node-local overrides (`[extensions.local.<id>]`) are string-valued, so an
+/// allowlist coming from there arrives JSON-encoded inside a string; both
+/// shapes are accepted.
+fn parse_http_allow_hosts(settings: &serde_json::Value) -> Result<Option<Vec<String>>> {
+  let Some(value) = settings.get("http_allow_hosts") else {
+    return Ok(None);
+  };
+  if value.is_null() {
+    return Ok(None);
+  }
+  let hosts: Vec<String> = match value {
+    serde_json::Value::String(raw) => serde_json::from_str(raw),
+    other => serde_json::from_value(other.clone()),
+  }
+  .map_err(|err| {
+    ExtensionError::InvalidPayload(format!(
+      "http_allow_hosts must be an array of host names: {err}"
+    ))
+  })?;
+  Ok(Some(hosts))
 }
 
 /// A loaded WASM extension: one store holding one instantiated guest.
@@ -217,8 +262,7 @@ struct WasmInstance {
   fuel: u64,
   deadline: Duration,
   /// Egress policy shared with the store state; `None` allows every host.
-  /// Read by the configure path (settings injection) and by engine tests.
-  #[allow(dead_code)]
+  /// Populated from `http_allow_hosts` in the resolved settings at load.
   http_allow_hosts: Arc<RwLock<Option<Vec<String>>>>,
 }
 
@@ -533,37 +577,54 @@ mod tests {
           (i64.extend_i32_u (local.get $total)))))
   "#;
 
-  /// Guest that traps on invocation.
-  const TRAP_WAT: &str = r#"
+  /// Guest that traps on every method but `configure` (the engine's settings
+  /// delivery must succeed so the trap surfaces at invoke time).
+  fn trap_wat() -> String {
+    format!(
+      r#"
     (module
-      (memory (export "memory") 1)
-      (func (export "lycoris_alloc") (param $len i32) (result i32)
-        (i32.const 1024))
+      {CONFIGURE_PROLOGUE}
+      (data (i32.const 16) "{{}}")
       (func (export "lycoris_invoke") (param $mp i32) (param $ml i32) (param $pp i32) (param $pl i32) (result i64)
+        (if (call $is_configure (local.get $mp) (local.get $ml))
+          (then (return (i64.or (i64.shl (i64.const 16) (i64.const 32)) (i64.const 2)))))
         (unreachable)))
-  "#;
+  "#
+    )
+  }
 
-  /// Guest that spins forever, burning fuel.
-  const LOOP_WAT: &str = r#"
+  /// Guest that spins forever on every method but `configure`, burning fuel.
+  fn loop_wat() -> String {
+    format!(
+      r#"
     (module
-      (memory (export "memory") 1)
-      (func (export "lycoris_alloc") (param $len i32) (result i32)
-        (i32.const 1024))
+      {CONFIGURE_PROLOGUE}
+      (data (i32.const 16) "{{}}")
       (func (export "lycoris_invoke") (param $mp i32) (param $ml i32) (param $pp i32) (param $pl i32) (result i64)
+        (if (call $is_configure (local.get $mp) (local.get $ml))
+          (then (return (i64.or (i64.shl (i64.const 16) (i64.const 32)) (i64.const 2)))))
         (loop (br 0))
         (unreachable)))
-  "#;
+  "#
+    )
+  }
 
-  /// Guest whose invoke hands back a non-JSON response buffer.
-  const NON_JSON_WAT: &str = r#"
+  /// Guest whose invoke hands back a non-JSON response buffer (`configure`
+  /// still answers well-formed JSON so the load succeeds).
+  fn non_json_wat() -> String {
+    format!(
+      r#"
     (module
-      (memory (export "memory") 1)
-      (data (i32.const 16) "not json")
-      (func (export "lycoris_alloc") (param $len i32) (result i32)
-        (i32.const 1024))
+      {CONFIGURE_PROLOGUE}
+      (data (i32.const 16) "{{}}")
+      (data (i32.const 24) "not json")
       (func (export "lycoris_invoke") (param $mp i32) (param $ml i32) (param $pp i32) (param $pl i32) (result i64)
-        (i64.or (i64.shl (i64.const 16) (i64.const 32)) (i64.const 8))))
-  "#;
+        (if (call $is_configure (local.get $mp) (local.get $ml))
+          (then (return (i64.or (i64.shl (i64.const 16) (i64.const 32)) (i64.const 2)))))
+        (i64.or (i64.shl (i64.const 24) (i64.const 32)) (i64.const 8))))
+  "#
+    )
+  }
 
   fn manifest() -> ExtensionManifest {
     ExtensionManifest::from_map(&BTreeMap::from([(
@@ -592,7 +653,7 @@ mod tests {
   async fn load_with_limits(wat_source: &str, limits: EngineLimits) -> Box<dyn ExtensionInstance> {
     WasmEngine::new(limits)
       .unwrap()
-      .load(&package_wat(wat_source))
+      .load(&package_wat(wat_source), serde_json::json!({}))
       .await
       .unwrap()
   }
@@ -621,7 +682,7 @@ mod tests {
 
   #[tokio::test]
   async fn guest_traps_map_to_the_guest_trap_variant() {
-    let instance = load(TRAP_WAT).await;
+    let instance = load(&trap_wat()).await;
     let result = instance.invoke("m", b"{}").await;
     assert!(matches!(result, Err(ExtensionError::GuestTrap(_))));
   }
@@ -632,7 +693,7 @@ mod tests {
       wasm_fuel_per_call: 100_000,
       ..EngineLimits::default()
     };
-    let instance = load_with_limits(LOOP_WAT, limits).await;
+    let instance = load_with_limits(&loop_wat(), limits).await;
     let result = instance.invoke("m", b"{}").await;
     let Err(ExtensionError::GuestTrap(message)) = result else {
       panic!("expected a guest trap, got {result:?}");
@@ -659,7 +720,7 @@ mod tests {
     };
     let result = WasmEngine::new(limits)
       .unwrap()
-      .load(&package_wat(balloon))
+      .load(&package_wat(balloon), serde_json::json!({}))
       .await;
     assert!(matches!(result, Err(ExtensionError::GuestTrap(_))));
   }
@@ -674,7 +735,7 @@ mod tests {
     "#;
     let result = WasmEngine::new(EngineLimits::default())
       .unwrap()
-      .load(&package_wat(missing_alloc))
+      .load(&package_wat(missing_alloc), serde_json::json!({}))
       .await;
     assert!(matches!(result, Err(ExtensionError::Engine(err)) if err.contains("lycoris_alloc")));
   }
@@ -690,7 +751,7 @@ mod tests {
     "#;
     let result = WasmEngine::new(EngineLimits::default())
       .unwrap()
-      .load(&package_wat(missing_memory))
+      .load(&package_wat(missing_memory), serde_json::json!({}))
       .await;
     assert!(matches!(result, Err(ExtensionError::Engine(err)) if err.contains("memory")));
   }
@@ -707,7 +768,7 @@ mod tests {
     "#;
     let result = WasmEngine::new(EngineLimits::default())
       .unwrap()
-      .load(&package_wat(wrong_signature))
+      .load(&package_wat(wrong_signature), serde_json::json!({}))
       .await;
     assert!(matches!(result, Err(ExtensionError::Engine(_))));
   }
@@ -725,7 +786,7 @@ mod tests {
     "#;
     let result = WasmEngine::new(EngineLimits::default())
       .unwrap()
-      .load(&package_wat(wasi_module))
+      .load(&package_wat(wasi_module), serde_json::json!({}))
       .await;
     assert!(
       matches!(result, Err(ExtensionError::Engine(err)) if err.contains("unsupported import"))
@@ -734,7 +795,7 @@ mod tests {
 
   #[tokio::test]
   async fn non_json_guest_output_is_an_invalid_payload() {
-    let instance = load(NON_JSON_WAT).await;
+    let instance = load(&non_json_wat()).await;
     let result = instance.invoke("m", b"{}").await;
     assert!(matches!(result, Err(ExtensionError::InvalidPayload(_))));
   }
@@ -752,7 +813,7 @@ mod tests {
     package.engine = EngineKind::Lua;
     let result = WasmEngine::new(EngineLimits::default())
       .unwrap()
-      .load(&package)
+      .load(&package, serde_json::json!({}))
       .await;
     assert!(matches!(result, Err(ExtensionError::Engine(_))));
   }
@@ -763,7 +824,7 @@ mod tests {
     package.content_hash = "0".repeat(64);
     let result = WasmEngine::new(EngineLimits::default())
       .unwrap()
-      .load(&package)
+      .load(&package, serde_json::json!({}))
       .await;
     assert!(matches!(
       result,
@@ -906,7 +967,7 @@ mod tests {
   async fn http_import_without_the_capability_fails_to_load() {
     let result = WasmEngine::new(EngineLimits::default())
       .unwrap()
-      .load(&package_wat(HTTP_FORWARD_WAT))
+      .load(&package_wat(HTTP_FORWARD_WAT), serde_json::json!({}))
       .await;
     match result {
       Err(ExtensionError::Engine(err)) => {
@@ -921,7 +982,10 @@ mod tests {
   async fn http_round_trip_against_a_mock_server() {
     let server = MockHttp::start().await;
     let engine = WasmEngine::new(EngineLimits::default()).unwrap();
-    let instance = engine.load_instance(&http_package()).await.unwrap();
+    let instance = engine
+      .load_instance(&http_package(), serde_json::json!({}))
+      .await
+      .unwrap();
 
     let document = request_document(
       "POST",
@@ -945,7 +1009,10 @@ mod tests {
   async fn http_status_codes_pass_through_to_the_guest() {
     let server = MockHttp::start().await;
     let engine = WasmEngine::new(EngineLimits::default()).unwrap();
-    let instance = engine.load_instance(&http_package()).await.unwrap();
+    let instance = engine
+      .load_instance(&http_package(), serde_json::json!({}))
+      .await
+      .unwrap();
 
     let document = request_document("GET", &format!("{}/teapot", server.base_url), None);
     let output = instance.invoke("http", &document).await.unwrap();
@@ -961,7 +1028,10 @@ mod tests {
   async fn http_response_bodies_hit_the_8_mib_cap() {
     let server = MockHttp::start().await;
     let engine = WasmEngine::new(EngineLimits::default()).unwrap();
-    let instance = engine.load_instance(&http_package()).await.unwrap();
+    let instance = engine
+      .load_instance(&http_package(), serde_json::json!({}))
+      .await
+      .unwrap();
 
     let document = request_document("GET", &format!("{}/huge", server.base_url), None);
     let output = instance.invoke("http", &document).await.unwrap();
@@ -974,7 +1044,10 @@ mod tests {
   async fn http_allow_hosts_rejects_unlisted_hosts_without_trapping() {
     let server = MockHttp::start().await;
     let engine = WasmEngine::new(EngineLimits::default()).unwrap();
-    let instance = engine.load_instance(&http_package()).await.unwrap();
+    let instance = engine
+      .load_instance(&http_package(), serde_json::json!({}))
+      .await
+      .unwrap();
     *instance.http_allow_hosts.write().unwrap() = Some(vec!["api.openai.com".to_string()]);
 
     let document = request_document("GET", &format!("{}/echo", server.base_url), None);
@@ -988,7 +1061,10 @@ mod tests {
   async fn http_allow_hosts_passes_listed_hosts() {
     let server = MockHttp::start().await;
     let engine = WasmEngine::new(EngineLimits::default()).unwrap();
-    let instance = engine.load_instance(&http_package()).await.unwrap();
+    let instance = engine
+      .load_instance(&http_package(), serde_json::json!({}))
+      .await
+      .unwrap();
     *instance.http_allow_hosts.write().unwrap() = Some(vec!["127.0.0.1".to_string()]);
 
     let document = request_document("GET", &format!("{}/echo", server.base_url), None);
@@ -996,5 +1072,173 @@ mod tests {
     let response = parse_output(&output);
 
     assert_eq!(response["status"], 200);
+  }
+
+  /// Shared WAT prologue for the configure fixtures: bump allocator plus an
+  /// `$is_configure` predicate comparing the method against `"configure"`
+  /// (`"configur"` as one little-endian i64 plus the trailing `e`).
+  const CONFIGURE_PROLOGUE: &str = r#"
+      (memory (export "memory") 1)
+      (global $heap (mut i32) (i32.const 1024))
+      (func $alloc (export "lycoris_alloc") (param $len i32) (result i32)
+        (local $ptr i32)
+        (local.set $ptr (global.get $heap))
+        (global.set $heap (i32.add (local.get $ptr) (local.get $len)))
+        (local.get $ptr))
+      (func $is_configure (param $ptr i32) (param $len i32) (result i32)
+        (i32.and
+          (i32.eq (local.get $len) (i32.const 9))
+          (i32.and
+            (i64.eq (i64.load align=1 (local.get $ptr)) (i64.const 8247611994986671971))
+            (i32.eq (i32.load8_u (i32.add (local.get $ptr) (i32.const 8))) (i32.const 101)))))
+  "#;
+
+  /// Configure-recording guest: on `configure` it stashes the payload in a
+  /// static region and answers `{"configured":true}`; any other method
+  /// returns the stashed settings verbatim.
+  fn configure_wat() -> String {
+    format!(
+      r#"
+    (module
+      {CONFIGURE_PROLOGUE}
+      (data (i32.const 16) "{{\"configured\":true}}")
+      (global $saved_len (mut i32) (i32.const 0))
+      (func (export "lycoris_invoke") (param $mp i32) (param $ml i32) (param $pp i32) (param $pl i32) (result i64)
+        (if (call $is_configure (local.get $mp) (local.get $ml))
+          (then
+            (memory.copy (i32.const 8192) (local.get $pp) (local.get $pl))
+            (global.set $saved_len (local.get $pl))
+            (return (i64.or (i64.shl (i64.const 16) (i64.const 32)) (i64.const 19)))))
+        (i64.or
+          (i64.shl (i64.const 8192) (i64.const 32))
+          (i64.extend_i32_u (global.get $saved_len)))))
+  "#
+    )
+  }
+
+  /// Configure-rejecting guest: traps on `configure`, echoes everything else.
+  fn configure_trap_wat() -> String {
+    format!(
+      r#"
+    (module
+      {CONFIGURE_PROLOGUE}
+      (func (export "lycoris_invoke") (param $mp i32) (param $ml i32) (param $pp i32) (param $pl i32) (result i64)
+        (if (call $is_configure (local.get $mp) (local.get $ml))
+          (then (unreachable)))
+        (i64.or
+          (i64.shl (i64.extend_i32_u (local.get $pp)) (i64.const 32))
+          (i64.extend_i32_u (local.get $pl)))))
+  "#
+    )
+  }
+
+  #[tokio::test]
+  async fn configure_receives_the_exact_settings_json() {
+    let settings = serde_json::json!({"token": "abc", "limits": {"n": 1}, "flags": [true]});
+    let engine = WasmEngine::new(EngineLimits::default()).unwrap();
+    let instance = engine
+      .load_instance(&package_wat(&configure_wat()), settings.clone())
+      .await
+      .unwrap();
+    let output = instance.invoke("state", b"{}").await.unwrap();
+    assert_eq!(parse_output(&output), settings);
+  }
+
+  #[tokio::test]
+  async fn a_failing_configure_fails_the_load() {
+    let result = WasmEngine::new(EngineLimits::default())
+      .unwrap()
+      .load(&package_wat(&configure_trap_wat()), serde_json::json!({}))
+      .await;
+    assert!(
+      matches!(result, Err(ExtensionError::GuestTrap(_))),
+      "expected a configure trap, got {}",
+      result.err().map(|err| err.to_string()).unwrap_or_default()
+    );
+  }
+
+  #[tokio::test]
+  async fn a_guest_without_configure_loads_and_serves() {
+    // The echo guest has no configure branch: it answers the configure call
+    // like any other, which the engine accepts as a (vacuous) success.
+    let instance = load(ECHO_WAT).await;
+    let output = instance.invoke("anything", br#"{"a":1}"#).await.unwrap();
+    assert_eq!(parse_output(&output), serde_json::json!({"a": 1}));
+  }
+
+  #[tokio::test]
+  async fn http_allow_hosts_from_settings_restricts_egress() {
+    let server = MockHttp::start().await;
+    let engine = WasmEngine::new(EngineLimits::default()).unwrap();
+    let instance = engine
+      .load_instance(
+        &http_package(),
+        serde_json::json!({"http_allow_hosts": ["api.openai.com"]}),
+      )
+      .await
+      .unwrap();
+
+    let document = request_document("GET", &format!("{}/echo", server.base_url), None);
+    let output = instance.invoke("http", &document).await.unwrap();
+    let response = parse_output(&output);
+
+    assert_eq!(response["error"]["type"], "host_not_allowed");
+  }
+
+  #[tokio::test]
+  async fn http_allow_hosts_from_settings_allows_listed_hosts() {
+    let server = MockHttp::start().await;
+    let engine = WasmEngine::new(EngineLimits::default()).unwrap();
+    let instance = engine
+      .load_instance(
+        &http_package(),
+        serde_json::json!({"http_allow_hosts": ["127.0.0.1"]}),
+      )
+      .await
+      .unwrap();
+
+    let document = request_document("GET", &format!("{}/echo", server.base_url), None);
+    let output = instance.invoke("http", &document).await.unwrap();
+    let response = parse_output(&output);
+
+    assert_eq!(response["status"], 200);
+  }
+
+  #[test]
+  fn http_allow_hosts_settings_parsing() {
+    // Absent or null: every host is allowed.
+    assert_eq!(
+      parse_http_allow_hosts(&serde_json::json!({})).unwrap(),
+      None
+    );
+    assert_eq!(
+      parse_http_allow_hosts(&serde_json::json!({"http_allow_hosts": null})).unwrap(),
+      None
+    );
+    // A list restricts egress to exactly those hosts.
+    assert_eq!(
+      parse_http_allow_hosts(&serde_json::json!({"http_allow_hosts": ["a.com", "b.com"]})).unwrap(),
+      Some(vec!["a.com".to_string(), "b.com".to_string()])
+    );
+    // Node-local overrides are string-valued, so the list may arrive
+    // JSON-encoded inside a string.
+    assert_eq!(
+      parse_http_allow_hosts(&serde_json::json!({"http_allow_hosts": "[\"a.com\"]"})).unwrap(),
+      Some(vec!["a.com".to_string()])
+    );
+    // Malformed policies fail the load instead of silently opening egress.
+    for bad in [
+      serde_json::json!({"http_allow_hosts": 42}),
+      serde_json::json!({"http_allow_hosts": [1]}),
+      serde_json::json!({"http_allow_hosts": "not json"}),
+    ] {
+      assert!(
+        matches!(
+          parse_http_allow_hosts(&bad),
+          Err(ExtensionError::InvalidPayload(_))
+        ),
+        "expected an invalid payload error for {bad}"
+      );
+    }
   }
 }

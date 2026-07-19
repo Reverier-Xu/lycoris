@@ -16,7 +16,7 @@ mod manifest;
 mod package;
 mod wasm;
 
-pub use engine::{EngineKind, EngineLimits, ExtensionEngine, ExtensionInstance};
+pub use engine::{CONFIGURE_METHOD, EngineKind, EngineLimits, ExtensionEngine, ExtensionInstance};
 pub use error::{ExtensionError, Result};
 pub use lua::LuaEngine;
 pub use manifest::{ExtensionManifest, HookDecl, HookErrorPolicy};

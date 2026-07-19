@@ -52,7 +52,9 @@ impl ExtensionEngine for LuaEngine {
     EngineKind::Lua
   }
 
-  async fn load(&self, package: &ExtensionPackage) -> Result<Box<dyn ExtensionInstance>> {
+  async fn load(
+    &self, package: &ExtensionPackage, settings: serde_json::Value,
+  ) -> Result<Box<dyn ExtensionInstance>> {
     package.verify()?;
     if package.engine != EngineKind::Lua {
       return Err(ExtensionError::Engine(format!(
@@ -81,12 +83,17 @@ impl ExtensionEngine for LuaEngine {
         .await
         .map_err(|err| ExtensionError::Engine(format!("lua load task failed: {err}")))??;
 
-    Ok(Box::new(LuaInstance {
+    let instance = LuaInstance {
       lua,
       entry_fn,
       instruction_budget: limits.lua_instructions_per_call,
       deadline: limits.invoke_timeout,
-    }))
+    };
+    // Deliver the settings through the configure method; a guest with a
+    // failing configure never becomes servable (llm-provider design
+    // section 5).
+    crate::engine::configure_instance(&instance, &package.id, &settings).await?;
+    Ok(Box::new(instance))
   }
 }
 
@@ -292,7 +299,7 @@ mod tests {
 
   async fn load(source: &str) -> Box<dyn ExtensionInstance> {
     LuaEngine::new(EngineLimits::default())
-      .load(&package(source))
+      .load(&package(source), serde_json::json!({}))
       .await
       .unwrap()
   }
@@ -345,7 +352,7 @@ mod tests {
       b"function handle(method, payload) return payload end".to_vec(),
     );
     let instance = LuaEngine::new(EngineLimits::default())
-      .load(&package)
+      .load(&package, serde_json::json!({}))
       .await
       .unwrap();
     let output = instance.invoke("m", b"42").await.unwrap();
@@ -354,7 +361,10 @@ mod tests {
 
   #[tokio::test]
   async fn script_errors_surface_as_the_script_variant() {
-    let instance = load("function invoke() error('boom') end").await;
+    // Configure must succeed so the failure surfaces at invoke time.
+    let instance =
+      load("function invoke(method) if method ~= \"configure\" then error(\"boom\") end return {ok = true} end")
+        .await;
     let result = instance.invoke("m", b"{}").await;
     assert!(matches!(result, Err(ExtensionError::Script(err)) if err.contains("boom")));
   }
@@ -362,7 +372,7 @@ mod tests {
   #[tokio::test]
   async fn syntax_errors_fail_load_with_the_script_variant() {
     let result = LuaEngine::new(EngineLimits::default())
-      .load(&package("this is not lua"))
+      .load(&package("this is not lua"), serde_json::json!({}))
       .await;
     assert!(matches!(result, Err(ExtensionError::Script(_))));
   }
@@ -373,8 +383,13 @@ mod tests {
       lua_instructions_per_call: 10_000,
       ..EngineLimits::default()
     };
-    let package = package("function invoke() while true do end end");
-    let instance = LuaEngine::new(limits).load(&package).await.unwrap();
+    let package = package(
+      "function invoke(method) if method ~= \"configure\" then while true do end end return {ok = true} end",
+    );
+    let instance = LuaEngine::new(limits)
+      .load(&package, serde_json::json!({}))
+      .await
+      .unwrap();
     let result = instance.invoke("m", b"{}").await;
     assert!(matches!(result, Err(ExtensionError::BudgetExceeded(_))));
   }
@@ -386,7 +401,9 @@ mod tests {
       ..EngineLimits::default()
     };
     let package = package("while true do end");
-    let result = LuaEngine::new(limits).load(&package).await;
+    let result = LuaEngine::new(limits)
+      .load(&package, serde_json::json!({}))
+      .await;
     assert!(matches!(result, Err(ExtensionError::BudgetExceeded(_))));
   }
 
@@ -397,8 +414,13 @@ mod tests {
       lua_instructions_per_call: 1_000_000_000,
       ..EngineLimits::default()
     };
-    let package = package("function invoke() return string.rep('x', 10 * 1024 * 1024) end");
-    let instance = LuaEngine::new(limits).load(&package).await.unwrap();
+    let package = package(
+      "function invoke(method) if method ~= \"configure\" then return string.rep('x', 10 * 1024 * 1024) end return {ok = true} end",
+    );
+    let instance = LuaEngine::new(limits)
+      .load(&package, serde_json::json!({}))
+      .await
+      .unwrap();
     let result = instance.invoke("m", b"{}").await;
     assert!(matches!(result, Err(ExtensionError::BudgetExceeded(_))));
   }
@@ -449,15 +471,19 @@ mod tests {
 
   #[tokio::test]
   async fn non_json_guest_output_is_an_invalid_payload() {
-    let instance = load("function invoke() return function() end end").await;
+    let instance = load(
+      "function invoke(method) if method ~= \"configure\" then return function() end end return {ok = true} end",
+    )
+    .await;
     let result = instance.invoke("m", b"{}").await;
     assert!(matches!(result, Err(ExtensionError::InvalidPayload(_))));
   }
 
   #[tokio::test]
   async fn instances_do_not_share_state() {
-    let source =
-      "counter = counter or 0\nfunction invoke() counter = counter + 1 return counter end";
+    // The counter skips `configure`, so the observed sequence reflects only
+    // real invocations on each isolated state.
+    let source = "counter = counter or 0\nfunction invoke(method) if method ~= \"configure\" then counter = counter + 1 return counter end return {ok = true} end";
     let first = load(source).await;
     let second = load(source).await;
     assert_eq!(
@@ -478,7 +504,9 @@ mod tests {
   async fn load_rejects_a_content_hash_mismatch() {
     let mut package = package("function invoke() end");
     package.artifact = b"tampered".to_vec();
-    let result = LuaEngine::new(EngineLimits::default()).load(&package).await;
+    let result = LuaEngine::new(EngineLimits::default())
+      .load(&package, serde_json::json!({}))
+      .await;
     assert!(matches!(
       result,
       Err(ExtensionError::ContentHashMismatch { .. })
@@ -488,7 +516,7 @@ mod tests {
   #[tokio::test]
   async fn load_rejects_a_missing_entry_function() {
     let result = LuaEngine::new(EngineLimits::default())
-      .load(&package("local x = 1"))
+      .load(&package("local x = 1"), serde_json::json!({}))
       .await;
     assert!(matches!(result, Err(ExtensionError::Engine(_))));
   }
@@ -497,7 +525,9 @@ mod tests {
   async fn load_rejects_a_wrong_engine_kind() {
     let mut package = package("function invoke() end");
     package.engine = EngineKind::Wasm;
-    let result = LuaEngine::new(EngineLimits::default()).load(&package).await;
+    let result = LuaEngine::new(EngineLimits::default())
+      .load(&package, serde_json::json!({}))
+      .await;
     assert!(matches!(result, Err(ExtensionError::Engine(_))));
   }
 
@@ -511,7 +541,9 @@ mod tests {
       ("capabilities".to_string(), r#"["http"]"#.to_string()),
     ]))
     .unwrap();
-    let result = LuaEngine::new(EngineLimits::default()).load(&package).await;
+    let result = LuaEngine::new(EngineLimits::default())
+      .load(&package, serde_json::json!({}))
+      .await;
     match result {
       Err(ExtensionError::Engine(err)) => {
         assert!(err.contains("http"), "unexpected error: {err}");
@@ -519,5 +551,65 @@ mod tests {
       Err(other) => panic!("expected an engine error, got {other}"),
       Ok(_) => panic!("expected an http capability error, but the load succeeded"),
     }
+  }
+
+  /// A guest recording the configure payload and echoing it back on the
+  /// `state` method.
+  const CONFIGURE_SOURCE: &str = r#"
+    local saved = nil
+    function invoke(method, payload)
+      if method == "configure" then saved = payload return {ok = true} end
+      if method == "state" then return saved end
+      return payload
+    end
+  "#;
+
+  #[tokio::test]
+  async fn configure_receives_the_exact_settings_json() {
+    let settings = serde_json::json!({"token": "abc", "limits": {"n": 1}, "flags": [true]});
+    let instance = LuaEngine::new(EngineLimits::default())
+      .load(&package(CONFIGURE_SOURCE), settings.clone())
+      .await
+      .unwrap();
+    let output = instance.invoke("state", b"{}").await.unwrap();
+    assert_eq!(parse_output(&output), settings);
+  }
+
+  #[tokio::test]
+  async fn a_failing_configure_fails_the_load() {
+    let source = r#"
+      function invoke(method, payload)
+        if method == "configure" then error("bad settings") end
+        return payload
+      end
+    "#;
+    let result = LuaEngine::new(EngineLimits::default())
+      .load(&package(source), serde_json::json!({}))
+      .await;
+    match result {
+      Err(ExtensionError::Script(err)) => {
+        assert!(err.contains("bad settings"), "unexpected error: {err}");
+      }
+      Err(other) => panic!("expected a script error, got {other}"),
+      Ok(_) => panic!("expected a configure failure, but the load succeeded"),
+    }
+  }
+
+  #[tokio::test]
+  async fn a_guest_without_configure_loads_and_serves() {
+    // A guest predating the configure convention rejects the unknown method;
+    // the engine tolerates exactly that class of failure.
+    let source = r#"
+      function invoke(method, payload)
+        if method ~= "echo" then error("unknown method: " .. method) end
+        return payload
+      end
+    "#;
+    let instance = LuaEngine::new(EngineLimits::default())
+      .load(&package(source), serde_json::json!({"k": "v"}))
+      .await
+      .unwrap();
+    let output = instance.invoke("echo", br#"{"a":1}"#).await.unwrap();
+    assert_eq!(parse_output(&output), serde_json::json!({"a": 1}));
   }
 }
