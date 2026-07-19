@@ -180,6 +180,15 @@ impl WasmEngine {
     let mut store = Store::new(&self.engine, state);
     store.limiter(|state| &mut state.limits);
 
+    // Arm the fuel budget before instantiation: a store starts with 0 fuel,
+    // and instantiation can execute instrumented guest code (a start
+    // section, or the runtime's synthesized initializers — observed on
+    // aarch64), which traps a fuel-less store. Each invoke re-arms the
+    // budget, so instantiation shares the per-call allowance.
+    store
+      .set_fuel(self.limits.wasm_fuel_per_call)
+      .map_err(|err| ExtensionError::Engine(format!("failed to set fuel: {err}")))?;
+
     let instance = self
       .linker(http_capability)?
       .instantiate_async(&mut store, &module)
