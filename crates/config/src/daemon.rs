@@ -168,8 +168,14 @@ impl Default for ExtensionsConfig {
   }
 }
 
+/// Sized for real guests, not toy WAT fixtures: the OpenAI provider guest
+/// does serde_json-scale request/response work per `chat` call (parse the
+/// wire request, build the upstream body, parse the completion), which the
+/// old 5M budget — calibrated on bump-allocator echo fixtures — could not
+/// sustain. 100M is the comfortable budget the wasm e2e suites measured
+/// against the real guest.
 fn default_wasm_fuel_per_call() -> u64 {
-  5_000_000
+  100_000_000
 }
 
 fn default_wasm_max_memory_bytes() -> u64 {
@@ -283,7 +289,7 @@ mod tests {
   fn extensions_default_when_section_missing() {
     let cfg: DaemonConfig = toml::from_str(VALID_TOML).unwrap();
     assert_eq!(cfg.extensions, ExtensionsConfig::default());
-    assert_eq!(cfg.extensions.wasm_fuel_per_call, 5_000_000);
+    assert_eq!(cfg.extensions.wasm_fuel_per_call, 100_000_000);
     assert_eq!(cfg.extensions.wasm_max_memory_bytes, 64 * 1024 * 1024);
     assert_eq!(cfg.extensions.lua_instructions_per_call, 1_000_000);
     assert_eq!(cfg.extensions.lua_max_memory_bytes, 32 * 1024 * 1024);

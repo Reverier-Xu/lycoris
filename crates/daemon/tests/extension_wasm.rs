@@ -469,9 +469,6 @@ async fn wasm_openai_provider_serves_cluster_chat_from_the_capable_node() {
     .node
     .labels
     .insert("role".to_string(), "runner".to_string());
-  // The real guest does real JSON work at configure and chat time; give it
-  // the comfortable fuel budget the crate-local wasm e2e uses.
-  configs[1].extensions.wasm_fuel_per_call = 100_000_000;
   configs[1].extensions.local.insert(
     "openai".to_string(),
     HashMap::from([

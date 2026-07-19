@@ -71,7 +71,10 @@ pub struct EngineLimits {
 impl Default for EngineLimits {
   fn default() -> Self {
     Self {
-      wasm_fuel_per_call: 5_000_000,
+      // Sized for real guests doing serde_json-scale JSON work (the OpenAI
+      // provider guest), not for the toy WAT fixtures the old 5M budget was
+      // calibrated on; must stay in sync with the daemon config default.
+      wasm_fuel_per_call: 100_000_000,
       wasm_max_memory_bytes: 64 * 1024 * 1024,
       lua_instructions_per_call: 1_000_000,
       lua_max_memory_bytes: 32 * 1024 * 1024,

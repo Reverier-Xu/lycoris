@@ -235,13 +235,9 @@ async fn wasm_guest_end_to_end_configure_and_chat() {
     std::fs::read(&artifact).unwrap(),
   );
 
-  // Loading delivers `configure` with the settings; the wasm guest does real
-  // JSON work, so give it comfortable fuel.
-  let limits = EngineLimits {
-    wasm_fuel_per_call: 100_000_000,
-    ..EngineLimits::default()
-  };
-  let engine = WasmEngine::new(limits).unwrap();
+  // Loading delivers `configure` with the settings. The default fuel budget
+  // is sized for the real guest's JSON work, so no override is needed here.
+  let engine = WasmEngine::new(EngineLimits::default()).unwrap();
   let instance = engine
     .load(
       &package,

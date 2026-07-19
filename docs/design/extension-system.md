@@ -276,7 +276,9 @@ Daemon TOML (node-local settings only):
 labels = { role = "runner" }
 
 [extensions]
-wasm_fuel_per_call = 5_000_000
+# Sized for real guests doing serde_json-scale JSON work (e.g. the OpenAI
+# provider guest), not toy echo fixtures.
+wasm_fuel_per_call = 100_000_000
 wasm_max_memory_bytes = 67_108_864   # 64 MiB
 lua_instructions_per_call = 1_000_000
 lua_max_memory_bytes = 33_554_432    # 32 MiB
