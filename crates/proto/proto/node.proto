@@ -321,3 +321,31 @@ message LeaveResponse {
   bool accepted = 1;
   string reason = 2;
 }
+
+// Extension invocation (extension system design, section 7). Sits behind the
+// cluster-key interceptor like `Cluster`: invoking an extension is an
+// admission-level operation, and forwarded calls present the forwarding
+// daemon's own cluster key.
+service Extension {
+  rpc Invoke(ExtensionInvokeRequest) returns (ExtensionInvokeResponse);
+}
+
+message ExtensionInvokeRequest {
+  string extension_id = 1;
+  string method = 2;
+  // JSON bytes, validated by the serving node before the call reaches an
+  // engine.
+  bytes payload = 3;
+  // Empty for a direct call. Non-empty marks a forwarded call and carries the
+  // forwarding node's id: the receiving node executes locally and never
+  // re-forwards (hop limit 1).
+  string origin_node_id = 4;
+}
+
+message ExtensionInvokeResponse {
+  // JSON bytes produced by the extension.
+  bytes payload = 1;
+  // Id of the node that actually executed the call (the serving node for a
+  // direct call, the capable peer for a forwarded one).
+  string executed_by = 2;
+}

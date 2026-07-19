@@ -11,16 +11,24 @@ use tokio::sync::Mutex;
 /// open connections. Peer endpoint bookkeeping (primary/fallback selection,
 /// seen/attempt marks) is owned by the callers in `crate::sync`, which hold
 /// the storage node domain directly.
+///
+/// The pool also carries the daemon's own cluster key: clients it hands out
+/// present that key on the cluster-key-guarded services (`Cluster`,
+/// `Extension`), which is what lets extension forwarding pass the receiving
+/// node's admission check with the *forwarding* node's identity (extension
+/// system design, sections 7 and 10).
 #[derive(Debug, Clone)]
 pub struct PeerPool {
   tls: TlsBundle,
+  cluster_key: Option<String>,
   clients: Arc<Mutex<HashMap<String, PeerClient>>>,
 }
 
 impl PeerPool {
-  pub fn new(tls_bundle: &TlsBundle) -> Self {
+  pub fn new(tls_bundle: &TlsBundle, cluster_key: Option<String>) -> Self {
     Self {
       tls: tls_bundle.clone(),
+      cluster_key,
       clients: Arc::new(Mutex::new(HashMap::new())),
     }
   }
@@ -46,6 +54,10 @@ impl PeerPool {
         }
         return Err(error);
       }
+    };
+    let client = match &self.cluster_key {
+      Some(key) => client.with_cluster_key(key.clone()),
+      None => client,
     };
 
     let mut clients = self.clients.lock().await;

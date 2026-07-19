@@ -6,12 +6,14 @@ use std::{collections::HashMap, time::Duration};
 use lycoris_proto::{
   CLUSTER_KEY_HEADER,
   node::{
-    FetchRegistersRequest, GetResourceRequest, JoinRequest, LeaveRequest, ListResourcesRequest,
-    NodeInfo as ProtoNodeInfo, ProbeRequest, ProbeResponse, PushNodeRequest, PushRegistersRequest,
-    RegisterRequest, Resource as ProtoResource, ResourceKind as ProtoResourceKind,
+    ExtensionInvokeRequest, ExtensionInvokeResponse, FetchRegistersRequest, GetResourceRequest,
+    JoinRequest, LeaveRequest, ListResourcesRequest, NodeInfo as ProtoNodeInfo, ProbeRequest,
+    ProbeResponse, PushNodeRequest, PushRegistersRequest, RegisterRequest,
+    Resource as ProtoResource, ResourceKind as ProtoResourceKind,
     ResourceScope as ProtoResourceScope, SetPrimaryEndpointRequest, StateMessage, StateResponse,
     SyncNodesRequest, SyncNodesResponse, SyncResourcesRequest, cluster_client::ClusterClient,
-    membership_client::MembershipClient, sync_client::SyncClient,
+    extension_client::ExtensionClient, membership_client::MembershipClient,
+    sync_client::SyncClient,
   },
 };
 use thiserror::Error;
@@ -40,6 +42,20 @@ async fn build_channel(
     .tls_config(tls_bundle.client_config())?
     .connect_timeout(CONNECT_TIMEOUT);
   Ok(endpoint.connect().await?)
+}
+
+/// Attach the cluster key as metadata on a request to a cluster-key-guarded
+/// service (`Cluster`, `Extension`). This is the single injection point so
+/// every guarded handle presents the key the same way.
+fn attach_cluster_key<T>(
+  cluster_key: Option<&String>, mut request: Request<T>,
+) -> Result<Request<T>, ClientError> {
+  if let Some(key) = cluster_key {
+    let value =
+      MetadataValue::try_from(key.as_str()).map_err(|_| ClientError::InvalidClusterKey)?;
+    request.metadata_mut().insert(CLUSTER_KEY_HEADER, value);
+  }
+  Ok(request)
 }
 
 #[derive(Debug, Clone)]
@@ -72,13 +88,8 @@ impl ClusterClientHandle {
     self
   }
 
-  fn attach_cluster_key<T>(&self, mut request: Request<T>) -> Result<Request<T>, ClientError> {
-    if let Some(key) = &self.cluster_key {
-      let value =
-        MetadataValue::try_from(key.as_str()).map_err(|_| ClientError::InvalidClusterKey)?;
-      request.metadata_mut().insert(CLUSTER_KEY_HEADER, value);
-    }
-    Ok(request)
+  fn attach_cluster_key<T>(&self, request: Request<T>) -> Result<Request<T>, ClientError> {
+    attach_cluster_key(self.cluster_key.as_ref(), request)
   }
 
   pub async fn register(&mut self, node: ProtoNodeInfo) -> Result<(), ClientError> {
@@ -137,6 +148,56 @@ impl ClusterClientHandle {
     let request = self.attach_cluster_key(request)?;
     let response = self.inner.get_resource(request).await?;
     Ok(Some(response.into_inner()).filter(|r| r.metadata.is_some()))
+  }
+}
+
+#[derive(Debug, Clone)]
+pub struct ExtensionClientHandle {
+  inner: ExtensionClient<Channel>,
+  cluster_key: Option<String>,
+}
+
+impl ExtensionClientHandle {
+  pub async fn connect(
+    address: &str, tls_bundle: &lycoris_tls::TlsBundle,
+  ) -> Result<Self, ClientError> {
+    Ok(Self::from_channel(
+      build_channel(address, tls_bundle).await?,
+    ))
+  }
+
+  pub(crate) fn from_channel(channel: Channel) -> Self {
+    Self {
+      inner: ExtensionClient::new(channel)
+        .max_decoding_message_size(MAX_RPC_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_RPC_MESSAGE_BYTES),
+      cluster_key: None,
+    }
+  }
+
+  /// Attach a cluster key that will be sent as metadata on all `Extension`
+  /// RPCs. The daemon's forwarding path presents the forwarding node's own
+  /// key this way (extension system design, section 7).
+  pub fn with_cluster_key(mut self, cluster_key: impl Into<String>) -> Self {
+    self.cluster_key = Some(cluster_key.into());
+    self
+  }
+
+  /// Invoke an extension on the connected node. `payload` is JSON;
+  /// `origin_node_id` marks a forwarded call (hop limit 1) and is `None` for
+  /// direct calls.
+  pub async fn invoke(
+    &mut self, extension_id: &str, method: &str, payload: Vec<u8>, origin_node_id: Option<String>,
+  ) -> Result<ExtensionInvokeResponse, ClientError> {
+    let request = Request::new(ExtensionInvokeRequest {
+      extension_id: extension_id.to_string(),
+      method: method.to_string(),
+      payload,
+      origin_node_id: origin_node_id.unwrap_or_default(),
+    });
+    let request = attach_cluster_key(self.cluster_key.as_ref(), request)?;
+    let response = self.inner.invoke(request).await?;
+    Ok(response.into_inner())
   }
 }
 
@@ -247,6 +308,7 @@ pub struct PeerClient {
   pub cluster: ClusterClientHandle,
   pub sync: SyncClientHandle,
   pub membership: MembershipClientHandle,
+  pub extension: ExtensionClientHandle,
 }
 
 impl PeerClient {
@@ -262,8 +324,19 @@ impl PeerClient {
     Self {
       cluster: ClusterClientHandle::from_channel(channel.clone()),
       sync: SyncClientHandle::from_channel(channel.clone()),
-      membership: MembershipClientHandle::from_channel(channel),
+      membership: MembershipClientHandle::from_channel(channel.clone()),
+      extension: ExtensionClientHandle::from_channel(channel),
     }
+  }
+
+  /// Attach a cluster key presented on every cluster-key-guarded RPC this
+  /// client makes (`Cluster` and `Extension`). The daemon's forwarding path
+  /// uses it to present the forwarding node's own key.
+  pub fn with_cluster_key(mut self, cluster_key: impl Into<String>) -> Self {
+    let cluster_key = cluster_key.into();
+    self.cluster = self.cluster.with_cluster_key(cluster_key.clone());
+    self.extension = self.extension.with_cluster_key(cluster_key);
+    self
   }
 }
 
@@ -353,5 +426,14 @@ mod tests {
   #[test]
   fn accepted_response_passes_through() {
     assert!(accepted("join", true, String::new()).is_ok());
+  }
+
+  #[tokio::test]
+  async fn peer_client_with_cluster_key_covers_every_guarded_handle() {
+    let channel = Channel::from_static("http://127.0.0.1:1").connect_lazy();
+    let client = PeerClient::from_channel(channel).with_cluster_key("deadbeef");
+
+    assert_eq!(client.cluster.cluster_key.as_deref(), Some("deadbeef"));
+    assert_eq!(client.extension.cluster_key.as_deref(), Some("deadbeef"));
   }
 }

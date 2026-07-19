@@ -4,5 +4,6 @@
 mod client;
 
 pub use client::{
-  ClientError, ClusterClientHandle as ClusterClient, MAX_RPC_MESSAGE_BYTES, PeerClient,
+  ClientError, ClusterClientHandle as ClusterClient, ExtensionClientHandle as ExtensionClient,
+  MAX_RPC_MESSAGE_BYTES, PeerClient,
 };

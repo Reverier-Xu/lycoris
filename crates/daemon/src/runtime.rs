@@ -190,7 +190,7 @@ pub async fn run_with_shutdown(
   let mapper = ResourceMapper::new(storage.clone(), membership_service.clone())
     .with_extension_notify(extension_manager.notify());
 
-  let pool = PeerPool::new(&tls_bundle);
+  let pool = PeerPool::new(&tls_bundle, cluster_key.as_ref().map(ClusterKey::to_hex));
   let resources = ResourceSync::new(mapper.clone(), node.clone(), pool.clone());
   let cluster_sync = ClusterSync::new(
     config.node.id.clone(),
