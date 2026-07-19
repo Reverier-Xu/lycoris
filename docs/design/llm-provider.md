@@ -108,17 +108,22 @@ region). New daemon config section:
 [extensions.local.openai]
 api_key = "sk-..."
 base_url = "https://api.openai.com/v1"
-http_allow_hosts = ["api.openai.com"]
+# local values are strings, so lists ride JSON-encoded
+http_allow_hosts = "[\"api.openai.com\"]"
 ```
 
 Merge semantics at load time: `resolved = manifest.settings` overlaid by
-`[extensions.local.<id>]` (local wins, key by key). Nothing in
+`[extensions.local.<id>]` (local wins, key by key; local values are strings,
+so they land in the merged document as JSON strings). Nothing in
 `[extensions.local]` ever leaves the node — it is not in any synced record.
 
-Delivery contract: after an engine loads an instance, the manager invokes
-`configure` with the resolved settings JSON before registering the instance
-as servable; `configure` is idempotent and re-issued on reload. Guests treat
-every method as stateless until `configure` has run (the OpenAI guest answers
+Delivery contract: the engine itself invokes `configure` with the resolved
+settings JSON inside `load`, after instantiation and before the instance is
+handed back to the manager and registered as servable. A `configure`
+failure fails the load; a guest predating the convention (an
+unknown-method class error) is tolerated and simply runs without settings.
+`configure` is idempotent and re-issued on reload. Guests treat every
+method as stateless until `configure` has run (the OpenAI guest answers
 `Provider { status: 0, message: "not configured" }` before that).
 
 ## 6. Guest support crate and the OpenAI ext

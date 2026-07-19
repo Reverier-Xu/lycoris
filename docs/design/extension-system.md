@@ -281,9 +281,14 @@ lua_max_memory_bytes = 33_554_432    # 32 MiB
 invoke_timeout_ms = 10_000
 ```
 
-Everything per-extension (selector, hooks, capabilities, settings) lives in
-the cluster-synced manifest, not in node config — nodes differ only through
-labels, which is what makes selector-based activation meaningful.
+Per-extension settings have one deliberate exception to the "everything
+lives in the synced manifest" rule: `[extensions.local.<id>]` holds
+node-local overrides (API keys, base URLs, egress allowlists) merged over
+the manifest settings at load time and never synced off-node — see
+`llm-provider.md` section 5. Everything else per-extension (selector,
+hooks, capabilities, baseline settings) lives in the cluster-synced
+manifest, not in node config — nodes differ only through labels, which is
+what makes selector-based activation meaningful.
 
 Hook dispatch: the manifest's `hooks` array names hook points
 (`"skill.invoke.pre"`, `"llm.call.post"`, …). The daemon owns a

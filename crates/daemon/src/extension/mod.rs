@@ -162,6 +162,34 @@ fn engine_limits(config: &ExtensionsConfig) -> EngineLimits {
   }
 }
 
+/// Resolve the settings document handed to the engine at load: the
+/// cluster-synced manifest settings JSON object as the base, overlaid key by
+/// key by the node-local `[extensions.local.<id>]` table — local wins, and
+/// since local values are strings they land in the merged document as JSON
+/// strings (llm-provider design, section 5). Nothing in the local table ever
+/// leaves the node.
+fn merge_settings(
+  manifest_settings: &str, local: Option<&HashMap<String, String>>,
+) -> Result<serde_json::Value, ExtensionManagerError> {
+  let parsed: serde_json::Value = serde_json::from_str(manifest_settings).map_err(|err| {
+    ExtensionError::InvalidPayload(format!("manifest settings are not valid JSON: {err}"))
+  })?;
+  let mut resolved = match parsed {
+    serde_json::Value::Object(map) => map,
+    // A non-object manifest document cannot be overlaid key by key: without
+    // local overrides it passes through unchanged; with overrides the local
+    // table becomes the whole base.
+    other if local.is_none() => return Ok(other),
+    _ => serde_json::Map::new(),
+  };
+  if let Some(local) = local {
+    for (key, value) in local {
+      resolved.insert(key.clone(), serde_json::Value::String(value.clone()));
+    }
+  }
+  Ok(serde_json::Value::Object(resolved))
+}
+
 /// A loaded extension instance plus the bookkeeping needed for reload and
 /// capability announcement decisions.
 struct LoadedExtension {
@@ -189,6 +217,10 @@ pub struct InvokeOutcome {
 pub struct ExtensionManager {
   wasm: WasmEngine,
   lua: LuaEngine,
+  /// Node-local per-extension settings overlays (`[extensions.local.<id>]`):
+  /// merged over the manifest settings at load time and never part of any
+  /// synced record (llm-provider design, section 5).
+  local: HashMap<String, HashMap<String, String>>,
   instances: Arc<Mutex<HashMap<String, LoadedExtension>>>,
   storage: Storage,
   membership: Arc<MembershipService>,
@@ -217,6 +249,7 @@ impl ExtensionManager {
     Ok(Self {
       wasm: WasmEngine::new(limits)?,
       lua: LuaEngine::new(limits),
+      local: config.local.clone(),
       instances: Arc::new(Mutex::new(HashMap::new())),
       storage,
       membership,
@@ -597,13 +630,10 @@ impl ExtensionManager {
       EngineKind::Lua => &self.lua,
     };
     let semver = package.manifest.semver.to_string();
-    // The manifest's settings JSON is the whole settings document for now;
-    // the node-local overlay (`[extensions.local.<id>]`) merges in a later
-    // batch (llm-provider design section 5).
-    let settings: serde_json::Value =
-      serde_json::from_str(&package.manifest.settings).map_err(|err| {
-        ExtensionError::InvalidPayload(format!("manifest settings are not valid JSON: {err}"))
-      })?;
+    // Resolve the settings document: cluster-synced manifest base overlaid
+    // by the node-local `[extensions.local.<id>]` table (llm-provider
+    // design, section 5). The engine delivers it via `configure`.
+    let settings = merge_settings(&package.manifest.settings, self.local.get(&record.id))?;
     let instance = engine.load(&package, settings).await?;
     Ok(LoadedExtension {
       version: record.version,
@@ -711,6 +741,7 @@ mod tests {
       lua_instructions_per_call: 3,
       lua_max_memory_bytes: 4,
       invoke_timeout_ms: 5,
+      local: HashMap::new(),
     };
     let limits = engine_limits(&config);
     assert_eq!(limits.wasm_fuel_per_call, 1);
@@ -718,6 +749,84 @@ mod tests {
     assert_eq!(limits.lua_instructions_per_call, 3);
     assert_eq!(limits.lua_max_memory_bytes, 4);
     assert_eq!(limits.invoke_timeout, Duration::from_millis(5));
+  }
+
+  #[test]
+  fn merge_settings_without_local_is_the_pure_manifest() {
+    let resolved = merge_settings(r#"{"region":"eu","retries":3}"#, None).unwrap();
+    assert_eq!(resolved, serde_json::json!({"region": "eu", "retries": 3}));
+    // A non-object manifest document passes through unchanged.
+    let resolved = merge_settings(r#"[1,2]"#, None).unwrap();
+    assert_eq!(resolved, serde_json::json!([1, 2]));
+  }
+
+  #[test]
+  fn merge_settings_local_overrides_and_extends() {
+    let local = HashMap::from([
+      ("region".to_string(), "us".to_string()),
+      ("api_key".to_string(), "sk-test".to_string()),
+    ]);
+    let resolved = merge_settings(r#"{"region":"eu","retries":3}"#, Some(&local)).unwrap();
+    assert_eq!(
+      resolved,
+      serde_json::json!({"region": "us", "retries": 3, "api_key": "sk-test"})
+    );
+    // Local values always land as strings, even over non-string base values.
+    let local = HashMap::from([("retries".to_string(), "9".to_string())]);
+    let resolved = merge_settings(r#"{"retries":3}"#, Some(&local)).unwrap();
+    assert_eq!(resolved, serde_json::json!({"retries": "9"}));
+  }
+
+  /// Lua fixture recording the configure payload and echoing it on `state`.
+  const CONFIGURE_SOURCE: &[u8] = br#"
+    local saved = nil
+    function invoke(method, payload)
+      if method == "configure" then saved = payload return {ok = true} end
+      if method == "state" then return saved end
+      return payload
+    end
+  "#;
+
+  #[tokio::test]
+  async fn merged_settings_reach_the_guest_configure() {
+    let dir = TempDir::new().unwrap();
+    let storage = Storage::open(dir.path().join("lycoris.redb")).unwrap();
+    let membership = Arc::new(MembershipService::new(
+      "local",
+      SwimConfig::default(),
+      MemberRegister::new("local", "127.0.0.1:1", 1, 0),
+    ));
+    let config = ExtensionsConfig {
+      local: HashMap::from([(
+        "ext-settings".to_string(),
+        HashMap::from([
+          ("region".to_string(), "us".to_string()),
+          ("api_key".to_string(), "sk-test".to_string()),
+        ]),
+      )]),
+      ..ExtensionsConfig::default()
+    };
+    let manager = ExtensionManager::new(&config, storage.clone(), membership).unwrap();
+
+    let manifest = BTreeMap::from([
+      ("semver".to_string(), "1.0.0".to_string()),
+      (
+        "settings".to_string(),
+        r#"{"region":"eu","retries":3}"#.to_string(),
+      ),
+    ]);
+    apply_extension_with_manifest(&storage, "ext-settings", 1, CONFIGURE_SOURCE, manifest);
+    manager.reconcile().await;
+
+    let output = manager
+      .invoke_local("ext-settings", "state", b"{}")
+      .await
+      .unwrap();
+    let echoed: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(
+      echoed,
+      serde_json::json!({"region": "us", "retries": 3, "api_key": "sk-test"})
+    );
   }
 
   #[tokio::test]

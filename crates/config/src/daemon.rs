@@ -116,12 +116,18 @@ pub struct TlsConfig {
   pub key: String,
 }
 
-/// Node-local extension engine budgets (extension system design, section 9).
+/// Node-local extension engine budgets and per-extension overrides
+/// (extension system design, section 9; llm-provider design, section 5).
 ///
-/// Everything per-extension (selector, hooks, capabilities, settings) lives in
-/// the cluster-synced manifest, not in node config — nodes differ only through
-/// labels, which is what makes selector-based activation meaningful. The whole
-/// section is optional; each field falls back to the design default.
+/// Engine budgets live here because they are node-local. Everything
+/// per-extension (selector, hooks, capabilities, baseline settings) lives in
+/// the cluster-synced manifest — nodes differ only through labels, which is
+/// what makes selector-based activation meaningful. The `local` table is the
+/// deliberate exception: per-node overrides (API keys, base URLs, egress
+/// allowlists) merged over the manifest settings at load time.
+/// **Nothing in `local` ever leaves the node** — it is not part of any
+/// synced record. The whole section is optional; each field falls back to
+/// the design default.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExtensionsConfig {
@@ -140,6 +146,13 @@ pub struct ExtensionsConfig {
   /// Wall-clock deadline for a single invocation, in milliseconds.
   #[serde(default = "default_invoke_timeout_ms")]
   pub invoke_timeout_ms: u64,
+  /// Per-extension node-local settings: `[extensions.local.<id>]` overlays
+  /// the extension's manifest settings key by key at load time (local wins;
+  /// values are written into the merged settings JSON as strings). Never
+  /// leaves the node — secrets such as API keys belong here, never in the
+  /// synced manifest.
+  #[serde(default)]
+  pub local: HashMap<String, HashMap<String, String>>,
 }
 
 impl Default for ExtensionsConfig {
@@ -150,6 +163,7 @@ impl Default for ExtensionsConfig {
       lua_instructions_per_call: default_lua_instructions_per_call(),
       lua_max_memory_bytes: default_lua_max_memory_bytes(),
       invoke_timeout_ms: default_invoke_timeout_ms(),
+      local: HashMap::new(),
     }
   }
 }
@@ -286,6 +300,41 @@ mod tests {
     assert_eq!(cfg.extensions.wasm_max_memory_bytes, 64 * 1024 * 1024);
     assert_eq!(cfg.extensions.lua_instructions_per_call, 1_000_000);
     assert_eq!(cfg.extensions.lua_max_memory_bytes, 32 * 1024 * 1024);
+  }
+
+  #[test]
+  fn extensions_local_defaults_to_empty() {
+    let cfg: DaemonConfig = toml::from_str(VALID_TOML).unwrap();
+    assert!(cfg.extensions.local.is_empty());
+  }
+
+  #[test]
+  fn extensions_local_parses_per_extension_tables() {
+    let toml = format!(
+      "{VALID_TOML}\n[extensions.local.openai]\napi_key = \"sk-test\"\nbase_url = \"https://api.openai.com/v1\"\nhttp_allow_hosts = \"[\\\"api.openai.com\\\"]\"\n"
+    );
+    let cfg: DaemonConfig = toml::from_str(&toml).unwrap();
+    assert_eq!(
+      cfg.extensions.local.get("openai"),
+      Some(&HashMap::from([
+        ("api_key".to_string(), "sk-test".to_string()),
+        (
+          "base_url".to_string(),
+          "https://api.openai.com/v1".to_string()
+        ),
+        (
+          "http_allow_hosts".to_string(),
+          "[\"api.openai.com\"]".to_string()
+        ),
+      ]))
+    );
+  }
+
+  #[test]
+  fn reject_non_string_extensions_local_value() {
+    let toml = format!("{VALID_TOML}\n[extensions.local.openai]\napi_key = 42\n");
+    let result: Result<DaemonConfig, _> = toml::from_str(&toml);
+    assert!(result.is_err());
   }
 
   #[test]
