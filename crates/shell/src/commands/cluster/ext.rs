@@ -75,7 +75,7 @@ fn load_package(path: &Path) -> Result<RegisterExtensionRequest, ShellError> {
   })?;
   let package: PackageFile = toml::from_str(&raw).map_err(|source| ShellError::PackageParse {
     path: path.to_path_buf(),
-    source,
+    source: Box::new(source),
   })?;
 
   if package.id.is_empty() {

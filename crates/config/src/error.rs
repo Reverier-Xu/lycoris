@@ -9,8 +9,10 @@ use thiserror::Error;
 pub enum ConfigError {
   #[error("io error: {0}")]
   Io(#[from] std::io::Error),
+  // `toml::de::Error` is large and platform-dependent in size, so it rides
+  // boxed to keep this enum small on every target.
   #[error("parse error: {0}")]
-  Parse(#[from] toml::de::Error),
+  Parse(#[from] Box<toml::de::Error>),
   #[error("serialize error: {0}")]
   Serialize(#[from] toml::ser::Error),
   #[error("invalid node address: {source}")]

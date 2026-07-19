@@ -54,10 +54,12 @@ pub(crate) enum ShellError {
     path: std::path::PathBuf,
     source: std::io::Error,
   },
+  // `toml::de::Error` is large and platform-dependent in size, so it rides
+  // boxed to keep this enum small on every target.
   #[error("failed to parse extension package {}: {source}", .path.display())]
   PackageParse {
     path: std::path::PathBuf,
-    source: toml::de::Error,
+    source: Box<toml::de::Error>,
   },
   #[error("invalid extension package: {0}")]
   PackageValidation(String),

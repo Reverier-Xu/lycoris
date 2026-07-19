@@ -11,7 +11,7 @@ use crate::error::ConfigError;
 /// Read and parse a TOML configuration file.
 pub(crate) fn read<T: DeserializeOwned>(path: &Path) -> Result<T, ConfigError> {
   let content = fs::read_to_string(path)?;
-  Ok(toml::from_str(&content)?)
+  Ok(toml::from_str(&content).map_err(Box::new)?)
 }
 
 /// Write a configuration value as pretty TOML, creating parent directories if
