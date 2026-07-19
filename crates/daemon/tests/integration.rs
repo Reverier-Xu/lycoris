@@ -6,7 +6,7 @@ use std::{
 };
 
 use lycoris_client::{ClusterClient, PeerClient};
-use lycoris_config::{ClusterConfig, DaemonConfig, NodeConfig, TlsConfig};
+use lycoris_config::{ClusterConfig, DaemonConfig, ExtensionsConfig, NodeConfig, TlsConfig};
 use lycoris_core::{ClusterKey, now_ms};
 use lycoris_proto::node::{NodeInfo, ResourceKind, ResourceScope as ProtoResourceScope};
 use lycoris_storage::{
@@ -152,6 +152,7 @@ fn build_config(
       key: key_path.to_string_lossy().to_string(),
     },
     data_dir: data_dir.to_string_lossy().to_string(),
+    extensions: ExtensionsConfig::default(),
   }
 }
 

@@ -26,6 +26,8 @@ pub struct DaemonConfig {
     deserialize_with = "non_empty_string"
   )]
   pub data_dir: String,
+  #[serde(default)]
+  pub extensions: ExtensionsConfig,
 }
 
 fn default_data_dir_string() -> String {
@@ -106,6 +108,64 @@ pub struct TlsConfig {
   pub key: String,
 }
 
+/// Node-local extension engine budgets (extension system design, section 9).
+///
+/// Everything per-extension (selector, hooks, capabilities, settings) lives in
+/// the cluster-synced manifest, not in node config — nodes differ only through
+/// labels, which is what makes selector-based activation meaningful. The whole
+/// section is optional; each field falls back to the design default.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionsConfig {
+  /// Fuel a WASM guest may consume per invocation (deterministic timeout).
+  #[serde(default = "default_wasm_fuel_per_call")]
+  pub wasm_fuel_per_call: u64,
+  /// Maximum linear memory a WASM guest may reach, in bytes.
+  #[serde(default = "default_wasm_max_memory_bytes")]
+  pub wasm_max_memory_bytes: u64,
+  /// VM instructions a Lua script may execute per invocation.
+  #[serde(default = "default_lua_instructions_per_call")]
+  pub lua_instructions_per_call: u64,
+  /// Maximum memory a Lua state may allocate, in bytes.
+  #[serde(default = "default_lua_max_memory_bytes")]
+  pub lua_max_memory_bytes: u64,
+  /// Wall-clock deadline for a single invocation, in milliseconds.
+  #[serde(default = "default_invoke_timeout_ms")]
+  pub invoke_timeout_ms: u64,
+}
+
+impl Default for ExtensionsConfig {
+  fn default() -> Self {
+    Self {
+      wasm_fuel_per_call: default_wasm_fuel_per_call(),
+      wasm_max_memory_bytes: default_wasm_max_memory_bytes(),
+      lua_instructions_per_call: default_lua_instructions_per_call(),
+      lua_max_memory_bytes: default_lua_max_memory_bytes(),
+      invoke_timeout_ms: default_invoke_timeout_ms(),
+    }
+  }
+}
+
+fn default_wasm_fuel_per_call() -> u64 {
+  5_000_000
+}
+
+fn default_wasm_max_memory_bytes() -> u64 {
+  64 * 1024 * 1024
+}
+
+fn default_lua_instructions_per_call() -> u64 {
+  1_000_000
+}
+
+fn default_lua_max_memory_bytes() -> u64 {
+  32 * 1024 * 1024
+}
+
+fn default_invoke_timeout_ms() -> u64 {
+  10_000
+}
+
 #[cfg(test)]
 mod tests {
   use std::fs;
@@ -163,6 +223,36 @@ mod tests {
       let result: Result<DaemonConfig, _> = toml::from_str(&toml);
       assert!(result.is_err(), "unknown field '{unknown}' was accepted");
     }
+  }
+
+  #[test]
+  fn extensions_default_when_section_missing() {
+    let cfg: DaemonConfig = toml::from_str(VALID_TOML).unwrap();
+    assert_eq!(cfg.extensions, ExtensionsConfig::default());
+    assert_eq!(cfg.extensions.wasm_fuel_per_call, 5_000_000);
+    assert_eq!(cfg.extensions.wasm_max_memory_bytes, 64 * 1024 * 1024);
+    assert_eq!(cfg.extensions.lua_instructions_per_call, 1_000_000);
+    assert_eq!(cfg.extensions.lua_max_memory_bytes, 32 * 1024 * 1024);
+    assert_eq!(cfg.extensions.invoke_timeout_ms, 10_000);
+  }
+
+  #[test]
+  fn extensions_explicit_override_keeps_defaults_elsewhere() {
+    let toml =
+      format!("{VALID_TOML}\n[extensions]\nwasm_fuel_per_call = 42\ninvoke_timeout_ms = 1\n");
+    let cfg: DaemonConfig = toml::from_str(&toml).unwrap();
+    assert_eq!(cfg.extensions.wasm_fuel_per_call, 42);
+    assert_eq!(cfg.extensions.invoke_timeout_ms, 1);
+    assert_eq!(cfg.extensions.wasm_max_memory_bytes, 64 * 1024 * 1024);
+    assert_eq!(cfg.extensions.lua_instructions_per_call, 1_000_000);
+    assert_eq!(cfg.extensions.lua_max_memory_bytes, 32 * 1024 * 1024);
+  }
+
+  #[test]
+  fn reject_unknown_field_in_extensions_section() {
+    let toml = format!("{VALID_TOML}\n[extensions]\nwasm_fuel = 1\n");
+    let result: Result<DaemonConfig, _> = toml::from_str(&toml);
+    assert!(result.is_err());
   }
 
   #[test]

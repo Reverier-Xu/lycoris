@@ -151,6 +151,7 @@ mod tests {
         key: "node.key".to_string(),
       },
       data_dir: "/var/lib/lycoris".to_string(),
+      extensions: crate::daemon::ExtensionsConfig::default(),
     }
   }
 
