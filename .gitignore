@@ -1,5 +1,6 @@
 /target
 /cache
+/dist
 /e2e/certs/
 /e2e/config/
 /e2e/keys/

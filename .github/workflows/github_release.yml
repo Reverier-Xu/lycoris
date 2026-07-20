@@ -9,59 +9,136 @@ on:
 permissions:
   contents: write
 
+# All run steps are bash, including on the windows runner (Git Bash).
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  build-musl:
-    name: build static musl binary
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
+  build-bin:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux ships as a fully static musl binary only, and macOS as
+          # Apple silicon only (intel macs are no longer served).
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
 
     steps:
       - name: checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
+
+      - name: verify the tag matches the workspace version
+        if: ${{ env.ACT != 'true' }}
+        run: |
+          # cargo-binstall resolves assets as
+          # releases/download/<version>/..., so the tag must equal the
+          # workspace version (no "v" prefix).
+          if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
+            echo "not a tag ref (${GITHUB_REF_NAME}); skipping the version check"
+            exit 0
+          fi
+          version="$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)"
+          if [[ "${GITHUB_REF_NAME}" != "${version}" ]]; then
+            printf 'tag %s does not match the workspace version %s\n' \
+              "${GITHUB_REF_NAME}" "${version}" >&2
+            exit 1
+          fi
 
       - name: install stable rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-musl
+          targets: ${{ matrix.target }}
 
       - name: install musl tools
+        if: ${{ contains(matrix.target, 'musl') }}
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: install protoc
-        uses: arduino/setup-protoc@v3
+        uses: taiki-e/install-action@v2
         with:
-          version: "23.x"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          tool: protoc@3
 
       - name: cache cargo artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
 
-      - name: build static musl binary
-        run: cargo build --release --target x86_64-unknown-linux-musl -p lycoris --locked
-
-      - name: stage release assets
-        run: |
-          mkdir -p release-assets
-          cp target/x86_64-unknown-linux-musl/release/lycoris \
-            release-assets/lycoris-x86_64-unknown-linux-musl
-          (cd release-assets && sha256sum lycoris-x86_64-unknown-linux-musl \
-            > lycoris-x86_64-unknown-linux-musl.sha256)
+      - name: build and package the binary
+        run: bash ./deploy/build-release.sh bin ${{ matrix.target }}
 
       - name: upload release asset artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: lycoris-x86_64-unknown-linux-musl
-          path: release-assets/
+          name: release-bin-${{ matrix.target }}
+          path: dist/
+          retention-days: 1
+
+  build-wasm:
+    name: build wasm extensions
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v7
+
+      - name: verify the tag matches the workspace version
+        if: ${{ env.ACT != 'true' }}
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
+            echo "not a tag ref (${GITHUB_REF_NAME}); skipping the version check"
+            exit 0
+          fi
+          version="$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)"
+          if [[ "${GITHUB_REF_NAME}" != "${version}" ]]; then
+            printf 'tag %s does not match the workspace version %s\n' \
+              "${GITHUB_REF_NAME}" "${version}" >&2
+            exit 1
+          fi
+
+      - name: install stable rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm32-unknown-unknown
+
+      - name: build and package the wasm extensions
+        run: bash ./deploy/build-release.sh wasm
+
+      - name: upload release asset artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-wasm
+          path: dist/
+          retention-days: 1
 
   github-release:
     name: publish github release
-    needs: build-musl
+    needs:
+      - build-bin
+      - build-wasm
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
     steps:
       - name: checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: skip release creation in act
         if: ${{ env.ACT == 'true' }}
@@ -101,10 +178,11 @@ jobs:
 
       - name: download release assets
         if: ${{ env.ACT != 'true' }}
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
-          name: lycoris-x86_64-unknown-linux-musl
+          pattern: release-*
           path: release-assets
+          merge-multiple: true
 
       - name: upload assets to github release
         if: ${{ env.ACT != 'true' }}
