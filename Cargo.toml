@@ -1,6 +1,12 @@
 [workspace]
-members  = ["crates/*", "extensions/*"]
-resolver = "3"
+members = ["crates/*", "extensions/*"]
+# Extensions are wasm guests: their `cdylib` crate type only makes sense for
+# wasm32, so keep them out of the default build — a workspace-wide
+# `cargo build` (e.g. for a musl host target) must not try to assemble them
+# for the host. Explicit `-p lycoris-ext-*` builds are unaffected, and
+# `--workspace` (used by the quality gates) still covers them.
+default-members = ["crates/*"]
+resolver        = "3"
 
 [workspace.package]
 authors      = ["Reverier-Xu <reverier.xu@woooo.tech>"]

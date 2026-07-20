@@ -12,14 +12,17 @@ rust-version.workspace = true
 version.workspace      = true
 
 [lib]
-# cdylib is the registrable wasm artifact; rlib keeps the pure core
-# reachable from host-side tests.
+# cdylib is the registrable wasm artifact (deploy/build-release.sh and the
+# wasm e2e tests consume the produced .wasm); rlib keeps the pure core
+# reachable from host-side tests. Building this crate for a host target that
+# cannot do cdylib (musl) is meaningless — the workspace `default-members`
+# keeps it out of such builds.
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 lycoris-extguest = { workspace = true }
-serde                   = { workspace = true }
-serde_json              = { workspace = true }
+serde            = { workspace = true }
+serde_json       = { workspace = true }
 
 [dev-dependencies]
 lycoris-extension = { workspace = true }
