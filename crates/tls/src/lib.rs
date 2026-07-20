@@ -70,6 +70,10 @@ pub enum TlsError {
   Io(#[from] std::io::Error),
   #[error("certificate generation error: {0}")]
   Generation(#[from] rcgen::Error),
+  /// A certificate stored on disk could not be parsed; the message carries
+  /// the underlying PEM/DER/ASN.1 detail.
+  #[error("failed to parse a stored certificate: {0}")]
+  Parse(String),
   #[error("invalid advertise address '{0}': expected https://<host>:<port>")]
   InvalidAddress(String),
 }

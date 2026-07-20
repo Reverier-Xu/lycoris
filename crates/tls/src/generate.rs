@@ -1,11 +1,13 @@
 use std::{path::Path, time::Duration};
 
-use ::time::OffsetDateTime;
 use rcgen::{
-  BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, Issuer, KeyPair, SanType,
+  BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, Issuer, KeyPair,
 };
+use time::OffsetDateTime;
 use tonic::transport::{Certificate, Identity};
-use x509_parser::{extensions::GeneralName, prelude::*};
+use x509_parser::{
+  certificate::X509Certificate, extensions::GeneralName, pem::Pem, prelude::FromDer, time::ASN1Time,
+};
 
 use crate::{TlsBundle, TlsError};
 
@@ -19,7 +21,14 @@ const NOT_BEFORE_SKEW: Duration = Duration::from_secs(60 * 60);
 struct ParsedCert {
   not_before: OffsetDateTime,
   not_after: OffsetDateTime,
-  sans: Vec<SanType>,
+  sans: Vec<San>,
+}
+
+/// One owned subjectAltName entry: a DNS name or an IP address. Other
+/// GeneralName kinds are irrelevant to the coverage check.
+enum San {
+  Dns(String),
+  Ip(std::net::IpAddr),
 }
 
 /// Ensure a usable TLS bundle exists at the configured paths.
@@ -50,9 +59,9 @@ where
     let (ca_cert_pem, ca_key_pem, cert_pem, key_pem) = generate_fresh_ca_and_node(node_id, &host)?;
 
     write_file(ca_cert_path, ca_cert_pem.clone())?;
-    write_private_file(ca_key_path, &ca_key_pem)?;
+    lycoris_core::write_private_file(ca_key_path, ca_key_pem.as_bytes())?;
     write_file(cert_path, cert_pem.clone())?;
-    write_private_file(key_path, &key_pem)?;
+    lycoris_core::write_private_file(key_path, key_pem.as_bytes())?;
 
     return bundle_from_strings(cert_pem, key_pem, ca_cert_pem);
   }
@@ -119,7 +128,7 @@ where
     let params = node_cert_params(node_id, &host, now)?;
     let cert = params.signed_by(&key, &issuer)?;
     write_file(cert_path, cert.pem())?;
-    write_private_file(key_path, &key.serialize_pem())?;
+    lycoris_core::write_private_file(key_path, key.serialize_pem().as_bytes())?;
   }
 
   let cert_pem = std::fs::read_to_string(cert_path)?;
@@ -214,13 +223,12 @@ fn needs_renewal(parsed: &ParsedCert, now: OffsetDateTime) -> bool {
   total <= 0 || remaining <= 0 || remaining < total / RENEWAL_THRESHOLD_DIVISOR
 }
 
-fn san_covers(sans: &[SanType], name: &str) -> bool {
+fn san_covers(sans: &[San], name: &str) -> bool {
   sans.iter().any(|san| match san {
-    SanType::DnsName(dns) => dns.as_str().eq_ignore_ascii_case(name),
-    SanType::IpAddress(ip) => name
+    San::Dns(dns) => dns.eq_ignore_ascii_case(name),
+    San::Ip(ip) => name
       .parse::<std::net::IpAddr>()
       .is_ok_and(|parsed| parsed == *ip),
-    _ => false,
   })
 }
 
@@ -235,14 +243,14 @@ fn san_covers(sans: &[SanType], name: &str) -> bool {
 /// and SANs.
 fn parse_cert(pem_str: &str) -> Result<ParsedCert, TlsError> {
   let (pem, _) = Pem::read(std::io::Cursor::new(pem_str.as_bytes()))
-    .map_err(|_e| TlsError::Generation(rcgen::Error::CouldNotParseCertificate))?;
+    .map_err(|err| TlsError::Parse(format!("invalid PEM: {err}")))?;
   let (_, cert) = X509Certificate::from_der(&pem.contents)
-    .map_err(|_e| TlsError::Generation(rcgen::Error::CouldNotParseCertificate))?;
+    .map_err(|err| TlsError::Parse(format!("invalid DER: {err}")))?;
 
   let validity = cert.validity();
   let not_before = asn1_to_offset(validity.not_before)?;
   let not_after = asn1_to_offset(validity.not_after)?;
-  let sans = parse_sans(&cert);
+  let sans = parse_sans(&cert)?;
 
   Ok(ParsedCert {
     not_before,
@@ -253,50 +261,46 @@ fn parse_cert(pem_str: &str) -> Result<ParsedCert, TlsError> {
 
 fn asn1_to_offset(time: ASN1Time) -> Result<OffsetDateTime, TlsError> {
   OffsetDateTime::from_unix_timestamp(time.timestamp())
-    .map_err(|_e| TlsError::Generation(rcgen::Error::CouldNotParseCertificate))
+    .map_err(|err| TlsError::Parse(format!("certificate timestamp out of range: {err}")))
 }
 
-/// OID 2.5.29.17: subjectAltName.
-const OID_SAN_STR: &str = "2.5.29.17";
-
-fn parse_sans(cert: &X509Certificate) -> Vec<SanType> {
+/// Read the subjectAltName extension through x509-parser's typed extension
+/// API, as owned entries.
+fn parse_sans(cert: &X509Certificate) -> Result<Vec<San>, TlsError> {
   let mut sans = Vec::new();
-  for ext in cert.extensions() {
-    if ext.oid.to_id_string() != OID_SAN_STR {
-      continue;
-    }
-    let result: Result<(_, x509_parser::extensions::SubjectAlternativeName<'_>), _> =
-      FromDer::from_der(ext.value);
-    if let Ok((_, parsed)) = result {
-      for name in parsed.general_names {
-        match name {
-          GeneralName::DNSName(dns) => {
-            if let Ok(ia5) = rcgen::string::Ia5String::try_from(dns) {
-              sans.push(SanType::DnsName(ia5));
-            }
-          }
-          GeneralName::IPAddress(bytes) => {
-            let ip = match bytes.len() {
-              4 => {
-                let mut octets = [0u8; 4];
-                octets.copy_from_slice(bytes);
-                std::net::IpAddr::V4(std::net::Ipv4Addr::from(octets))
-              }
-              16 => {
-                let mut octets = [0u8; 16];
-                octets.copy_from_slice(bytes);
-                std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets))
-              }
-              _ => continue,
-            };
-            sans.push(SanType::IpAddress(ip));
-          }
-          _ => {}
+  let Some(san_ext) = cert
+    .subject_alternative_name()
+    .map_err(|err| TlsError::Parse(format!("invalid subjectAltName extension: {err}")))?
+  else {
+    return Ok(sans);
+  };
+  for name in &san_ext.value.general_names {
+    match name {
+      GeneralName::DNSName(dns) => sans.push(San::Dns(dns.to_string())),
+      GeneralName::IPAddress(bytes) => {
+        if let Some(ip) = ip_from_bytes(bytes) {
+          sans.push(San::Ip(ip));
         }
       }
+      _ => {}
     }
   }
-  sans
+  Ok(sans)
+}
+
+/// Convert the raw address bytes of an IP SAN (4 or 16 octets).
+fn ip_from_bytes(bytes: &[u8]) -> Option<std::net::IpAddr> {
+  match bytes.len() {
+    4 => <[u8; 4]>::try_from(bytes)
+      .ok()
+      .map(std::net::Ipv4Addr::from)
+      .map(std::net::IpAddr::V4),
+    16 => <[u8; 16]>::try_from(bytes)
+      .ok()
+      .map(std::net::Ipv6Addr::from)
+      .map(std::net::IpAddr::V6),
+    _ => None,
+  }
 }
 
 fn write_file<P: AsRef<Path>>(path: P, content: String) -> Result<(), TlsError> {
@@ -304,11 +308,6 @@ fn write_file<P: AsRef<Path>>(path: P, content: String) -> Result<(), TlsError> 
     std::fs::create_dir_all(parent)?;
   }
   std::fs::write(path.as_ref(), content)?;
-  Ok(())
-}
-
-fn write_private_file<P: AsRef<Path>>(path: P, content: &str) -> Result<(), TlsError> {
-  lycoris_core::write_private_file(path, content.as_bytes())?;
   Ok(())
 }
 
