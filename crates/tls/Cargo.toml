@@ -19,6 +19,7 @@ thiserror    = { workspace = true }
 time         = { workspace = true }
 tonic        = { workspace = true }
 tracing      = { workspace = true }
+x509-parser  = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

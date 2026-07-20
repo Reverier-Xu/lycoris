@@ -14,8 +14,8 @@ rust-version = "1.96"
 version      = "0.1.0"
 
 [profile.dev]
+codegen-units   = 16
 split-debuginfo = "unpacked"
-codegen-units = 16
 
 [profile.release]
 codegen-units = 1
@@ -27,46 +27,60 @@ strip         = true
 unsafe_code = "forbid"
 
 [workspace.dependencies]
-arrow-array   = "58.0"
-arrow-schema  = "58.0"
-async-trait   = "0.1"
-clap          = "4.6"
-directories   = "6.0"
-futures-util  = "0.3"
-hex           = "0.4"
-is-root       = "0.1"
-lancedb       = "0.31"
-lycoris-client    = { path = "crates/client" }
-lycoris-config    = { path = "crates/config" }
-lycoris-core      = { path = "crates/core" }
-lycoris-daemon    = { path = "crates/daemon" }
-lycoris-extension = { path = "crates/extension" }
-lycoris-extguest = { path = "crates/extguest" }
-lycoris-membership = { path = "crates/membership" }
-lycoris-proto     = { path = "crates/proto" }
-lycoris-storage   = { path = "crates/storage" }
-lycoris-tls       = { path = "crates/tls" }
-blake3        = "1.8"
-mlua          = { version = "0.12", features = ["lua54", "vendored", "serialize", "send"] }
-owo-colors    = "4.3"
-postcard      = { version = "1.0", features = ["use-std"] }
-prost         = "0.13"
-rcgen         = { version = "0.13", features = ["x509-parser"] }
-ring          = "0.17"
-redb          = "3.0"
-rustls        = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-semver        = "1.0"
-serde         = { version = "1.0", features = ["derive"] }
-serde_json    = "1.0"
-tempfile      = "3"
-thiserror     = "2.0"
-time          = "0.3"
-tokio         = { version = "1.52", features = ["full"] }
-toml          = "0.8"
-tonic         = { version = "0.13", features = ["tls-ring"] }
-tonic-build   = "0.13"
-tracing       = "0.1"
+async-trait        = "0.1"
+blake3             = "1.8"
+clap               = "4.6"
+directories        = "6.0"
+futures-util       = "0.3"
+hex                = "0.4"
+is-root            = "0.1"
+lancedb            = "0.31"
+owo-colors         = "4.3"
+postcard           = { version = "1.1", features = ["use-std"] }
+prost              = "0.14"
+rcgen              = { version = "0.14", features = ["x509-parser"] }
+redb               = "4.1"
+ring               = "0.17"
+semver             = "1.0"
+serde              = { version = "1.0", features = ["derive"] }
+serde_json         = "1.0"
+tempfile           = "3"
+thiserror          = "2.0"
+time               = "0.3"
+tokio              = { version = "1.53", features = ["full"] }
+toml               = "1.1"
+tonic              = { version = "0.14", features = ["tls-ring"] }
+tonic-prost        = "0.14"
+tonic-prost-build  = "0.14"
+tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-reqwest       = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots"] }
-wasmtime      = "46"
-wat           = "1"
+wasmtime           = "46"
+wat                = "1"
+webpki-roots       = "1"
+x509-parser        = "0.18"
+
+mlua = { version = "0.12", features = [
+  "lua54",
+  "vendored",
+  "serialize",
+  "send",
+] }
+reqwest = { version = "0.13", default-features = false, features = [
+  "rustls-no-provider",
+] }
+rustls = { version = "0.23", default-features = false, features = [
+  "ring",
+  "std",
+  "tls12",
+] }
+
+lycoris-client     = { path = "crates/client" }
+lycoris-config     = { path = "crates/config" }
+lycoris-core       = { path = "crates/core" }
+lycoris-daemon     = { path = "crates/daemon" }
+lycoris-extension  = { path = "crates/extension" }
+lycoris-extguest   = { path = "crates/extguest" }
+lycoris-membership = { path = "crates/membership" }
+lycoris-proto      = { path = "crates/proto" }
+lycoris-storage    = { path = "crates/storage" }
+lycoris-tls        = { path = "crates/tls" }

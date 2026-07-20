@@ -11,13 +11,17 @@
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
-use arrow_array::{
-  Array, BinaryArray, FixedSizeListArray, Float32Array, Int64Array, RecordBatch,
-  RecordBatchIterator, StringArray, types::Float32Type,
-};
-use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use futures_util::stream::TryStreamExt;
+// Arrow types come from lancedb's re-export so the record batches this code
+// builds and the ones lancedb returns are always the same arrow version.
+use lancedb::arrow::{
+  arrow_array::{
+    Array, BinaryArray, FixedSizeListArray, Float32Array, Int64Array, RecordBatch,
+    RecordBatchIterator, StringArray, UInt64Array, types::Float32Type,
+  },
+  arrow_schema::{DataType, Field, Schema},
+};
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lycoris_core::ResourceScope;
 use redb::{Database, TableDefinition};
@@ -324,8 +328,7 @@ impl LanceDbMemoryStorage {
       Int64Array::from_iter_values(entries.iter().map(|entry| entry.updated_at_ms));
     let content_hashes =
       StringArray::from_iter_values(entries.iter().map(|entry| entry.content_hash.as_str()));
-    let versions =
-      arrow_array::UInt64Array::from_iter_values(entries.iter().map(|entry| entry.version));
+    let versions = UInt64Array::from_iter_values(entries.iter().map(|entry| entry.version));
 
     RecordBatch::try_new(
       schema,
@@ -501,7 +504,7 @@ fn parse_memory_batch(batch: &RecordBatch) -> Result<Vec<MemoryEntry>, AgentStor
     .ok_or_else(|| AgentStorageError::Backend("content_hash column has wrong type".to_string()))?;
   let versions = version_col
     .as_any()
-    .downcast_ref::<arrow_array::UInt64Array>()
+    .downcast_ref::<UInt64Array>()
     .ok_or_else(|| AgentStorageError::Backend("version column has wrong type".to_string()))?;
 
   let mut entries = Vec::new();

@@ -23,11 +23,11 @@
 //! *not* errors: the status passes through to the guest, which owns the
 //! retry/failover policy.
 //!
-//! The client is `reqwest` over hyper (async, tokio-native) with
-//! rustls/ring and webpki roots, matching the workspace TLS stack and the
-//! static musl distribution.
+//! The client is reqwest over hyper (async, tokio-native) with a
+//! preconfigured rustls/ring + webpki-roots TLS stack, matching the
+//! workspace TLS stack and the static musl distribution.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use futures_util::StreamExt;
 
@@ -39,14 +39,32 @@ pub const MAX_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
 /// Per-request wall-clock timeout.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Build the shared HTTP client: rustls/ring with webpki roots (the crate
-/// features select exactly that stack). Non-2xx statuses are pass-through
-/// by default (`error_for_status` is never called).
+/// Build the shared HTTP client with a preconfigured rustls/ring +
+/// webpki-roots TLS stack (reqwest 0.13 defaults to aws-lc + platform
+/// verifier; this pins the exact ring + Mozilla roots combination the
+/// musl static distribution depends on).
 pub fn client() -> Result<reqwest::Client> {
+  let tls = ring_tls_config()
+    .map_err(|err| ExtensionError::Engine(format!("failed to build the TLS config: {err}")))?;
+
   reqwest::Client::builder()
     .timeout(REQUEST_TIMEOUT)
+    .use_preconfigured_tls(tls)
     .build()
     .map_err(|err| ExtensionError::Engine(format!("failed to build the http client: {err}")))
+}
+
+/// A rustls client config backed by ring (the crypto provider) and
+/// webpki-roots (Mozilla trust anchors). This combination works on musl
+/// static builds with zero filesystem dependencies.
+fn ring_tls_config() -> std::result::Result<rustls::ClientConfig, rustls::Error> {
+  let roots: rustls::RootCertStore = webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect();
+  let config =
+    rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+      .with_safe_default_protocol_versions()?
+      .with_root_certificates(roots)
+      .with_no_client_auth();
+  Ok(config)
 }
 
 /// Execute one request document against `client`, honouring the per-instance

@@ -33,7 +33,7 @@ use lycoris_extension::{ChatMessage, ChatRequest, LlmProvider, Role, Usage};
 use lycoris_proto::node::{
   RegisterExtensionRequest, ResourceKind, ResourceScope as ProtoResourceScope,
 };
-use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
 use tempfile::TempDir;
 use tokio::time;
 
@@ -55,6 +55,7 @@ fn generate_test_certs(
   let ca_key = KeyPair::generate().unwrap();
   let mut ca_params = CertificateParams::new(vec!["lycoris-test-ca".to_string()]).unwrap();
   ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+  let ca_issuer_for_signing = Issuer::from_params(&ca_params, &ca_key);
   let ca_cert = ca_params.self_signed(&ca_key).unwrap();
 
   let ca_cert_path = dir.path().join("ca.crt");
@@ -68,7 +69,7 @@ fn generate_test_certs(
   for i in 0..node_count {
     let key = KeyPair::generate().unwrap();
     let params = CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
-    let cert = params.signed_by(&key, &ca_cert, &ca_key).unwrap();
+    let cert = params.signed_by(&key, &ca_issuer_for_signing).unwrap();
 
     let cert_path = dir.path().join(format!("node{i}.crt"));
     let key_path = dir.path().join(format!("node{i}.key"));
