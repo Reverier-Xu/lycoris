@@ -4196,7 +4196,7 @@ dependencies = [
 
 [[package]]
 name = "lycoris"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "lycoris-client",
@@ -4220,7 +4220,7 @@ dependencies = [
 
 [[package]]
 name = "lycoris-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "lycoris-proto",
  "lycoris-tls",
@@ -4231,7 +4231,7 @@ dependencies = [
 
 [[package]]
 name = "lycoris-config"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "directories",
  "lycoris-core",
@@ -4243,7 +4243,7 @@ dependencies = [
 
 [[package]]
 name = "lycoris-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "directories",
  "hex",
@@ -4256,7 +4256,7 @@ dependencies = [
 
 [[package]]
 name = "lycoris-daemon"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -4281,7 +4281,7 @@ dependencies = [
 
 [[package]]
 name = "lycoris-ext-openai"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "lycoris-extension",
  "lycoris-extguest",
@@ -4292,7 +4292,7 @@ dependencies = [
 
 [[package]]
 name = "lycoris-extension"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -4313,7 +4313,7 @@ dependencies = [
 
 [[package]]
 name = "lycoris-extguest"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4321,14 +4321,14 @@ dependencies = [
 
 [[package]]
 name = "lycoris-membership"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
 ]
 
 [[package]]
 name = "lycoris-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "lycoris-core",
  "prost",
@@ -4339,7 +4339,7 @@ dependencies = [
 
 [[package]]
 name = "lycoris-storage"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -4356,7 +4356,7 @@ dependencies = [
 
 [[package]]
 name = "lycoris-tls"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "lycoris-core",
  "rcgen",
