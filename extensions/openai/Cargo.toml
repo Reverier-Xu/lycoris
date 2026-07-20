@@ -26,6 +26,7 @@ serde_json       = { workspace = true }
 
 [dev-dependencies]
 lycoris-extension = { workspace = true }
+lycoris-testkit   = { path = "../../testkit" }
 tokio             = { workspace = true }
 
 [lints.rust]

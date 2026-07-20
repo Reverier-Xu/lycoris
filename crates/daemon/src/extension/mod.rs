@@ -1101,37 +1101,16 @@ mod tests {
     );
   }
 
-  /// Generate a test CA and one node identity; the bundle serves as client
-  /// credentials for the forwarding path.
-  fn test_tls(dir: &std::path::Path) -> lycoris_tls::TlsBundle {
-    use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
-
-    let ca_key = KeyPair::generate().unwrap();
-    let mut ca_params = CertificateParams::new(vec!["lycoris-test-ca".to_string()]).unwrap();
-    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    let ca_issuer = Issuer::from_params(&ca_params, &ca_key);
-    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
-    let ca_path = dir.join("ca.crt");
-    std::fs::write(&ca_path, ca_cert.pem()).unwrap();
-
-    let key = KeyPair::generate().unwrap();
-    let params = CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
-    let cert = params.signed_by(&key, &ca_issuer).unwrap();
-    let cert_path = dir.join("node.crt");
-    let key_path = dir.join("node.key");
-    std::fs::write(&cert_path, cert.pem()).unwrap();
-    std::fs::write(&key_path, key.serialize_pem()).unwrap();
-
-    lycoris_tls::load_tls_bundle(&cert_path, &key_path, &ca_path).unwrap()
-  }
-
   #[tokio::test]
   async fn invoke_surfaces_unavailable_when_every_candidate_fails() {
     let _ = lycoris_tls::install_crypto_provider();
     let dir = TempDir::new().unwrap();
     let (storage, membership, manager) = test_manager(&dir);
     let tls_dir = TempDir::new().unwrap();
-    let tls = test_tls(tls_dir.path());
+    let certs = lycoris_testkit::certs::write_test_certs(tls_dir.path(), 1);
+    let tls =
+      lycoris_tls::load_tls_bundle(&certs.nodes[0].cert, &certs.nodes[0].key, &certs.ca_cert)
+        .unwrap();
     let manager = manager.with_peer_pool(crate::transport::PeerPool::new(&tls, None));
 
     // The only candidate is unreachable (nothing listens on port 1).

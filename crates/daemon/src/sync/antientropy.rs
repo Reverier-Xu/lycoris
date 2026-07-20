@@ -460,7 +460,6 @@ mod tests {
     sync_server::{Sync, SyncServer},
   };
   use lycoris_storage::{NodeDomain, Storage};
-  use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
   use tempfile::TempDir;
   use tonic::{Request, Response, Status};
 
@@ -630,28 +629,6 @@ mod tests {
     }
   }
 
-  /// Generate a test CA and one node identity; the returned bundle serves as
-  /// both server and client credentials since both ends trust the same CA.
-  fn test_tls(dir: &std::path::Path) -> lycoris_tls::TlsBundle {
-    let ca_key = KeyPair::generate().unwrap();
-    let mut ca_params = CertificateParams::new(vec!["lycoris-test-ca".to_string()]).unwrap();
-    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    let ca_issuer = Issuer::from_params(&ca_params, &ca_key);
-    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
-    let ca_path = dir.join("ca.crt");
-    std::fs::write(&ca_path, ca_cert.pem()).unwrap();
-
-    let key = KeyPair::generate().unwrap();
-    let params = CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
-    let cert = params.signed_by(&key, &ca_issuer).unwrap();
-    let cert_path = dir.join("node.crt");
-    let key_path = dir.join("node.key");
-    std::fs::write(&cert_path, cert.pem()).unwrap();
-    std::fs::write(&key_path, key.serialize_pem()).unwrap();
-
-    lycoris_tls::load_tls_bundle(&cert_path, &key_path, &ca_path).unwrap()
-  }
-
   /// Serve `peer` over mTLS on an ephemeral loopback port, polling until the
   /// listener accepts connections instead of assuming a fixed startup delay.
   async fn serve_legacy_peer(
@@ -730,7 +707,10 @@ mod tests {
   async fn run_full_sync_fallback(hang_on_merkle: bool) {
     let _ = lycoris_tls::install_crypto_provider();
     let tls_dir = TempDir::new().unwrap();
-    let tls = test_tls(tls_dir.path());
+    let certs = lycoris_testkit::certs::write_test_certs(tls_dir.path(), 1);
+    let tls =
+      lycoris_tls::load_tls_bundle(&certs.nodes[0].cert, &certs.nodes[0].key, &certs.ca_cert)
+        .unwrap();
 
     let legacy = LegacyPeer {
       hang_on_merkle,

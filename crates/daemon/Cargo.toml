@@ -30,7 +30,7 @@ tracing.workspace            = true
 
 [dev-dependencies]
 blake3.workspace   = true
-rcgen.workspace    = true
+lycoris-testkit    = { path = "../../testkit" }
 rustls.workspace   = true
 tempfile.workspace = true
 

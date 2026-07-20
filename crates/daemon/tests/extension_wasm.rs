@@ -18,11 +18,7 @@
 use std::{
   collections::HashMap,
   path::PathBuf,
-  process::Command,
-  sync::{
-    Arc, Mutex,
-    atomic::{AtomicU16, Ordering},
-  },
+  sync::atomic::{AtomicU16, Ordering},
   time::Duration,
 };
 
@@ -33,7 +29,7 @@ use lycoris_extension::{ChatMessage, ChatRequest, LlmProvider, Role, Usage};
 use lycoris_proto::node::{
   RegisterExtensionRequest, ResourceKind, ResourceScope as ProtoResourceScope,
 };
-use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
+use lycoris_testkit::http::{MockHttpServer, MockResponse, RecordedRequest};
 use tempfile::TempDir;
 use tokio::time;
 
@@ -45,42 +41,6 @@ fn alloc_base_port() -> u16 {
   // Each test reserves a 100-port block so internal and external addresses
   // cannot collide.
   NEXT_BASE_PORT.fetch_add(100, Ordering::SeqCst)
-}
-
-fn generate_test_certs(
-  node_count: usize,
-) -> (TempDir, PathBuf, PathBuf, Vec<PathBuf>, Vec<PathBuf>) {
-  let dir = TempDir::new().unwrap();
-
-  let ca_key = KeyPair::generate().unwrap();
-  let mut ca_params = CertificateParams::new(vec!["lycoris-test-ca".to_string()]).unwrap();
-  ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-  let ca_issuer_for_signing = Issuer::from_params(&ca_params, &ca_key);
-  let ca_cert = ca_params.self_signed(&ca_key).unwrap();
-
-  let ca_cert_path = dir.path().join("ca.crt");
-  let ca_key_path = dir.path().join("ca.key");
-  std::fs::write(&ca_cert_path, ca_cert.pem()).unwrap();
-  std::fs::write(&ca_key_path, ca_key.serialize_pem()).unwrap();
-
-  let mut cert_paths = Vec::with_capacity(node_count);
-  let mut key_paths = Vec::with_capacity(node_count);
-
-  for i in 0..node_count {
-    let key = KeyPair::generate().unwrap();
-    let params = CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
-    let cert = params.signed_by(&key, &ca_issuer_for_signing).unwrap();
-
-    let cert_path = dir.path().join(format!("node{i}.crt"));
-    let key_path = dir.path().join(format!("node{i}.key"));
-    std::fs::write(&cert_path, cert.pem()).unwrap();
-    std::fs::write(&key_path, key.serialize_pem()).unwrap();
-
-    cert_paths.push(cert_path);
-    key_paths.push(key_path);
-  }
-
-  (dir, ca_cert_path, ca_key_path, cert_paths, key_paths)
 }
 
 fn client_tls_bundle(
@@ -247,200 +207,45 @@ async fn wait_for_annotation(
   }
 }
 
-/// Whether the `wasm32-unknown-unknown` target is installed. Without rustup
-/// the build below is left to report its own failure.
-fn wasm32_target_installed() -> bool {
-  let Ok(output) = Command::new("rustup")
-    .args(["target", "list", "--installed"])
-    .output()
-  else {
-    return true;
-  };
-  String::from_utf8_lossy(&output.stdout)
-    .lines()
-    .any(|line| line.trim() == "wasm32-unknown-unknown")
-}
-
-/// Build the release wasm artifact with the workspace's own cargo and
-/// return its path, or `None` — after printing the remediation — when the
-/// `wasm32-unknown-unknown` target is not installed, so the test skips
-/// itself instead of failing (the skip policy of the crate-local wasm e2e).
-/// Uses `--locked` so the committed lockfile is what gets built.
-fn build_wasm_artifact() -> Option<PathBuf> {
-  if !wasm32_target_installed() {
-    eprintln!(
-      "skipping: the wasm32-unknown-unknown target is not installed; run `rustup target add wasm32-unknown-unknown` first"
-    );
-    return None;
-  }
-  let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-    .join("../..")
-    .canonicalize()
-    .unwrap();
-  let status = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string()))
-    .args([
-      "build",
-      "--release",
-      "--locked",
-      "--target",
-      "wasm32-unknown-unknown",
-      "--package",
-      "lycoris-ext-openai",
-    ])
-    .current_dir(&root)
-    .status()
-    .unwrap();
-  assert!(
-    status.success(),
-    "the wasm32 build of lycoris-ext-openai failed"
-  );
-  let target_dir = std::env::var_os("CARGO_TARGET_DIR").map_or_else(
-    || root.join("target"),
-    |dir| {
-      let dir = PathBuf::from(dir);
-      if dir.is_absolute() {
-        dir
-      } else {
-        root.join(dir)
-      }
-    },
-  );
-  let artifact = target_dir.join("wasm32-unknown-unknown/release/lycoris_ext_openai.wasm");
-  assert!(
-    artifact.is_file(),
-    "expected the wasm artifact at {}",
-    artifact.display()
-  );
-  Some(artifact)
-}
-
-/// One recorded request the mock server saw.
-struct Recorded {
-  head: String,
-  body: String,
-}
-
-/// A minimal mock OpenAI server: one request per connection, a canned chat
-/// completion, every request recorded. Aborted on drop.
-struct MockOpenAi {
-  base_url: String,
-  recorded: Arc<Mutex<Vec<Recorded>>>,
-  task: tokio::task::JoinHandle<()>,
-}
-
-impl MockOpenAi {
-  async fn start() -> Self {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base_url = format!("http://{}", listener.local_addr().unwrap());
-    let recorded = Arc::new(Mutex::new(Vec::new()));
-    let recorder = Arc::clone(&recorded);
-    let task = tokio::spawn(async move {
-      loop {
-        let Ok((mut stream, _)) = listener.accept().await else {
-          break;
-        };
-        let recorder = Arc::clone(&recorder);
-        tokio::spawn(async move {
-          // Byte-wise header read avoids over-reading into the body.
-          let mut head = Vec::new();
-          let mut byte = [0u8; 1];
-          while !head.ends_with(b"\r\n\r\n") {
-            if stream.read(&mut byte).await.unwrap_or(0) == 0 {
-              return;
-            }
-            head.push(byte[0]);
-            if head.len() > 64 * 1024 {
-              return;
-            }
-          }
-          let head = String::from_utf8_lossy(&head).into_owned();
-          let content_length: usize = head
-            .lines()
-            .find_map(|line| {
-              line
-                .to_ascii_lowercase()
-                .strip_prefix("content-length:")
-                .and_then(|value| value.trim().parse().ok())
-            })
-            .unwrap_or(0);
-          let mut body = vec![0u8; content_length];
-          if stream.read_exact(&mut body).await.is_err() {
-            return;
-          }
-          let body = String::from_utf8_lossy(&body).into_owned();
-          let path = head
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .unwrap_or("/")
-            .to_string();
-          recorder.lock().unwrap().push(Recorded {
-            head: head.clone(),
-            body: body.clone(),
-          });
-
-          let (status, reason, response_body): (u16, &str, String) = if path
-            == "/v1/chat/completions"
-          {
-            (
-              200,
-              "OK",
-              r#"{
-                "id": "chatcmpl-mock",
-                "object": "chat.completion",
-                "created": 1700000000,
-                "model": "gpt-mock",
-                "choices": [{
-                  "index": 0,
-                  "message": {"role": "assistant", "content": "canned hello"},
-                  "finish_reason": "stop"
-                }],
-                "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}
-              }"#
-                .to_string(),
-            )
-          } else {
-            (
-              404,
-              "Not Found",
-              r#"{"error":{"message":"no such route","type":"invalid_request_error"}}"#.to_string(),
-            )
-          };
-          let response = format!(
-            "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
-            response_body.len()
-          );
-          let _ = stream.write_all(response.as_bytes()).await;
-        });
-      }
-    });
-    Self {
-      base_url,
-      recorded,
-      task,
-    }
-  }
-}
-
-impl Drop for MockOpenAi {
-  fn drop(&mut self) {
-    self.task.abort();
+/// Canned OpenAI-compatible responses for the routed provider test.
+fn mock_openai_response(request: &RecordedRequest) -> MockResponse {
+  if request.path() == "/v1/chat/completions" {
+    MockResponse::new(
+      200,
+      "OK",
+      r#"{
+        "id": "chatcmpl-mock",
+        "object": "chat.completion",
+        "created": 1700000000,
+        "model": "gpt-mock",
+        "choices": [{
+          "index": 0,
+          "message": {"role": "assistant", "content": "canned hello"},
+          "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}
+      }"#,
+    )
+    .header("content-type", "application/json")
+  } else {
+    MockResponse::new(
+      404,
+      "Not Found",
+      r#"{"error":{"message":"no such route","type":"invalid_request_error"}}"#,
+    )
+    .header("content-type", "application/json")
   }
 }
 
 #[tokio::test]
 #[ignore = "requires the wasm32-unknown-unknown target; run with --ignored"]
 async fn wasm_openai_provider_serves_cluster_chat_from_the_capable_node() {
-  let Some(artifact) = build_wasm_artifact() else {
-    return;
-  };
+  let artifact = lycoris_testkit::wasm::build_wasm_artifact("lycoris-ext-openai");
   let _ = lycoris_tls::install_crypto_provider();
-  let server = MockOpenAi::start().await;
+  let server = MockHttpServer::start(mock_openai_response).await;
 
   let (node_count, base_port) = (2, alloc_base_port());
-  let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
+  let (_dir, certs) = lycoris_testkit::certs::temp_test_certs(node_count);
   let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
 
   let cluster_key = ClusterKey::generate().expect("generate cluster key");
@@ -455,10 +260,10 @@ async fn wasm_openai_provider_serves_cluster_chat_from_the_capable_node() {
         port,
         vec![peer],
         data_dirs[i].path().to_path_buf(),
-        &ca_cert_path,
-        &ca_key_path,
-        &cert_paths[i],
-        &key_paths[i],
+        &certs.ca_cert,
+        &certs.ca_key,
+        &certs.nodes[i].cert,
+        &certs.nodes[i].key,
       )
     })
     .collect();
@@ -475,7 +280,7 @@ async fn wasm_openai_provider_serves_cluster_chat_from_the_capable_node() {
     "openai".to_string(),
     HashMap::from([
       ("api_key".to_string(), "sk-test".to_string()),
-      ("base_url".to_string(), format!("{}/v1", server.base_url)),
+      ("base_url".to_string(), format!("{}/v1", server.base_url())),
     ]),
   );
 
@@ -490,7 +295,7 @@ async fn wasm_openai_provider_serves_cluster_chat_from_the_capable_node() {
   // cluster-shared record whose selector matches only node-1's label.
   let node0_url = format!("https://127.0.0.1:{base_port}");
   let node1_url = format!("https://127.0.0.1:{}", base_port + 1);
-  let client_tls = client_tls_bundle(&cert_paths[0], &key_paths[0], &ca_cert_path);
+  let client_tls = client_tls_bundle(&certs.nodes[0].cert, &certs.nodes[0].key, &certs.ca_cert);
   let mut extension_client = connect_extension_client(&node0_url, &client_tls, &key_hex).await;
   extension_client
     .register(RegisterExtensionRequest {
@@ -512,7 +317,7 @@ async fn wasm_openai_provider_serves_cluster_chat_from_the_capable_node() {
     .expect("register the openai extension");
 
   // The record converges to node-1 through resource anti-entropy.
-  let client_tls = client_tls_bundle(&cert_paths[1], &key_paths[1], &ca_cert_path);
+  let client_tls = client_tls_bundle(&certs.nodes[1].cert, &certs.nodes[1].key, &certs.ca_cert);
   let mut node1_client = connect_client(&node1_url, &client_tls, &key_hex).await;
   wait_for_resource(
     &mut node1_client,
@@ -524,7 +329,7 @@ async fn wasm_openai_provider_serves_cluster_chat_from_the_capable_node() {
 
   // node-1 loads the guest (selector match) and announces the capability;
   // the register gossip delivers the annotation to node-0's membership view.
-  let client_tls = client_tls_bundle(&cert_paths[0], &key_paths[0], &ca_cert_path);
+  let client_tls = client_tls_bundle(&certs.nodes[0].cert, &certs.nodes[0].key, &certs.ca_cert);
   let mut node0_client = connect_client(&node0_url, &client_tls, &key_hex).await;
   let announced = wait_for_annotation(
     &mut node0_client,
@@ -573,7 +378,7 @@ async fn wasm_openai_provider_serves_cluster_chat_from_the_capable_node() {
   // proof the merged `[extensions.local.openai]` settings reached the guest —
   // and the pinned stream flag of the section 3 wire convention.
   {
-    let recorded = server.recorded.lock().unwrap();
+    let recorded = server.recorded();
     assert_eq!(recorded.len(), 1);
     assert!(
       recorded[0].head.starts_with("POST /v1/chat/completions"),

@@ -13,7 +13,6 @@ use lycoris_storage::{
   DEFAULT_EMBEDDING_DIM, ExtensionRecord, MemoryEntry, ResourceScope, SkillRecord, Storage,
   VersionedContentStore, WorkspaceRecord,
 };
-use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
 use tempfile::TempDir;
 use tokio::time;
 
@@ -56,42 +55,6 @@ async fn list_node_ids(client: &mut ClusterClient) -> Vec<String> {
       _ => None,
     })
     .collect()
-}
-
-fn generate_test_certs(
-  node_count: usize,
-) -> (TempDir, PathBuf, PathBuf, Vec<PathBuf>, Vec<PathBuf>) {
-  let dir = TempDir::new().unwrap();
-
-  let ca_key = KeyPair::generate().unwrap();
-  let mut ca_params = CertificateParams::new(vec!["lycoris-test-ca".to_string()]).unwrap();
-  ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-  let ca_issuer_for_signing = Issuer::from_params(&ca_params, &ca_key);
-  let ca_cert = ca_params.self_signed(&ca_key).unwrap();
-
-  let ca_cert_path = dir.path().join("ca.crt");
-  let ca_key_path = dir.path().join("ca.key");
-  std::fs::write(&ca_cert_path, ca_cert.pem()).unwrap();
-  std::fs::write(&ca_key_path, ca_key.serialize_pem()).unwrap();
-
-  let mut cert_paths = Vec::with_capacity(node_count);
-  let mut key_paths = Vec::with_capacity(node_count);
-
-  for i in 0..node_count {
-    let key = KeyPair::generate().unwrap();
-    let params = CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
-    let cert = params.signed_by(&key, &ca_issuer_for_signing).unwrap();
-
-    let cert_path = dir.path().join(format!("node{i}.crt"));
-    let key_path = dir.path().join(format!("node{i}.key"));
-    std::fs::write(&cert_path, cert.pem()).unwrap();
-    std::fs::write(&key_path, key.serialize_pem()).unwrap();
-
-    cert_paths.push(cert_path);
-    key_paths.push(key_path);
-  }
-
-  (dir, ca_cert_path, ca_key_path, cert_paths, key_paths)
 }
 
 fn client_tls_bundle(
@@ -163,7 +126,7 @@ async fn registry_converges_across_three_node_chain() {
   let _ = lycoris_tls::install_crypto_provider();
 
   let (node_count, base_port) = (3, alloc_base_port());
-  let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
+  let (_dir, certs) = lycoris_testkit::certs::temp_test_certs(node_count);
 
   let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
 
@@ -187,10 +150,10 @@ async fn registry_converges_across_three_node_chain() {
         port,
         peers,
         data_dirs[i].path().to_path_buf(),
-        &ca_cert_path,
-        &ca_key_path,
-        &cert_paths[i],
-        &key_paths[i],
+        &certs.ca_cert,
+        &certs.ca_key,
+        &certs.nodes[i].cert,
+        &certs.nodes[i].key,
       )
     })
     .collect();
@@ -200,7 +163,7 @@ async fn registry_converges_across_three_node_chain() {
   }
 
   // Register an external node through node-0.
-  let client_tls = client_tls_bundle(&cert_paths[0], &key_paths[0], &ca_cert_path);
+  let client_tls = client_tls_bundle(&certs.nodes[0].cert, &certs.nodes[0].key, &certs.ca_cert);
   let node0_url = format!("https://127.0.0.1:{base_port}");
   let mut client = connect_client(&node0_url, &client_tls, &key_hex).await;
 
@@ -219,7 +182,7 @@ async fn registry_converges_across_three_node_chain() {
   // every node, instead of assuming a fixed propagation window. The external
   // node's gossip may overtake node-0's own register on the chain, so each id
   // gets its own wait.
-  let client_tls = client_tls_bundle(&cert_paths[2], &key_paths[2], &ca_cert_path);
+  let client_tls = client_tls_bundle(&certs.nodes[2].cert, &certs.nodes[2].key, &certs.ca_cert);
   let node2_url = format!("https://127.0.0.1:{}", base_port + 2);
   let mut client = connect_client(&node2_url, &client_tls, &key_hex).await;
   for id in ["external-node", "node-0", "node-1", "node-2"] {
@@ -239,7 +202,7 @@ async fn primary_failure_falls_back_and_promotes() {
   let _ = lycoris_tls::install_crypto_provider();
 
   let (node_count, base_port) = (2, alloc_base_port());
-  let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
+  let (_dir, certs) = lycoris_testkit::certs::temp_test_certs(node_count);
   let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
 
   let cluster_key = ClusterKey::generate().expect("generate cluster key");
@@ -254,10 +217,10 @@ async fn primary_failure_falls_back_and_promotes() {
         port,
         vec![peer],
         data_dirs[i].path().to_path_buf(),
-        &ca_cert_path,
-        &ca_key_path,
-        &cert_paths[i],
-        &key_paths[i],
+        &certs.ca_cert,
+        &certs.ca_key,
+        &certs.nodes[i].cert,
+        &certs.nodes[i].key,
       )
     })
     .collect();
@@ -294,7 +257,7 @@ async fn primary_failure_falls_back_and_promotes() {
 
   // Point node-0's primary at an unreachable address.
   let node0_url = format!("https://127.0.0.1:{base_port}");
-  let client_tls = client_tls_bundle(&cert_paths[0], &key_paths[0], &ca_cert_path);
+  let client_tls = client_tls_bundle(&certs.nodes[0].cert, &certs.nodes[0].key, &certs.ca_cert);
   let mut client = connect_client(&node0_url, &client_tls, &key_hex).await;
   client
     .set_primary_endpoint("https://127.0.0.1:1")
@@ -355,7 +318,7 @@ async fn partition_merge_reconciles_bidirectional_membership() {
   let _ = lycoris_tls::install_crypto_provider();
 
   let (node_count, base_port) = (2, alloc_base_port());
-  let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
+  let (_dir, certs) = lycoris_testkit::certs::temp_test_certs(node_count);
   let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
 
   let cluster_key = ClusterKey::generate().expect("generate cluster key");
@@ -370,10 +333,10 @@ async fn partition_merge_reconciles_bidirectional_membership() {
         port,
         vec![peer],
         data_dirs[i].path().to_path_buf(),
-        &ca_cert_path,
-        &ca_key_path,
-        &cert_paths[i],
-        &key_paths[i],
+        &certs.ca_cert,
+        &certs.ca_key,
+        &certs.nodes[i].cert,
+        &certs.nodes[i].key,
       )
     })
     .collect();
@@ -384,7 +347,7 @@ async fn partition_merge_reconciles_bidirectional_membership() {
 
   let node0_url = format!("https://127.0.0.1:{base_port}");
   let node1_url = format!("https://127.0.0.1:{}", base_port + 1);
-  let client_tls = client_tls_bundle(&cert_paths[0], &key_paths[0], &ca_cert_path);
+  let client_tls = client_tls_bundle(&certs.nodes[0].cert, &certs.nodes[0].key, &certs.ca_cert);
   let mut client = connect_client(&node0_url, &client_tls, &key_hex).await;
 
   let alpha_dir = TempDir::new().unwrap();
@@ -430,7 +393,7 @@ async fn failure_detector_marks_unresponsive_peer() {
   let _ = lycoris_tls::install_crypto_provider();
 
   let (node_count, base_port) = (2, alloc_base_port());
-  let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
+  let (_dir, certs) = lycoris_testkit::certs::temp_test_certs(node_count);
   let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
 
   let cluster_key = ClusterKey::generate().expect("generate cluster key");
@@ -445,10 +408,10 @@ async fn failure_detector_marks_unresponsive_peer() {
         port,
         vec![peer],
         data_dirs[i].path().to_path_buf(),
-        &ca_cert_path,
-        &ca_key_path,
-        &cert_paths[i],
-        &key_paths[i],
+        &certs.ca_cert,
+        &certs.ca_key,
+        &certs.nodes[i].cert,
+        &certs.nodes[i].key,
       )
     })
     .collect();
@@ -469,7 +432,7 @@ async fn failure_detector_marks_unresponsive_peer() {
 
   let node0_url = format!("https://127.0.0.1:{base_port}");
   let _node1_url = format!("https://127.0.0.1:{}", base_port + 1);
-  let client_tls = client_tls_bundle(&cert_paths[0], &key_paths[0], &ca_cert_path);
+  let client_tls = client_tls_bundle(&certs.nodes[0].cert, &certs.nodes[0].key, &certs.ca_cert);
   let mut client = connect_client(&node0_url, &client_tls, &key_hex).await;
 
   wait_for_node(&mut client, "node-1", Duration::from_secs(30)).await;
@@ -508,7 +471,7 @@ async fn shared_skills_replicate_via_anti_entropy() {
   let _ = lycoris_tls::install_crypto_provider();
 
   let (node_count, base_port) = (3, alloc_base_port());
-  let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
+  let (_dir, certs) = lycoris_testkit::certs::temp_test_certs(node_count);
   let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
 
   let cluster_key = ClusterKey::generate().expect("generate cluster key");
@@ -559,10 +522,10 @@ async fn shared_skills_replicate_via_anti_entropy() {
         port,
         peers,
         data_dirs[i].path().to_path_buf(),
-        &ca_cert_path,
-        &ca_key_path,
-        &cert_paths[i],
-        &key_paths[i],
+        &certs.ca_cert,
+        &certs.ca_key,
+        &certs.nodes[i].cert,
+        &certs.nodes[i].key,
       )
     })
     .collect();
@@ -572,7 +535,7 @@ async fn shared_skills_replicate_via_anti_entropy() {
   }
 
   let node2_url = format!("https://127.0.0.1:{}", base_port + 2);
-  let client_tls = client_tls_bundle(&cert_paths[2], &key_paths[2], &ca_cert_path);
+  let client_tls = client_tls_bundle(&certs.nodes[2].cert, &certs.nodes[2].key, &certs.ca_cert);
   let mut client = connect_client(&node2_url, &client_tls, &key_hex).await;
 
   let start = std::time::Instant::now();
@@ -676,7 +639,7 @@ async fn shared_memories_replicate_via_anti_entropy() {
   let _ = lycoris_tls::install_crypto_provider();
 
   let (node_count, base_port) = (3, alloc_base_port());
-  let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
+  let (_dir, certs) = lycoris_testkit::certs::temp_test_certs(node_count);
   let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
 
   let cluster_key = ClusterKey::generate().expect("generate cluster key");
@@ -718,10 +681,10 @@ async fn shared_memories_replicate_via_anti_entropy() {
         port,
         peers,
         data_dirs[i].path().to_path_buf(),
-        &ca_cert_path,
-        &ca_key_path,
-        &cert_paths[i],
-        &key_paths[i],
+        &certs.ca_cert,
+        &certs.ca_key,
+        &certs.nodes[i].cert,
+        &certs.nodes[i].key,
       )
     })
     .collect();
@@ -731,7 +694,7 @@ async fn shared_memories_replicate_via_anti_entropy() {
   }
 
   let node2_url = format!("https://127.0.0.1:{}", base_port + 2);
-  let client_tls = client_tls_bundle(&cert_paths[2], &key_paths[2], &ca_cert_path);
+  let client_tls = client_tls_bundle(&certs.nodes[2].cert, &certs.nodes[2].key, &certs.ca_cert);
   let mut client = connect_client(&node2_url, &client_tls, &key_hex).await;
 
   wait_for_resource(
@@ -748,7 +711,7 @@ async fn shared_workspaces_replicate_via_anti_entropy() {
   let _ = lycoris_tls::install_crypto_provider();
 
   let (node_count, base_port) = (3, alloc_base_port());
-  let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
+  let (_dir, certs) = lycoris_testkit::certs::temp_test_certs(node_count);
   let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
 
   let cluster_key = ClusterKey::generate().expect("generate cluster key");
@@ -782,10 +745,10 @@ async fn shared_workspaces_replicate_via_anti_entropy() {
         port,
         peers,
         data_dirs[i].path().to_path_buf(),
-        &ca_cert_path,
-        &ca_key_path,
-        &cert_paths[i],
-        &key_paths[i],
+        &certs.ca_cert,
+        &certs.ca_key,
+        &certs.nodes[i].cert,
+        &certs.nodes[i].key,
       )
     })
     .collect();
@@ -795,7 +758,7 @@ async fn shared_workspaces_replicate_via_anti_entropy() {
   }
 
   let node2_url = format!("https://127.0.0.1:{}", base_port + 2);
-  let client_tls = client_tls_bundle(&cert_paths[2], &key_paths[2], &ca_cert_path);
+  let client_tls = client_tls_bundle(&certs.nodes[2].cert, &certs.nodes[2].key, &certs.ca_cert);
   let mut client = connect_client(&node2_url, &client_tls, &key_hex).await;
 
   wait_for_resource(
@@ -812,7 +775,7 @@ async fn local_resources_do_not_replicate() {
   let _ = lycoris_tls::install_crypto_provider();
 
   let (node_count, base_port) = (2, alloc_base_port());
-  let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
+  let (_dir, certs) = lycoris_testkit::certs::temp_test_certs(node_count);
   let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
 
   let cluster_key = ClusterKey::generate().expect("generate cluster key");
@@ -853,10 +816,10 @@ async fn local_resources_do_not_replicate() {
         port,
         vec![peer],
         data_dirs[i].path().to_path_buf(),
-        &ca_cert_path,
-        &ca_key_path,
-        &cert_paths[i],
-        &key_paths[i],
+        &certs.ca_cert,
+        &certs.ca_key,
+        &certs.nodes[i].cert,
+        &certs.nodes[i].key,
       )
     })
     .collect();
@@ -866,7 +829,7 @@ async fn local_resources_do_not_replicate() {
   }
 
   let node1_url = format!("https://127.0.0.1:{}", base_port + 1);
-  let client_tls = client_tls_bundle(&cert_paths[1], &key_paths[1], &ca_cert_path);
+  let client_tls = client_tls_bundle(&certs.nodes[1].cert, &certs.nodes[1].key, &certs.ca_cert);
   let mut client = connect_client(&node1_url, &client_tls, &key_hex).await;
 
   // Negative assertion: polling cannot prove absence, so give anti-entropy a
@@ -917,7 +880,7 @@ async fn partition_merge_reconciles_shared_resources() {
   let _ = lycoris_tls::install_crypto_provider();
 
   let (node_count, base_port) = (2, alloc_base_port());
-  let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
+  let (_dir, certs) = lycoris_testkit::certs::temp_test_certs(node_count);
   let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
 
   let cluster_key = ClusterKey::generate().expect("generate cluster key");
@@ -990,10 +953,10 @@ async fn partition_merge_reconciles_shared_resources() {
         port,
         vec![peer],
         data_dirs[i].path().to_path_buf(),
-        &ca_cert_path,
-        &ca_key_path,
-        &cert_paths[i],
-        &key_paths[i],
+        &certs.ca_cert,
+        &certs.ca_key,
+        &certs.nodes[i].cert,
+        &certs.nodes[i].key,
       )
     })
     .collect();
@@ -1003,7 +966,7 @@ async fn partition_merge_reconciles_shared_resources() {
   }
 
   let node1_url = format!("https://127.0.0.1:{}", base_port + 1);
-  let client_tls = client_tls_bundle(&cert_paths[1], &key_paths[1], &ca_cert_path);
+  let client_tls = client_tls_bundle(&certs.nodes[1].cert, &certs.nodes[1].key, &certs.ca_cert);
   let mut client = connect_client(&node1_url, &client_tls, &key_hex).await;
 
   wait_for_resource(
@@ -1041,7 +1004,7 @@ async fn workspace_content_hash_verifies_on_apply() {
   let _ = lycoris_tls::install_crypto_provider();
 
   let (node_count, base_port) = (2, alloc_base_port());
-  let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
+  let (_dir, certs) = lycoris_testkit::certs::temp_test_certs(node_count);
   let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
 
   let cluster_key = ClusterKey::generate().expect("generate cluster key");
@@ -1074,10 +1037,10 @@ async fn workspace_content_hash_verifies_on_apply() {
         port,
         vec![peer],
         data_dirs[i].path().to_path_buf(),
-        &ca_cert_path,
-        &ca_key_path,
-        &cert_paths[i],
-        &key_paths[i],
+        &certs.ca_cert,
+        &certs.ca_key,
+        &certs.nodes[i].cert,
+        &certs.nodes[i].key,
       )
     })
     .collect();
@@ -1087,7 +1050,7 @@ async fn workspace_content_hash_verifies_on_apply() {
   }
 
   let node1_url = format!("https://127.0.0.1:{}", base_port + 1);
-  let client_tls = client_tls_bundle(&cert_paths[1], &key_paths[1], &ca_cert_path);
+  let client_tls = client_tls_bundle(&certs.nodes[1].cert, &certs.nodes[1].key, &certs.ca_cert);
   let mut client = connect_client(&node1_url, &client_tls, &key_hex).await;
 
   wait_for_resource(
@@ -1104,7 +1067,7 @@ async fn memory_content_hash_verifies_on_apply() {
   let _ = lycoris_tls::install_crypto_provider();
 
   let (node_count, base_port) = (2, alloc_base_port());
-  let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
+  let (_dir, certs) = lycoris_testkit::certs::temp_test_certs(node_count);
   let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
 
   let cluster_key = ClusterKey::generate().expect("generate cluster key");
@@ -1137,10 +1100,10 @@ async fn memory_content_hash_verifies_on_apply() {
         port,
         vec![peer],
         data_dirs[i].path().to_path_buf(),
-        &ca_cert_path,
-        &ca_key_path,
-        &cert_paths[i],
-        &key_paths[i],
+        &certs.ca_cert,
+        &certs.ca_key,
+        &certs.nodes[i].cert,
+        &certs.nodes[i].key,
       )
     })
     .collect();
@@ -1150,7 +1113,7 @@ async fn memory_content_hash_verifies_on_apply() {
   }
 
   let node1_url = format!("https://127.0.0.1:{}", base_port + 1);
-  let client_tls = client_tls_bundle(&cert_paths[1], &key_paths[1], &ca_cert_path);
+  let client_tls = client_tls_bundle(&certs.nodes[1].cert, &certs.nodes[1].key, &certs.ca_cert);
   let mut client = connect_client(&node1_url, &client_tls, &key_hex).await;
 
   wait_for_resource(
@@ -1167,7 +1130,7 @@ async fn memory_recall_works_after_replication() {
   let _ = lycoris_tls::install_crypto_provider();
 
   let (node_count, base_port) = (2, alloc_base_port());
-  let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
+  let (_dir, certs) = lycoris_testkit::certs::temp_test_certs(node_count);
   let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
 
   let cluster_key = ClusterKey::generate().expect("generate cluster key");
@@ -1203,10 +1166,10 @@ async fn memory_recall_works_after_replication() {
         port,
         vec![peer],
         data_dirs[i].path().to_path_buf(),
-        &ca_cert_path,
-        &ca_key_path,
-        &cert_paths[i],
-        &key_paths[i],
+        &certs.ca_cert,
+        &certs.ca_key,
+        &certs.nodes[i].cert,
+        &certs.nodes[i].key,
       )
     })
     .collect();
@@ -1216,7 +1179,7 @@ async fn memory_recall_works_after_replication() {
   }
 
   let node1_url = format!("https://127.0.0.1:{}", base_port + 1);
-  let client_tls = client_tls_bundle(&cert_paths[1], &key_paths[1], &ca_cert_path);
+  let client_tls = client_tls_bundle(&certs.nodes[1].cert, &certs.nodes[1].key, &certs.ca_cert);
   let mut client = connect_client(&node1_url, &client_tls, &key_hex).await;
 
   wait_for_resource(
@@ -1250,7 +1213,7 @@ async fn wrong_cluster_key_is_rejected() {
   let _ = lycoris_tls::install_crypto_provider();
 
   let (node_count, base_port) = (1, alloc_base_port());
-  let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
+  let (_dir, certs) = lycoris_testkit::certs::temp_test_certs(node_count);
   let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
 
   let cluster_key = ClusterKey::generate().expect("generate cluster key");
@@ -1260,17 +1223,17 @@ async fn wrong_cluster_key_is_rejected() {
     base_port,
     vec![],
     data_dirs[0].path().to_path_buf(),
-    &ca_cert_path,
-    &ca_key_path,
-    &cert_paths[0],
-    &key_paths[0],
+    &certs.ca_cert,
+    &certs.ca_key,
+    &certs.nodes[0].cert,
+    &certs.nodes[0].key,
   );
   spawn_runtime(config, cluster_key.clone());
 
   // The mTLS handshake succeeds (the client cert is valid), but a mismatched
   // cluster key must be rejected at the Cluster admission boundary.
   let node0_url = format!("https://127.0.0.1:{base_port}");
-  let client_tls = client_tls_bundle(&cert_paths[0], &key_paths[0], &ca_cert_path);
+  let client_tls = client_tls_bundle(&certs.nodes[0].cert, &certs.nodes[0].key, &certs.ca_cert);
   let wrong_key = ClusterKey::generate().expect("generate wrong cluster key");
   let mut client = connect_client(&node0_url, &client_tls, &cluster_key.to_hex())
     .await
@@ -1377,7 +1340,7 @@ async fn extension_invocation_routes_to_the_capable_node() {
   let _ = lycoris_tls::install_crypto_provider();
 
   let (node_count, base_port) = (2, alloc_base_port());
-  let (_dir, ca_cert_path, ca_key_path, cert_paths, key_paths) = generate_test_certs(node_count);
+  let (_dir, certs) = lycoris_testkit::certs::temp_test_certs(node_count);
   let data_dirs: Vec<TempDir> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
 
   let cluster_key = ClusterKey::generate().expect("generate cluster key");
@@ -1425,10 +1388,10 @@ async fn extension_invocation_routes_to_the_capable_node() {
         port,
         vec![peer],
         data_dirs[i].path().to_path_buf(),
-        &ca_cert_path,
-        &ca_key_path,
-        &cert_paths[i],
-        &key_paths[i],
+        &certs.ca_cert,
+        &certs.ca_key,
+        &certs.nodes[i].cert,
+        &certs.nodes[i].key,
       )
     })
     .collect();
@@ -1445,7 +1408,7 @@ async fn extension_invocation_routes_to_the_capable_node() {
   let node1_url = format!("https://127.0.0.1:{}", base_port + 1);
 
   // The record converges to node-1 through resource anti-entropy.
-  let client_tls = client_tls_bundle(&cert_paths[1], &key_paths[1], &ca_cert_path);
+  let client_tls = client_tls_bundle(&certs.nodes[1].cert, &certs.nodes[1].key, &certs.ca_cert);
   let mut node1_client = connect_client(&node1_url, &client_tls, &key_hex).await;
   wait_for_resource(
     &mut node1_client,
@@ -1457,7 +1420,7 @@ async fn extension_invocation_routes_to_the_capable_node() {
 
   // node-1 loads the extension (selector match) and announces the capability;
   // the register gossip delivers the annotation to node-0's membership view.
-  let client_tls = client_tls_bundle(&cert_paths[0], &key_paths[0], &ca_cert_path);
+  let client_tls = client_tls_bundle(&certs.nodes[0].cert, &certs.nodes[0].key, &certs.ca_cert);
   let mut node0_client = connect_client(&node0_url, &client_tls, &key_hex).await;
   let announced = wait_for_annotation(
     &mut node0_client,
@@ -1470,7 +1433,7 @@ async fn extension_invocation_routes_to_the_capable_node() {
 
   // The invoke on node-0 finds no local instance and is forwarded one hop to
   // node-1, which executes it.
-  let client_tls = client_tls_bundle(&cert_paths[0], &key_paths[0], &ca_cert_path);
+  let client_tls = client_tls_bundle(&certs.nodes[0].cert, &certs.nodes[0].key, &certs.ca_cert);
   let mut extension_client = connect_extension_client(&node0_url, &client_tls, &key_hex).await;
   let response = extension_client
     .invoke("echo-ext", "echo", br#"{"hello":"world"}"#.to_vec(), None)

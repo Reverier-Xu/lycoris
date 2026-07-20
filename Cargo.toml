@@ -1,10 +1,10 @@
 [workspace]
-members = ["crates/*", "extensions/*"]
-# Extensions are wasm guests: their `cdylib` crate type only makes sense for
-# wasm32, so keep them out of the default build — a workspace-wide
-# `cargo build` (e.g. for a musl host target) must not try to assemble them
-# for the host. Explicit `-p lycoris-ext-*` builds are unaffected, and
-# `--workspace` (used by the quality gates) still covers them.
+members = ["crates/*", "extensions/*", "testkit"]
+# Only crates/* belongs to the default build: extensions are wasm guests
+# (their `cdylib` crate type only makes sense for wasm32, so a workspace-wide
+# `cargo build` for a host target — e.g. musl — must not assemble them), and
+# testkit is dev-only test fixtures. Explicit `-p` builds are unaffected,
+# and `--workspace` (used by the quality gates) still covers everything.
 default-members = ["crates/*"]
 resolver        = "3"
 

@@ -28,7 +28,8 @@ wasmtime     = { workspace = true }
 webpki-roots = { workspace = true }
 
 [dev-dependencies]
-wat = { workspace = true }
+lycoris-testkit = { path = "../../testkit" }
+wat             = { workspace = true }
 
 [lints]
 workspace = true

@@ -529,6 +529,8 @@ fn guest_trap<E: std::fmt::Display>(context: &'static str) -> impl Fn(E) -> Exte
 mod tests {
   use std::collections::BTreeMap;
 
+  use lycoris_testkit::http::{MockHttpServer, MockResponse, RecordedRequest};
+
   use super::*;
   use crate::manifest::ExtensionManifest;
 
@@ -868,87 +870,23 @@ mod tests {
     )
   }
 
-  /// A minimal mock HTTP server: one request per connection, routed canned
-  /// responses. Returns the base URL; the task is aborted on drop.
-  struct MockHttp {
-    base_url: String,
-    task: tokio::task::JoinHandle<()>,
-  }
-
-  impl MockHttp {
-    async fn start() -> Self {
-      use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-      let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-      let base_url = format!("http://{}", listener.local_addr().unwrap());
-      let task = tokio::spawn(async move {
-        loop {
-          let Ok((mut stream, _)) = listener.accept().await else {
-            break;
-          };
-          tokio::spawn(async move {
-            // Byte-wise header read avoids over-reading into the body.
-            let mut head = Vec::new();
-            let mut byte = [0u8; 1];
-            while !head.ends_with(b"\r\n\r\n") {
-              if stream.read(&mut byte).await.unwrap_or(0) == 0 {
-                return;
-              }
-              head.push(byte[0]);
-              if head.len() > 64 * 1024 {
-                return;
-              }
-            }
-            let head = String::from_utf8_lossy(&head).into_owned();
-            let content_length: usize = head
-              .lines()
-              .find_map(|line| {
-                line
-                  .to_ascii_lowercase()
-                  .strip_prefix("content-length:")
-                  .and_then(|value| value.trim().parse().ok())
-              })
-              .unwrap_or(0);
-            let mut body = vec![0u8; content_length];
-            if stream.read_exact(&mut body).await.is_err() {
-              return;
-            }
-            let request_line = head.lines().next().unwrap_or_default().to_string();
-            let path = request_line
-              .split_whitespace()
-              .nth(1)
-              .unwrap_or("/")
-              .to_string();
-            let (status, reason, response_body): (u16, &str, Vec<u8>) = match path.as_str() {
-              "/teapot" => (418, "I'm a teapot", b"short and stout".to_vec()),
-              "/huge" => (200, "OK", vec![b'x'; 9 * 1024 * 1024]),
-              _ => (
-                200,
-                "OK",
-                serde_json::to_vec(&serde_json::json!({
-                  "request": request_line,
-                  "body": String::from_utf8_lossy(&body),
-                }))
-                .unwrap(),
-              ),
-            };
-            let response = format!(
-              "HTTP/1.1 {status} {reason}\r\ncontent-length: {}\r\nx-mock: yes\r\nconnection: close\r\n\r\n",
-              response_body.len()
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
-            let _ = stream.write_all(&response_body).await;
-          });
-        }
-      });
-      Self { base_url, task }
-    }
-  }
-
-  impl Drop for MockHttp {
-    fn drop(&mut self) {
-      self.task.abort();
-    }
+  /// Responses for the HTTP import tests: echo requests, preserve status
+  /// codes, and provide an intentionally oversized body.
+  fn mock_http_response(request: &RecordedRequest) -> MockResponse {
+    let response = match request.path() {
+      "/teapot" => MockResponse::new(418, "I'm a teapot", b"short and stout".to_vec()),
+      "/huge" => MockResponse::new(200, "OK", vec![b'x'; 9 * 1024 * 1024]),
+      _ => MockResponse::new(
+        200,
+        "OK",
+        serde_json::to_vec(&serde_json::json!({
+          "request": request.head.lines().next().unwrap_or_default(),
+          "body": request.body,
+        }))
+        .unwrap(),
+      ),
+    };
+    response.header("x-mock", "yes")
   }
 
   fn request_document(method: &str, url: &str, body: Option<&str>) -> Vec<u8> {
@@ -980,7 +918,7 @@ mod tests {
 
   #[tokio::test]
   async fn http_round_trip_against_a_mock_server() {
-    let server = MockHttp::start().await;
+    let server = MockHttpServer::start(mock_http_response).await;
     let engine = WasmEngine::new(EngineLimits::default()).unwrap();
     let instance = engine
       .load_instance(&http_package(), serde_json::json!({}))
@@ -989,7 +927,7 @@ mod tests {
 
     let document = request_document(
       "POST",
-      &format!("{}/echo", server.base_url),
+      &format!("{}/echo", server.base_url()),
       Some(r#"{"a":1}"#),
     );
     let output = instance.invoke("http", &document).await.unwrap();
@@ -1007,14 +945,14 @@ mod tests {
 
   #[tokio::test]
   async fn http_status_codes_pass_through_to_the_guest() {
-    let server = MockHttp::start().await;
+    let server = MockHttpServer::start(mock_http_response).await;
     let engine = WasmEngine::new(EngineLimits::default()).unwrap();
     let instance = engine
       .load_instance(&http_package(), serde_json::json!({}))
       .await
       .unwrap();
 
-    let document = request_document("GET", &format!("{}/teapot", server.base_url), None);
+    let document = request_document("GET", &format!("{}/teapot", server.base_url()), None);
     let output = instance.invoke("http", &document).await.unwrap();
     let response = parse_output(&output);
 
@@ -1026,14 +964,14 @@ mod tests {
 
   #[tokio::test]
   async fn http_response_bodies_hit_the_8_mib_cap() {
-    let server = MockHttp::start().await;
+    let server = MockHttpServer::start(mock_http_response).await;
     let engine = WasmEngine::new(EngineLimits::default()).unwrap();
     let instance = engine
       .load_instance(&http_package(), serde_json::json!({}))
       .await
       .unwrap();
 
-    let document = request_document("GET", &format!("{}/huge", server.base_url), None);
+    let document = request_document("GET", &format!("{}/huge", server.base_url()), None);
     let output = instance.invoke("http", &document).await.unwrap();
     let response = parse_output(&output);
 
@@ -1042,7 +980,7 @@ mod tests {
 
   #[tokio::test]
   async fn http_allow_hosts_rejects_unlisted_hosts_without_trapping() {
-    let server = MockHttp::start().await;
+    let server = MockHttpServer::start(mock_http_response).await;
     let engine = WasmEngine::new(EngineLimits::default()).unwrap();
     let instance = engine
       .load_instance(&http_package(), serde_json::json!({}))
@@ -1050,7 +988,7 @@ mod tests {
       .unwrap();
     *instance.http_allow_hosts.write().unwrap() = Some(vec!["api.openai.com".to_string()]);
 
-    let document = request_document("GET", &format!("{}/echo", server.base_url), None);
+    let document = request_document("GET", &format!("{}/echo", server.base_url()), None);
     let output = instance.invoke("http", &document).await.unwrap();
     let response = parse_output(&output);
 
@@ -1059,7 +997,7 @@ mod tests {
 
   #[tokio::test]
   async fn http_allow_hosts_passes_listed_hosts() {
-    let server = MockHttp::start().await;
+    let server = MockHttpServer::start(mock_http_response).await;
     let engine = WasmEngine::new(EngineLimits::default()).unwrap();
     let instance = engine
       .load_instance(&http_package(), serde_json::json!({}))
@@ -1067,7 +1005,7 @@ mod tests {
       .unwrap();
     *instance.http_allow_hosts.write().unwrap() = Some(vec!["127.0.0.1".to_string()]);
 
-    let document = request_document("GET", &format!("{}/echo", server.base_url), None);
+    let document = request_document("GET", &format!("{}/echo", server.base_url()), None);
     let output = instance.invoke("http", &document).await.unwrap();
     let response = parse_output(&output);
 
@@ -1168,7 +1106,7 @@ mod tests {
 
   #[tokio::test]
   async fn http_allow_hosts_from_settings_restricts_egress() {
-    let server = MockHttp::start().await;
+    let server = MockHttpServer::start(mock_http_response).await;
     let engine = WasmEngine::new(EngineLimits::default()).unwrap();
     let instance = engine
       .load_instance(
@@ -1178,7 +1116,7 @@ mod tests {
       .await
       .unwrap();
 
-    let document = request_document("GET", &format!("{}/echo", server.base_url), None);
+    let document = request_document("GET", &format!("{}/echo", server.base_url()), None);
     let output = instance.invoke("http", &document).await.unwrap();
     let response = parse_output(&output);
 
@@ -1187,7 +1125,7 @@ mod tests {
 
   #[tokio::test]
   async fn http_allow_hosts_from_settings_allows_listed_hosts() {
-    let server = MockHttp::start().await;
+    let server = MockHttpServer::start(mock_http_response).await;
     let engine = WasmEngine::new(EngineLimits::default()).unwrap();
     let instance = engine
       .load_instance(
@@ -1197,7 +1135,7 @@ mod tests {
       .await
       .unwrap();
 
-    let document = request_document("GET", &format!("{}/echo", server.base_url), None);
+    let document = request_document("GET", &format!("{}/echo", server.base_url()), None);
     let output = instance.invoke("http", &document).await.unwrap();
     let response = parse_output(&output);
 

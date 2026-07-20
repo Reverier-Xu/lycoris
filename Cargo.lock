@@ -4267,8 +4267,8 @@ dependencies = [
  "lycoris-membership",
  "lycoris-proto",
  "lycoris-storage",
+ "lycoris-testkit",
  "lycoris-tls",
- "rcgen",
  "rustls",
  "serde",
  "serde_json",
@@ -4285,6 +4285,7 @@ version = "0.2.0"
 dependencies = [
  "lycoris-extension",
  "lycoris-extguest",
+ "lycoris-testkit",
  "serde",
  "serde_json",
  "tokio",
@@ -4297,6 +4298,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "futures-util",
+ "lycoris-testkit",
  "mlua",
  "reqwest 0.13.4",
  "rustls",
@@ -4351,6 +4353,16 @@ dependencies = [
  "serde",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "lycoris-testkit"
+version = "0.2.0"
+dependencies = [
+ "rcgen",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 
