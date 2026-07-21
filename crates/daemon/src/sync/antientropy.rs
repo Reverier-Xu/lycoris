@@ -650,7 +650,7 @@ mod tests {
         .serve(addr)
         .await;
       if let Err(error) = result {
-        eprintln!("legacy peer server failed: {error}");
+        tracing::error!(%error, "legacy peer server failed");
       }
     });
 

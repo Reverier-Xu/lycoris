@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use lycoris_proto::node::{
   NodeBody, NodeState, Resource as ProtoResource, ResourceKind, resource::Body,
 };
-use owo_colors::OwoColorize;
 
 use super::parse::{resource_name, scope_from_proto};
 
@@ -19,11 +18,7 @@ pub(crate) fn render_list(
 }
 
 fn render_node_list(resources: &[ProtoResource], local_id: &str) {
-  println!(
-    "{}  {}",
-    "NODE ID".bold().underline(),
-    "STATE".bold().underline(),
-  );
+  tracing::info!("{}\t{}", "NODE ID", "STATE");
 
   let mut skipped = 0usize;
   for resource in resources {
@@ -31,40 +26,34 @@ fn render_node_list(resources: &[ProtoResource], local_id: &str) {
       skipped += 1;
       continue;
     };
-    let marker = if node.id == local_id {
-      "-> ".cyan().to_string()
+    let marker = if node.id == local_id { "->" } else { "" };
+    let current = if node.id == local_id {
+      " (current)"
     } else {
-      "   ".to_string()
+      ""
     };
-    let id = if node.id == local_id {
-      node.id.cyan().to_string()
-    } else {
-      node.id.clone()
-    };
-    println!("{}{}  {}", marker, id, state_display(node.state),);
-    println!("  address: {}", node.address);
+    tracing::info!(
+      "{marker} {}{current}\t{}\n  address: {}",
+      node.id,
+      state_display(node.state),
+      node.address
+    );
   }
   if skipped > 0 {
-    eprintln!("note: {skipped} resource(s) had no node body and were not displayed");
+    tracing::warn!("note: {skipped} resource(s) had no node body and were not displayed");
   }
 }
 
 fn render_generic_list(resources: &[ProtoResource]) {
-  println!(
-    "{}  {}  {}  {}",
-    "NAME".bold().underline(),
-    "KIND".bold().underline(),
-    "SCOPE".bold().underline(),
-    "SOURCE".bold().underline()
-  );
+  tracing::info!("{}\t{}\t{}\t{}", "NAME", "KIND", "SCOPE", "SOURCE");
 
   for resource in resources {
     let metadata = match resource.metadata.as_ref() {
       Some(m) => m,
       None => continue,
     };
-    println!(
-      "{}  {}  {}  {}",
+    tracing::info!(
+      "{}\t{}\t{}\t{}",
       metadata.name,
       kind_display(metadata.kind),
       scope_display(metadata.scope),
@@ -77,13 +66,13 @@ fn render_generic_list(resources: &[ProtoResource]) {
 /// facts — engine, human-facing semver, and whether the manifest selector
 /// matches this node's configured labels.
 fn render_extension_list(resources: &[ProtoResource], local_labels: &HashMap<String, String>) {
-  println!(
-    "{}  {}  {}  {}  {}",
-    "ID".bold().underline(),
-    "NAME".bold().underline(),
-    "ENGINE".bold().underline(),
-    "SEMVER".bold().underline(),
-    "LOCAL".bold().underline(),
+  tracing::info!(
+    "{}\t{}\t{}\t{}\t{}",
+    "ID",
+    "NAME",
+    "ENGINE",
+    "SEMVER",
+    "LOCAL"
   );
 
   let mut skipped = 0usize;
@@ -105,13 +94,17 @@ fn render_extension_list(resources: &[ProtoResource], local_labels: &HashMap<Str
       "no"
     };
     let semver = body.manifest.get("semver").map_or("-", String::as_str);
-    println!(
-      "{}  {}  {}  {}  {}",
-      metadata.id, metadata.name, body.engine, semver, local,
+    tracing::info!(
+      "{}\t{}\t{}\t{}\t{}",
+      metadata.id,
+      metadata.name,
+      body.engine,
+      semver,
+      local,
     );
   }
   if skipped > 0 {
-    eprintln!("note: {skipped} resource(s) had no extension body and were not displayed");
+    tracing::warn!("note: {skipped} resource(s) had no extension body and were not displayed");
   }
 }
 
@@ -133,85 +126,121 @@ pub(crate) fn render_resource(resource: &ProtoResource, kind: ResourceKind, loca
 
 fn render_node(resource: &ProtoResource, local_id: &str) {
   let Some(Body::Node(NodeBody { node: Some(node) })) = resource.body.as_ref() else {
-    eprintln!("note: the returned resource has no node body; nothing to display");
+    tracing::warn!("note: the returned resource has no node body; nothing to display");
     return;
   };
 
-  let marker = if node.id == local_id {
-    " (current)".cyan().to_string()
+  let current = if node.id == local_id {
+    " (current)"
   } else {
-    String::new()
+    ""
   };
-
-  println!("{}{}", node.id.bold().cyan(), marker);
-  println!("  address:        {}", node.address);
-  println!("  state:          {}", state_display(node.state));
-  println!("  incarnation:    {}", node.incarnation);
-  println!("  heartbeat:      {}", node.heartbeat);
-  println!("  last heartbeat: {}", node.last_heartbeat_unix_ms);
-  println!("  labels:         {:?}", node.labels);
-  println!("  annotations:    {:?}", node.annotations);
+  tracing::info!(
+    "{}{current}\n\
+     \x20 address:        {}\n\
+     \x20 state:          {}\n\
+     \x20 incarnation:    {}\n\
+     \x20 heartbeat:      {}\n\
+     \x20 last heartbeat: {}\n\
+     \x20 labels:         {:?}\n\
+     \x20 annotations:    {:?}",
+    node.id,
+    node.address,
+    state_display(node.state),
+    node.incarnation,
+    node.heartbeat,
+    node.last_heartbeat_unix_ms,
+    node.labels,
+    node.annotations
+  );
 }
 
 fn render_generic(resource: &ProtoResource) {
   let metadata = match resource.metadata.as_ref() {
     Some(m) => m,
     None => {
-      println!("(missing metadata)");
+      tracing::warn!("(missing metadata)");
       return;
     }
   };
 
-  println!("{}", metadata.name.bold());
-  println!("  kind:           {}", kind_display(metadata.kind));
-  println!("  id:             {}", metadata.id);
-  println!("  scope:          {}", scope_display(metadata.scope));
-  println!("  source node:    {}", metadata.source_node_id);
-  println!("  created at:     {}", metadata.created_at_ms);
-  println!("  updated at:     {}", metadata.updated_at_ms);
-  println!("  labels:         {:?}", metadata.labels);
-  println!("  annotations:    {:?}", metadata.annotations);
+  tracing::info!(
+    "{name}\n\
+     \x20 kind:           {kind}\n\
+     \x20 id:             {id}\n\
+     \x20 scope:          {scope}\n\
+     \x20 source node:    {source}\n\
+     \x20 created at:     {created}\n\
+     \x20 updated at:     {updated}\n\
+     \x20 labels:         {labels:?}\n\
+     \x20 annotations:    {annotations:?}",
+    name = metadata.name,
+    kind = kind_display(metadata.kind),
+    id = metadata.id,
+    scope = scope_display(metadata.scope),
+    source = metadata.source_node_id,
+    created = metadata.created_at_ms,
+    updated = metadata.updated_at_ms,
+    labels = metadata.labels,
+    annotations = metadata.annotations
+  );
 
   match resource.body.as_ref() {
     Some(Body::Session(body)) => {
-      println!("  title:          {}", body.title);
-      println!("  host node:      {}", body.host_node_id);
-      println!("  metadata:       {:?}", body.metadata);
+      tracing::info!(
+        "  title:          {}\n  host node:      {}\n  metadata:       {:?}",
+        body.title,
+        body.host_node_id,
+        body.metadata
+      );
     }
     Some(Body::Memory(body)) => {
-      println!("  content length: {}", body.content.len());
-      println!("  embedding dim:  {}", body.embedding.len());
-      println!("  content hash:   {}", body.content_hash);
-      println!("  metadata:       {:?}", body.metadata);
+      tracing::info!(
+        "  content length: {}\n  embedding dim:  {}\n  content hash:   {}\n  metadata:       {:?}",
+        body.content.len(),
+        body.embedding.len(),
+        body.content_hash,
+        body.metadata
+      );
     }
     Some(Body::Skill(body)) => {
-      println!("  version:        {}", body.version);
-      println!("  content hash:   {}", body.content_hash);
-      println!("  content length: {}", body.content.len());
-      println!("  metadata:       {:?}", body.metadata);
+      tracing::info!(
+        "  version:        {}\n  content hash:   {}\n  content length: {}\n  metadata:       {:?}",
+        body.version,
+        body.content_hash,
+        body.content.len(),
+        body.metadata
+      );
     }
     Some(Body::Rule(body)) => {
-      println!("  version:        {}", body.version);
-      println!("  content hash:   {}", body.content_hash);
-      println!("  content length: {}", body.content.len());
-      println!("  metadata:       {:?}", body.metadata);
+      tracing::info!(
+        "  version:        {}\n  content hash:   {}\n  content length: {}\n  metadata:       {:?}",
+        body.version,
+        body.content_hash,
+        body.content.len(),
+        body.metadata
+      );
     }
     Some(Body::Workspace(body)) => {
-      println!("  root:           {}", body.root);
-      println!("  version:        {}", body.version);
-      println!("  content hash:   {}", body.content_hash);
-      println!("  sessions:       {:?}", body.session_ids);
-      println!("  metadata:       {:?}", body.metadata);
+      tracing::info!(
+        "  root:           {}\n  version:        {}\n  content hash:   {}\n  sessions:       {:?}\n  metadata:       {:?}",
+        body.root,
+        body.version,
+        body.content_hash,
+        body.session_ids,
+        body.metadata
+      );
     }
     Some(Body::Extension(body)) => {
-      println!("  version:        {}", body.version);
-      println!("  engine:         {}", body.engine);
-      println!("  entry:          {}", body.entry);
-      println!("  content hash:   {}", body.content_hash);
-      // The artifact itself is never dumped; its size is enough to confirm
-      // what the node holds.
-      println!("  artifact size:  {} bytes", body.artifact.len());
-      println!("  manifest:       {:?}", body.manifest);
+      tracing::info!(
+        "  version:        {}\n  engine:         {}\n  entry:          {}\n  content hash:   {}\n  artifact size:  {} bytes\n  manifest:       {:?}",
+        body.version,
+        body.engine,
+        body.entry,
+        body.content_hash,
+        body.artifact.len(),
+        body.manifest
+      );
     }
     Some(Body::Node(_)) | None => {}
   }

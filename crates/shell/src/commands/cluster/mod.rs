@@ -2,7 +2,6 @@ use lycoris_client::{ClusterClient, ExtensionClient};
 use lycoris_config::{ClientConfig, DaemonConfig};
 use lycoris_core::{ClusterKey, default_cluster_key_path};
 use lycoris_proto::node::{NodeInfo, ResourceKind};
-use owo_colors::OwoColorize;
 
 use crate::error::ShellError;
 
@@ -10,6 +9,7 @@ pub(crate) mod ext;
 mod parse;
 mod render;
 
+#[tracing::instrument(name = "get_resources", skip_all, fields(resource = %resource))]
 pub(crate) async fn get_resources(
   client_config: &ClientConfig, resource: &str, name: Option<String>, selectors: &[String],
   scope: Option<String>,
@@ -60,13 +60,14 @@ pub(crate) async fn get_resources(
           source,
         })?;
       render::render_list(kind, &resources, &local_id, &local_labels);
-      println!("total: {}", resources.len());
+      tracing::info!(total = resources.len(), "resources listed");
     }
   }
 
   Ok(())
 }
 
+#[tracing::instrument(name = "register", skip_all, fields(id = %id, address = %address))]
 pub(crate) async fn register(
   client_config: &ClientConfig, id: String, address: String, key: Option<String>,
 ) -> Result<(), ShellError> {
@@ -79,7 +80,7 @@ pub(crate) async fn register(
     std::collections::HashMap::new(),
   );
   client.register(node).await.map_err(ShellError::Register)?;
-  println!("registered node {}", id.cyan());
+  tracing::info!(id = %id, "node registered");
   Ok(())
 }
 
@@ -91,14 +92,15 @@ pub(crate) fn init_cluster(key: Option<String>) -> Result<(), ShellError> {
 
   let path = default_cluster_key_path();
   cluster_key.save(&path)?;
-  println!(
-    "initialized cluster with key {}",
-    cluster_key.to_hex().cyan()
+  tracing::info!(
+    key = %cluster_key.to_hex(),
+    path = %path.display(),
+    "cluster initialized"
   );
-  println!("key stored at: {}", path.display());
   Ok(())
 }
 
+#[tracing::instrument(name = "join_cluster", skip_all, fields(%peer))]
 pub(crate) async fn join_cluster(
   client_config: &ClientConfig, peer: String, key: Option<String>,
 ) -> Result<(), ShellError> {
@@ -132,14 +134,15 @@ pub(crate) async fn join_cluster(
     .await
     .map_err(ShellError::SetPrimary)?;
 
-  println!(
-    "node {} joined cluster through {}",
-    daemon_config.node.id.cyan(),
-    peer.cyan()
+  tracing::info!(
+    node_id = %daemon_config.node.id,
+    %peer,
+    "node joined cluster"
   );
   Ok(())
 }
 
+#[tracing::instrument(name = "leave_cluster", skip_all)]
 pub(crate) async fn leave_cluster(client_config: &ClientConfig) -> Result<(), ShellError> {
   let daemon_config = DaemonConfig::load(None)?;
   let mut client = connect_cluster(client_config).await?;
@@ -147,10 +150,7 @@ pub(crate) async fn leave_cluster(client_config: &ClientConfig) -> Result<(), Sh
     .leave(&daemon_config.node.id)
     .await
     .map_err(ShellError::Leave)?;
-  println!(
-    "node {} is leaving the cluster",
-    daemon_config.node.id.cyan()
-  );
+  tracing::info!(node_id = %daemon_config.node.id, "node leaving cluster");
   Ok(())
 }
 
@@ -161,7 +161,7 @@ pub(crate) fn show_key() -> Result<(), ShellError> {
   }
 
   let key = ClusterKey::load(&path)?;
-  println!("{}", key.to_hex());
+  tracing::info!(key = %key.to_hex(), "cluster key");
   Ok(())
 }
 
@@ -249,7 +249,7 @@ fn local_node_id() -> String {
   match DaemonConfig::load(None) {
     Ok(config) => config.node.id,
     Err(error) => {
-      eprintln!("warning: failed to load daemon config, local node will not be marked: {error}");
+      tracing::warn!(%error, "failed to load daemon config, local node will not be marked");
       String::new()
     }
   }
@@ -261,9 +261,7 @@ fn local_node_labels() -> std::collections::HashMap<String, String> {
   match DaemonConfig::load(None) {
     Ok(config) => config.node.labels,
     Err(error) => {
-      eprintln!(
-        "warning: failed to load daemon config, local selector matches will not be marked: {error}"
-      );
+      tracing::warn!(%error, "failed to load daemon config, local selector matches will not be marked");
       std::collections::HashMap::new()
     }
   }

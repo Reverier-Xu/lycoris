@@ -28,7 +28,6 @@ use std::{
 
 use lycoris_config::ClientConfig;
 use lycoris_proto::node::RegisterExtensionRequest;
-use owo_colors::OwoColorize;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ShellError;
@@ -159,6 +158,7 @@ fn to_json(value: &impl Serialize, key: &str) -> Result<String, ShellError> {
 
 /// `lycoris cluster ext load`: register the package on the connected node and
 /// print the outcome; the package then converges cluster-wide.
+#[tracing::instrument(name = "ext_load", skip_all, fields(package = %package.display()))]
 pub(crate) async fn ext_load(
   client_config: &ClientConfig, package: &Path,
 ) -> Result<(), ShellError> {
@@ -169,15 +169,14 @@ pub(crate) async fn ext_load(
     .register(request)
     .await
     .map_err(ShellError::RegisterExtension)?;
-  println!("accepted: {}", "true".green());
-  println!("extension:  {}", id.cyan());
-  println!("content hash: {content_hash}");
+  tracing::info!(%id, %content_hash, "extension loaded");
   Ok(())
 }
 
 /// `lycoris cluster ext invoke`: call an extension method with a JSON
-/// payload. The payload prints to stdout (pipeable); the routing decision
-/// prints to stderr.
+/// payload. The payload prints to stdout (pipeable) so it can be consumed
+/// by downstream tools; the routing decision is logged via tracing.
+#[tracing::instrument(name = "ext_invoke", skip_all, fields(id = %id, method = %method))]
 pub(crate) async fn ext_invoke(
   client_config: &ClientConfig, id: &str, method: &str, payload: Option<String>,
 ) -> Result<(), ShellError> {
@@ -188,9 +187,11 @@ pub(crate) async fn ext_invoke(
     .invoke(id, method, payload, None)
     .await
     .map_err(ShellError::InvokeExtension)?;
-  // Engines guarantee JSON output; print it verbatim instead of re-encoding.
-  println!("{}", String::from_utf8_lossy(&response.payload));
-  eprintln!("executed by: {}", response.executed_by);
+  // Engines guarantee JSON output; print it verbatim to stdout for pipe
+  // composability, and also log the routing decision via tracing.
+  let payload_str = String::from_utf8_lossy(&response.payload);
+  println!("{payload_str}");
+  tracing::info!(executed_by = %response.executed_by, "extension invoked");
   Ok(())
 }
 

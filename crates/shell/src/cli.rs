@@ -29,7 +29,21 @@ pub(crate) enum Command {
   Daemon(ConfigArg),
 
   /// Install lycoris as a user-mode background service.
-  Setup,
+  Setup {
+    /// Node id (defaults to the machine hostname).
+    #[arg(long)]
+    node_id: Option<String>,
+    /// Port for both listen and advertise (default: 7796).
+    #[arg(long, default_value = "7796")]
+    port: u16,
+    /// Address this node advertises to the cluster,
+    /// e.g. https://192.168.1.1:7796 (default: https://127.0.0.1:<port>).
+    #[arg(long)]
+    advertise_addr: Option<String>,
+    /// Do not start the service after setup.
+    #[arg(long)]
+    no_start: bool,
+  },
 }
 
 #[derive(Subcommand, Debug)]

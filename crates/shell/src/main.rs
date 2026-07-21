@@ -13,7 +13,7 @@ use lycoris_config::ClientConfig;
 
 fn main() {
   if let Err(error) = run() {
-    eprintln!("error: {error}");
+    tracing::error!(%error, "command failed");
     std::process::exit(1);
   }
 }
@@ -21,12 +21,13 @@ fn main() {
 fn run() -> Result<(), ShellError> {
   lycoris_tls::install_crypto_provider().map_err(ShellError::CryptoProvider)?;
   // Logs go to stderr so stdout stays reserved for command output (which may
-  // be piped). The default level is quiet; RUST_LOG overrides it.
+  // be piped). The default level is info so every user-visible message
+  // appears; RUST_LOG overrides it.
   tracing_subscriber::fmt()
     .with_writer(std::io::stderr)
     .with_env_filter(
       tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
     )
     .init();
 
@@ -38,14 +39,21 @@ fn run() -> Result<(), ShellError> {
 
 /// Single dispatch for every CLI command; synchronous commands simply
 /// complete inline inside the async context.
+#[tracing::instrument(name = "dispatch", skip_all, fields(command = ?command))]
 async fn dispatch(command: Command) -> Result<(), ShellError> {
   match command {
     Command::Cluster(cluster) => dispatch_cluster(cluster).await,
     Command::Daemon(args) => commands::daemon::run(args.config).await,
-    Command::Setup => commands::setup::run(),
+    Command::Setup {
+      node_id,
+      port,
+      advertise_addr,
+      no_start,
+    } => commands::setup::run(node_id, port, advertise_addr, no_start),
   }
 }
 
+#[tracing::instrument(name = "cluster", skip_all)]
 async fn dispatch_cluster(command: ClusterCommand) -> Result<(), ShellError> {
   match command {
     ClusterCommand::Init { key } => commands::cluster::init_cluster(key),

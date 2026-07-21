@@ -35,17 +35,18 @@ pkg-fmt = "zip"
 
 [dependencies]
 clap                         = { workspace = true, features = ["derive"] }
+is-root.workspace            = true
 lycoris-client.workspace     = true
 lycoris-config.workspace     = true
 lycoris-core.workspace       = true
 lycoris-daemon.workspace     = true
 lycoris-proto.workspace      = true
 lycoris-tls.workspace        = true
-owo-colors.workspace         = true
 rustls.workspace             = true
 semver.workspace             = true
 serde.workspace              = true
 serde_json.workspace         = true
+service-manager.workspace    = true
 thiserror.workspace          = true
 tokio.workspace              = true
 toml.workspace               = true

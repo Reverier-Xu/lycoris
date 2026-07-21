@@ -53,21 +53,24 @@ impl GitContentStore {
     if output.status.success() {
       Ok(output)
     } else {
-      Err(WorkspaceStorageError::GitCommandFailed(
-        String::from_utf8_lossy(&output.stderr).to_string(),
-      ))
+      let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+      tracing::error!(%stderr, "git command failed");
+      Err(WorkspaceStorageError::GitCommandFailed(stderr))
     }
   }
 }
 
 impl VersionedContentStore for GitContentStore {
+  #[tracing::instrument(name = "git_write", skip_all, fields(id = %id))]
   fn write(&self, id: &str, content: &str, message: &str) -> Result<String, WorkspaceStorageError> {
     resource_id::validate(id)?;
     self.initialize()?;
     let relative_path = format!("{id}.toml");
     std::fs::write(self.repo_path.join(&relative_path), content)?;
 
+    tracing::debug!(id = %id, "git add");
     self.ok(self.git().arg("add").arg(&relative_path).output()?)?;
+    tracing::debug!(id = %id, message = %message, "git commit");
     let output = self
       .git()
       .arg("commit")
@@ -79,9 +82,9 @@ impl VersionedContentStore for GitContentStore {
       .arg(&relative_path)
       .output()?;
     if !output.status.success() && output.status.code() != Some(1) {
-      return Err(WorkspaceStorageError::GitCommandFailed(
-        String::from_utf8_lossy(&output.stderr).to_string(),
-      ));
+      let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+      tracing::error!(%stderr, "git commit failed");
+      return Err(WorkspaceStorageError::GitCommandFailed(stderr));
     }
 
     let output = self.ok(
@@ -94,9 +97,12 @@ impl VersionedContentStore for GitContentStore {
         .arg(&relative_path)
         .output()?,
     )?;
-    Ok(String::from_utf8(output.stdout)?.trim().to_string())
+    let hash = String::from_utf8(output.stdout)?.trim().to_string();
+    tracing::debug!(id = %id, commit = %hash, "git write complete");
+    Ok(hash)
   }
 
+  #[tracing::instrument(name = "git_read", skip_all, fields(id = %id))]
   fn read(&self, id: &str) -> Result<Option<String>, WorkspaceStorageError> {
     resource_id::validate(id)?;
     match std::fs::read_to_string(self.repo_path.join(format!("{id}.toml"))) {
