@@ -1,0 +1,92 @@
+use std::{fmt, str::FromStr};
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+macro_rules! identifier {
+  ($name:ident, $length:expr) => {
+    #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+    pub struct $name([u8; $length]);
+
+    impl $name {
+      pub const BYTE_LENGTH: usize = $length;
+
+      pub const fn from_bytes(bytes: [u8; $length]) -> Self {
+        Self(bytes)
+      }
+
+      pub const fn as_bytes(&self) -> &[u8; $length] {
+        &self.0
+      }
+    }
+
+    impl fmt::Debug for $name {
+      fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+      }
+    }
+
+    impl fmt::Display for $name {
+      fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&hex::encode(self.0))
+      }
+    }
+
+    impl FromStr for $name {
+      type Err = ParseIdentifierError;
+
+      fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let expected = $length * 2;
+        if value.len() != expected {
+          return Err(ParseIdentifierError::Length {
+            expected,
+            actual: value.len(),
+          });
+        }
+        let mut bytes = [0_u8; $length];
+        hex::decode_to_slice(value, &mut bytes)?;
+        Ok(Self(bytes))
+      }
+    }
+  };
+}
+
+identifier!(ClusterId, 32);
+identifier!(NodeId, 32);
+identifier!(RequestId, 16);
+
+#[derive(Debug, Error)]
+pub enum ParseIdentifierError {
+  #[error("identifier has {actual} hex characters; expected {expected}")]
+  Length { expected: usize, actual: usize },
+  #[error("identifier is not valid hexadecimal: {0}")]
+  Hex(#[from] hex::FromHexError),
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn identifier_text_round_trip_is_canonical() {
+    let id = NodeId::from_bytes([0xAB; NodeId::BYTE_LENGTH]);
+    let encoded = id.to_string();
+
+    assert_eq!(encoded.len(), NodeId::BYTE_LENGTH * 2);
+    assert_eq!(encoded.parse::<NodeId>().unwrap(), id);
+    assert_eq!(format!("{id:?}"), encoded);
+  }
+
+  #[test]
+  fn identifier_parser_rejects_wrong_length_and_non_hex() {
+    assert!(matches!(
+      "00".parse::<ClusterId>(),
+      Err(ParseIdentifierError::Length { .. })
+    ));
+    let invalid = "z".repeat(RequestId::BYTE_LENGTH * 2);
+    assert!(matches!(
+      invalid.parse::<RequestId>(),
+      Err(ParseIdentifierError::Hex(_))
+    ));
+  }
+}

@@ -1,0 +1,21 @@
+[package]
+name = "lycoris-overlay"
+
+authors.workspace      = true
+description.workspace  = true
+edition.workspace      = true
+homepage.workspace     = true
+license.workspace      = true
+readme.workspace       = true
+repository.workspace   = true
+rust-version.workspace = true
+version.workspace      = true
+
+[dependencies]
+hex       = { workspace = true }
+postcard  = { workspace = true }
+serde     = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

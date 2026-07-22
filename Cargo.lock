@@ -4385,6 +4385,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "lycoris-overlay"
+version = "0.2.0"
+dependencies = [
+ "hex",
+ "postcard",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "lycoris-proto"
 version = "0.2.0"
 dependencies = [

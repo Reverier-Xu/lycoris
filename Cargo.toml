@@ -88,6 +88,7 @@ lycoris-daemon     = { path = "crates/daemon" }
 lycoris-extension  = { path = "crates/extension" }
 lycoris-extguest   = { path = "crates/extguest" }
 lycoris-membership = { path = "crates/membership" }
+lycoris-overlay    = { path = "crates/overlay" }
 lycoris-proto      = { path = "crates/proto" }
 lycoris-storage    = { path = "crates/storage" }
 lycoris-tls        = { path = "crates/tls" }
