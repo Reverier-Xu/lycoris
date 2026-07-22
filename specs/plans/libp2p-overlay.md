@@ -20,7 +20,7 @@ Workflow changes additionally require `act`. The final dependency and release ga
 ## Atomic deliveries
 
 - [x] Define the architecture, impact, invariants, and E2E acceptance contract.
-- [ ] Lock resource convergence behavior at the mapper and synchronization boundary.
+- [x] Lock resource convergence behavior at the mapper and synchronization boundary.
 - [ ] Add overlay protocol identifiers, bounded wire types, and deterministic codecs.
 - [ ] Persist node identities and the signed authorization registry.
 - [ ] Add the single-owner libp2p link actor with QUIC and TCP/Noise/Yamux.

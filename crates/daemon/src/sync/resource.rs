@@ -113,3 +113,125 @@ impl ResourceSync {
     }
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use std::sync::Arc;
+
+  use lycoris_membership::SwimConfig;
+  use lycoris_proto::node::{MemoryBody, ResourceMetadata, ResourceScope, resource::Body};
+  use lycoris_storage::{DEFAULT_EMBEDDING_DIM, MemoryEntry, Storage};
+  use tempfile::TempDir;
+
+  use super::*;
+  use crate::{
+    membership::{MemberRegister, MembershipService},
+    transport::PeerPool,
+  };
+
+  struct TestResourceSync {
+    _data_dir: TempDir,
+    _tls_dir: TempDir,
+    mapper: ResourceMapper,
+    sync: ResourceSync,
+  }
+
+  fn test_resource_sync() -> TestResourceSync {
+    let data_dir = TempDir::new().unwrap();
+    let storage = Storage::open(data_dir.path().join("lycoris.redb")).unwrap();
+    let node = storage.node().clone();
+    let service = Arc::new(MembershipService::new(
+      "local",
+      SwimConfig::default(),
+      MemberRegister::new("local", "127.0.0.1:1", 1, 0),
+    ));
+    let mapper = ResourceMapper::new(storage, service);
+
+    let (tls_dir, certs) = lycoris_testkit::certs::temp_test_certs(1);
+    let tls =
+      lycoris_tls::load_tls_bundle(&certs.nodes[0].cert, &certs.nodes[0].key, &certs.ca_cert)
+        .unwrap();
+    let sync = ResourceSync::new(mapper.clone(), node, PeerPool::new(&tls, None));
+
+    TestResourceSync {
+      _data_dir: data_dir,
+      _tls_dir: tls_dir,
+      mapper,
+      sync,
+    }
+  }
+
+  fn memory_resource(id: &str, content: &[u8], version: u64) -> Resource {
+    Resource {
+      metadata: Some(ResourceMetadata {
+        id: id.to_string(),
+        name: id.to_string(),
+        kind: lycoris_proto::node::ResourceKind::Memory as i32,
+        scope: ResourceScope::ClusterShared as i32,
+        source_node_id: "peer".to_string(),
+        updated_at_ms: version as i64,
+        ..ResourceMetadata::default()
+      }),
+      body: Some(Body::Memory(MemoryBody {
+        content: content.to_vec(),
+        content_hash: MemoryEntry::compute_content_hash(content),
+        embedding: vec![0.0; DEFAULT_EMBEDDING_DIM],
+        version,
+        ..MemoryBody::default()
+      })),
+    }
+  }
+
+  fn resource_ids(resources: &[Resource]) -> Vec<String> {
+    let mut ids: Vec<_> = resources
+      .iter()
+      .filter_map(|resource| resource.metadata.as_ref())
+      .map(|metadata| metadata.id.clone())
+      .collect();
+    ids.sort();
+    ids
+  }
+
+  #[tokio::test]
+  async fn merge_and_list_shared_returns_union_and_skips_invalid_resource() {
+    let fixture = test_resource_sync();
+    fixture
+      .mapper
+      .apply_resource(&memory_resource("local", b"local", 1))
+      .await
+      .unwrap();
+    let valid = memory_resource("remote", b"remote", 1);
+    let mut invalid = memory_resource("invalid", b"invalid", 1);
+    let Some(Body::Memory(body)) = invalid.body.as_mut() else {
+      panic!("expected memory body");
+    };
+    body.content_hash = "invalid-hash".to_string();
+
+    let merged = fixture
+      .sync
+      .merge_and_list_shared(vec![valid, invalid])
+      .await;
+
+    assert_eq!(resource_ids(&merged), ["local", "remote"]);
+  }
+
+  #[tokio::test]
+  async fn merge_and_list_shared_is_idempotent_and_preserves_winner() {
+    let fixture = test_resource_sync();
+    let winner = memory_resource("memory", b"winner", 2);
+    let stale = memory_resource("memory", b"stale", 1);
+
+    fixture
+      .sync
+      .merge_and_list_shared(vec![winner.clone(), winner, stale])
+      .await;
+    let merged = fixture.sync.merge_and_list_shared(Vec::new()).await;
+
+    assert_eq!(resource_ids(&merged), ["memory"]);
+    let Some(Body::Memory(body)) = merged[0].body.as_ref() else {
+      panic!("expected memory body");
+    };
+    assert_eq!(body.version, 2);
+    assert_eq!(body.content, b"winner");
+  }
+}
