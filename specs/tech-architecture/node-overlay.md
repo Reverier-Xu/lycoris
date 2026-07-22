@@ -68,17 +68,20 @@ AuthorizationRecord {
   node_id,
   peer_id,
   identity_public_key,
+  initial_public_key,
   epoch,
-  state: active | revoked | conflicted,
-  predecessor,
-  authorized_by,
+  state: active | revoked,
+  identity_predecessor,
+  authorizer_identity,
+  authorizer_action_predecessor,
+  retired_identity_and_action_head,
   signature
 }
 ```
 
-The registry is an append-only set of signed operations. Replication merges operations by hash. A node's effective record follows a single increasing epoch chain. Concurrent operations for the same predecessor and epoch produce `conflicted`; neither candidate is authorized until another authorized node resolves the fork.
+The registry is an append-only set of signed operations. Replication merges operations by hash. Each record participates in two causal chains: the subject's identity chain and the signer's authorization-action chain. A record is effective only when both paths to it are unique and every authorizer identity on the path is itself effective and active. Concurrent successors derive `conflicted`; neither branch is authorized until another authorized node resolves the fork.
 
-Normal rotation is signed by the old identity. Lost-key recovery is signed by any active authorized node. If no authorized node or offline recovery material remains, the old identity cannot be recovered cryptographically and the cluster must be reinitialized.
+Normal rotation is signed by the old identity and terminates that key's authorization-action chain. Lost-key recovery or revocation is signed by another active authorized node and explicitly retires the old key's last known action head. Historical operations before the terminal record remain valid; a later old-key operation creates a conflict and fails closed. If no authorized node or offline recovery material remains, the old identity cannot be recovered cryptographically and the cluster must be reinitialized.
 
 ## Admission state machine
 

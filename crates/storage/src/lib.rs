@@ -20,7 +20,9 @@ pub use agent::{
 pub use error::StorageError;
 pub use extension::{ExtensionBlobStore, ExtensionDomain, ExtensionRecord, ExtensionStorageError};
 pub use lycoris_core::ResourceScope;
-pub use node::{LocalStorage, MetaStorage, NodeDomain, PeerRecord, PeerStorage};
+pub use node::{
+  AuthorizationStorage, LocalStorage, MetaStorage, NodeDomain, PeerRecord, PeerStorage,
+};
 use redb::Database;
 pub use resource_id::{InvalidResourceId, validate as validate_resource_id};
 pub use table::RedbTableStorage;

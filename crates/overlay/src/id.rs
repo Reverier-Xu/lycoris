@@ -53,7 +53,34 @@ macro_rules! identifier {
 
 identifier!(ClusterId, 32);
 identifier!(NodeId, 32);
+identifier!(RecordId, 32);
 identifier!(RequestId, 16);
+
+impl ClusterId {
+  pub fn from_genesis(node_id: NodeId) -> Self {
+    Self(domain_hash(b"lycoris/cluster-id/1", node_id.as_bytes()))
+  }
+}
+
+impl NodeId {
+  pub fn from_initial_public_key(public_key: &[u8]) -> Self {
+    Self(domain_hash(b"lycoris/node-id/1", public_key))
+  }
+}
+
+impl RecordId {
+  pub(crate) fn from_signed_record(record: &[u8]) -> Self {
+    Self(domain_hash(b"lycoris/authorization-record/1", record))
+  }
+}
+
+fn domain_hash(domain: &[u8], value: &[u8]) -> [u8; 32] {
+  let mut hasher = blake3::Hasher::new();
+  hasher.update(domain);
+  hasher.update(&[0]);
+  hasher.update(value);
+  hasher.finalize().into()
+}
 
 #[derive(Debug, Error)]
 pub enum ParseIdentifierError {

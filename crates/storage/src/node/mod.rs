@@ -1,9 +1,11 @@
+pub mod authorization;
 pub mod local;
 pub mod meta;
 pub mod peers;
 
 use std::sync::Arc;
 
+pub use authorization::AuthorizationStorage;
 pub use local::LocalStorage;
 pub use meta::MetaStorage;
 pub use peers::{PeerRecord, PeerStorage};
@@ -16,6 +18,7 @@ use redb::Database;
 /// an `Arc`.
 #[derive(Debug, Clone)]
 pub struct NodeDomain {
+  authorization: AuthorizationStorage,
   local: LocalStorage,
   peers: PeerStorage,
   meta: MetaStorage,
@@ -24,10 +27,16 @@ pub struct NodeDomain {
 impl NodeDomain {
   pub(crate) fn new(db: Arc<Database>) -> Self {
     Self {
+      authorization: AuthorizationStorage::new(db.clone()),
       local: LocalStorage::new(db.clone()),
       peers: PeerStorage::new(db.clone()),
       meta: MetaStorage::new(db),
     }
+  }
+
+  /// Access the complete signed node authorization record set.
+  pub fn authorization(&self) -> &AuthorizationStorage {
+    &self.authorization
   }
 
   /// Access local node attribute storage.

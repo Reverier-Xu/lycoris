@@ -22,7 +22,7 @@ Workflow changes additionally require `act`. The final dependency and release ga
 - [x] Define the architecture, impact, invariants, and E2E acceptance contract.
 - [x] Lock resource convergence behavior at the mapper and synchronization boundary.
 - [x] Add overlay protocol identifiers, bounded wire types, and deterministic codecs.
-- [ ] Persist node identities and the signed authorization registry.
+- [x] Persist node identities and the signed authorization registry.
 - [ ] Add the single-owner libp2p link actor with QUIC and TCP/Noise/Yamux.
 - [ ] Enforce known-peer authorization and deterministic duplicate-link arbitration.
 - [ ] Add quarantined join-key and operator-approved enrollment.
