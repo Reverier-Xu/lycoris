@@ -80,24 +80,31 @@ impl Envelope {
 }
 
 #[cfg(test)]
-mod tests {
-  use std::collections::HashSet;
-
+pub(crate) mod test_support {
   use super::*;
 
-  fn header() -> EnvelopeHeader {
+  pub(crate) fn header(
+    protocol: ProtocolId, kind: MessageKind, deadline_unix_ms: i64, remaining_hops: u8,
+  ) -> EnvelopeHeader {
     EnvelopeHeader {
       version: PROTOCOL_VERSION,
       cluster_id: ClusterId::from_bytes([1; ClusterId::BYTE_LENGTH]),
       request_id: RequestId::from_bytes([2; RequestId::BYTE_LENGTH]),
       source: NodeId::from_bytes([3; NodeId::BYTE_LENGTH]),
       destination: NodeId::from_bytes([4; NodeId::BYTE_LENGTH]),
-      protocol: ProtocolId::Membership,
-      kind: MessageKind::Request,
-      deadline_unix_ms: 42,
-      remaining_hops: 8,
+      protocol,
+      kind,
+      deadline_unix_ms,
+      remaining_hops,
     }
   }
+}
+
+#[cfg(test)]
+mod tests {
+  use std::collections::HashSet;
+
+  use super::*;
 
   #[test]
   fn protocol_paths_are_unique_and_versioned() {
@@ -117,7 +124,8 @@ mod tests {
 
   #[test]
   fn envelope_rejects_payload_above_the_frame_budget() {
-    let error = Envelope::new(header(), vec![0; MAX_PAYLOAD_BYTES + 1]).unwrap_err();
+    let header = test_support::header(ProtocolId::Membership, MessageKind::Request, 42, 8);
+    let error = Envelope::new(header, vec![0; MAX_PAYLOAD_BYTES + 1]).unwrap_err();
 
     assert!(matches!(error, FrameError::PayloadTooLarge { .. }));
   }

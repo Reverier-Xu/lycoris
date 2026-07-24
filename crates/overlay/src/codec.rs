@@ -37,27 +37,11 @@ pub fn decode_frame<T: DeserializeOwned>(frame: &[u8]) -> Result<T, FrameError> 
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::{
-    ClusterId, Envelope, EnvelopeHeader, MessageKind, NodeId, PROTOCOL_VERSION, ProtocolId,
-    RequestId,
-  };
+  use crate::{Envelope, MessageKind, ProtocolId, protocol::test_support};
 
   fn envelope() -> Envelope {
-    Envelope::new(
-      EnvelopeHeader {
-        version: PROTOCOL_VERSION,
-        cluster_id: ClusterId::from_bytes([1; ClusterId::BYTE_LENGTH]),
-        request_id: RequestId::from_bytes([2; RequestId::BYTE_LENGTH]),
-        source: NodeId::from_bytes([3; NodeId::BYTE_LENGTH]),
-        destination: NodeId::from_bytes([4; NodeId::BYTE_LENGTH]),
-        protocol: ProtocolId::Resource,
-        kind: MessageKind::Response,
-        deadline_unix_ms: 10,
-        remaining_hops: 4,
-      },
-      b"resource page".to_vec(),
-    )
-    .unwrap()
+    let header = test_support::header(ProtocolId::Resource, MessageKind::Response, 10, 4);
+    Envelope::new(header, b"resource page".to_vec()).unwrap()
   }
 
   #[test]

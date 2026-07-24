@@ -130,6 +130,13 @@ impl AuthorizationRegistry {
     })
   }
 
+  pub fn active_peer_for_node(&self, node_id: NodeId) -> Option<PeerId> {
+    let AuthorizationStatus::Active(record) = self.status(node_id) else {
+      return None;
+    };
+    PeerId::from_bytes(record.peer_id()).ok()
+  }
+
   pub fn authorizer_head(
     &self, identity: &AuthorizationRecord,
   ) -> Result<&AuthorizationRecord, AuthorizationError> {
@@ -404,6 +411,23 @@ mod tests {
       .unwrap()
   }
 
+  fn admit_member(
+    cluster_id: ClusterId, member: &NodeIdentity, sponsor_record: &AuthorizationRecord,
+    sponsor: &NodeIdentity,
+  ) -> AuthorizationRecord {
+    AuthorizationRecord::admit(cluster_id, member, sponsor_record, sponsor_record, sponsor).unwrap()
+  }
+
+  fn insert_admitted_member(
+    registry: &mut AuthorizationRegistry, sponsor_record: &AuthorizationRecord,
+    sponsor: &NodeIdentity,
+  ) -> (NodeIdentity, AuthorizationRecord) {
+    let member = NodeIdentity::generate();
+    let admission = admit_member(registry.cluster_id(), &member, sponsor_record, sponsor);
+    registry.insert(admission.clone()).unwrap();
+    (member, admission)
+  }
+
   #[test]
   fn forged_genesis_for_an_existing_node_is_rejected() {
     let (identity, record, _) = genesis();
@@ -429,6 +453,10 @@ mod tests {
     assert_eq!(
       registry.node_for_peer(&successor.peer_id()),
       Some(identity.node_id())
+    );
+    assert_eq!(
+      registry.active_peer_for_node(identity.node_id()),
+      Some(successor.peer_id())
     );
     assert_eq!(registry.node_for_peer(&identity.peer_id()), None);
   }
@@ -479,16 +507,7 @@ mod tests {
   #[test]
   fn historical_admission_survives_sponsor_rotation() {
     let (sponsor, sponsor_record, mut registry) = genesis();
-    let member = NodeIdentity::generate();
-    let admission = AuthorizationRecord::admit(
-      registry.cluster_id(),
-      &member,
-      &sponsor_record,
-      &sponsor_record,
-      &sponsor,
-    )
-    .unwrap();
-    registry.insert(admission.clone()).unwrap();
+    let (member, admission) = insert_admitted_member(&mut registry, &sponsor_record, &sponsor);
     let rotation =
       AuthorizationRecord::rotate(&sponsor_record, &admission, &successor(&sponsor), &sponsor)
         .unwrap();
@@ -545,16 +564,7 @@ mod tests {
   #[test]
   fn old_key_branch_after_recovery_fails_closed() {
     let (sponsor, sponsor_record, mut registry) = genesis();
-    let member = NodeIdentity::generate();
-    let admission = AuthorizationRecord::admit(
-      registry.cluster_id(),
-      &member,
-      &sponsor_record,
-      &sponsor_record,
-      &sponsor,
-    )
-    .unwrap();
-    registry.insert(admission.clone()).unwrap();
+    let (member, admission) = insert_admitted_member(&mut registry, &sponsor_record, &sponsor);
     let recovered = successor(&member);
     let recovery = AuthorizationRecord::recover(
       &admission,

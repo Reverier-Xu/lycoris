@@ -1,8 +1,11 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use futures_util::StreamExt;
 use libp2p::{
-  Multiaddr, PeerId, Swarm, SwarmBuilder, noise, ping,
+  Multiaddr, PeerId, Swarm, SwarmBuilder,
+  core::ConnectedPoint,
+  multiaddr::Protocol,
+  noise, ping,
   swarm::{ConnectionId, SwarmEvent, dial_opts::DialOpts},
   tcp, yamux,
 };
@@ -12,7 +15,7 @@ use tokio::{
 };
 
 use super::{LinkCommand, LinkConfig, LinkError, LinkHandle, LinkSnapshot};
-use crate::NodeIdentity;
+use crate::{AuthorizationRegistry, NodeId, NodeIdentity, authorization::AuthorizationError};
 
 pub struct LinkRuntime {
   handle: LinkHandle,
@@ -20,7 +23,9 @@ pub struct LinkRuntime {
 }
 
 impl LinkRuntime {
-  pub fn start(identity: &NodeIdentity, config: LinkConfig) -> Result<Self, LinkError> {
+  pub fn start(
+    identity: &NodeIdentity, config: LinkConfig, authorization: AuthorizationRegistry,
+  ) -> Result<Self, LinkError> {
     let mut swarm = build_swarm(identity, &config)?;
     for address in config.listen_addresses() {
       swarm
@@ -29,7 +34,7 @@ impl LinkRuntime {
     }
 
     let local_peer_id = identity.peer_id();
-    let state = LinkState::new(identity.node_id(), local_peer_id);
+    let state = LinkState::new(identity.node_id(), local_peer_id, authorization);
     let (snapshot_tx, snapshots) = watch::channel(state.snapshot());
     let (commands, command_rx) = mpsc::channel(config.command_capacity());
     let actor = LinkActor {
@@ -92,23 +97,30 @@ impl LinkActor {
   fn handle_command(&mut self, command: LinkCommand) -> bool {
     match command {
       LinkCommand::Dial {
-        peer_id,
+        node_id,
         address,
         reply,
       } => {
-        let options = DialOpts::peer_id(peer_id).addresses(vec![address]).build();
-        let result = self
-          .swarm
-          .dial(options)
-          .map_err(|error| LinkError::Transport(error.to_string()));
+        let result = self.dial(node_id, address);
         let _ = reply.send(result);
         false
       }
-      LinkCommand::Disconnect { peer_id, reply } => {
+      LinkCommand::Disconnect { node_id, reply } => {
         let result = self
-          .swarm
-          .disconnect_peer_id(peer_id)
-          .map_err(|()| LinkError::NotConnected(peer_id));
+          .state
+          .active_peer_for_node(node_id)
+          .ok_or(LinkError::UnauthorizedNode(node_id))
+          .and_then(|peer_id| {
+            self
+              .swarm
+              .disconnect_peer_id(peer_id)
+              .map_err(|()| LinkError::NotConnected(node_id))
+          });
+        let _ = reply.send(result);
+        false
+      }
+      LinkCommand::SetAuthorization { registry, reply } => {
+        let result = self.set_authorization(registry);
         let _ = reply.send(result);
         false
       }
@@ -117,6 +129,48 @@ impl LinkActor {
         true
       }
     }
+  }
+
+  fn dial(&mut self, node_id: NodeId, address: Multiaddr) -> Result<(), LinkError> {
+    let peer_id = self
+      .state
+      .active_peer_for_node(node_id)
+      .ok_or(LinkError::UnauthorizedNode(node_id))?;
+    let options = DialOpts::peer_id(peer_id).addresses(vec![address]).build();
+    self
+      .swarm
+      .dial(options)
+      .map_err(|error| LinkError::Transport(error.to_string()))
+  }
+
+  fn set_authorization(&mut self, registry: AuthorizationRegistry) -> Result<(), LinkError> {
+    if registry.cluster_id() != self.state.authorization.cluster_id() {
+      return Err(
+        AuthorizationError::ForeignCluster {
+          expected: self.state.authorization.cluster_id(),
+          actual: registry.cluster_id(),
+        }
+        .into(),
+      );
+    }
+    self.state.authorization = registry;
+    let stale_connections: Vec<_> = self
+      .state
+      .connections
+      .iter()
+      .filter_map(|(connection_id, connection)| {
+        let authorized = self
+          .state
+          .authorization
+          .node_for_peer(&connection.peer_id)
+          .is_some_and(|node_id| node_id == connection.node_id);
+        (!authorized).then_some(*connection_id)
+      })
+      .collect();
+    for connection_id in stale_connections {
+      self.swarm.close_connection(connection_id);
+    }
+    Ok(())
   }
 
   fn handle_event(&mut self, event: SwarmEvent<ping::Event>) {
@@ -135,15 +189,17 @@ impl LinkActor {
         }
         changed
       }
-      SwarmEvent::ConnectionEstablished { peer_id, .. } => self.state.connected.insert(peer_id),
+      SwarmEvent::ConnectionEstablished {
+        peer_id,
+        connection_id,
+        endpoint,
+        ..
+      } => self.connection_established(peer_id, connection_id, endpoint),
       SwarmEvent::ConnectionClosed {
         peer_id,
         connection_id,
-        num_established,
         ..
-      } => self
-        .state
-        .connection_closed(peer_id, connection_id, num_established),
+      } => self.state.connection_closed(peer_id, connection_id),
       SwarmEvent::Behaviour(event) => match event.result {
         Ok(_) => self
           .state
@@ -165,69 +221,198 @@ impl LinkActor {
       self.snapshot_tx.send_replace(self.state.snapshot());
     }
   }
+
+  fn connection_established(
+    &mut self, peer_id: PeerId, connection_id: ConnectionId, endpoint: ConnectedPoint,
+  ) -> bool {
+    let Some(node_id) = self.state.authorization.node_for_peer(&peer_id) else {
+      tracing::debug!(%peer_id, "closing unauthorized overlay connection");
+      self.swarm.close_connection(connection_id);
+      return false;
+    };
+    let changed = self
+      .state
+      .connection_established(peer_id, node_id, connection_id, endpoint);
+    self.arbitrate_connections(peer_id, node_id);
+    changed
+  }
+
+  fn arbitrate_connections(&mut self, peer_id: PeerId, node_id: NodeId) {
+    let mut candidates: Vec<_> = self
+      .state
+      .connections
+      .iter()
+      .filter(|(_, connection)| connection.node_id == node_id)
+      .map(|(connection_id, connection)| {
+        (
+          *connection_id,
+          connection_preference(self.state.local_peer_id, peer_id, &connection.endpoint),
+        )
+      })
+      .collect();
+    if candidates.len() <= 1 {
+      return;
+    }
+    candidates.sort_by(|left, right| left.1.cmp(&right.1).then(left.0.cmp(&right.0)));
+    let winner = candidates[0].0;
+    for (connection_id, _) in candidates.into_iter().skip(1) {
+      self.swarm.close_connection(connection_id);
+    }
+    tracing::debug!(%peer_id, ?winner, "closed duplicate overlay connections");
+  }
+}
+
+#[derive(Debug, Clone)]
+struct ConnectionInfo {
+  peer_id: PeerId,
+  node_id: NodeId,
+  endpoint: ConnectedPoint,
 }
 
 struct LinkState {
-  node_id: crate::NodeId,
+  node_id: NodeId,
   local_peer_id: PeerId,
+  authorization: AuthorizationRegistry,
   listeners: BTreeSet<Multiaddr>,
-  connected: BTreeSet<PeerId>,
-  healthy_connections: BTreeSet<(PeerId, ConnectionId)>,
+  connections: BTreeMap<ConnectionId, ConnectionInfo>,
+  healthy_connections: BTreeSet<ConnectionId>,
 }
 
 impl LinkState {
-  fn new(node_id: crate::NodeId, local_peer_id: PeerId) -> Self {
+  fn new(node_id: NodeId, local_peer_id: PeerId, authorization: AuthorizationRegistry) -> Self {
     Self {
       node_id,
       local_peer_id,
+      authorization,
       listeners: BTreeSet::new(),
-      connected: BTreeSet::new(),
+      connections: BTreeMap::new(),
       healthy_connections: BTreeSet::new(),
     }
   }
 
-  fn connection_closed(
-    &mut self, peer_id: PeerId, connection_id: ConnectionId, remaining_connections: u32,
+  fn active_peer_for_node(&self, node_id: NodeId) -> Option<PeerId> {
+    self.authorization.active_peer_for_node(node_id)
+  }
+
+  fn connection_established(
+    &mut self, peer_id: PeerId, node_id: NodeId, connection_id: ConnectionId,
+    endpoint: ConnectedPoint,
   ) -> bool {
-    let health_changed = self.set_connection_health(peer_id, connection_id, false);
-    let connection_changed = (remaining_connections == 0).then(|| self.connected.remove(&peer_id));
-    health_changed || connection_changed.unwrap_or(false)
+    self.connections.insert(
+      connection_id,
+      ConnectionInfo {
+        peer_id,
+        node_id,
+        endpoint,
+      },
+    );
+    true
+  }
+
+  fn connection_closed(&mut self, peer_id: PeerId, connection_id: ConnectionId) -> bool {
+    let Some(connection) = self.connections.get(&connection_id) else {
+      self.healthy_connections.remove(&connection_id);
+      return false;
+    };
+    debug_assert_eq!(connection.peer_id, peer_id);
+    let _node_id = connection.node_id;
+    self.healthy_connections.remove(&connection_id);
+    self.connections.remove(&connection_id);
+    true
   }
 
   fn set_connection_health(
     &mut self, peer_id: PeerId, connection_id: ConnectionId, healthy: bool,
   ) -> bool {
-    let was_healthy = self.peer_is_healthy(peer_id);
-    let connection = (peer_id, connection_id);
-    if healthy {
-      self.healthy_connections.insert(connection);
-    } else {
-      self.healthy_connections.remove(&connection);
+    let Some(connection) = self.connections.get(&connection_id) else {
+      self.healthy_connections.remove(&connection_id);
+      return false;
+    };
+    if connection.peer_id != peer_id {
+      return false;
     }
-    was_healthy != self.peer_is_healthy(peer_id)
+    let node_id = connection.node_id;
+    let was_healthy = self.node_is_healthy(node_id);
+    if healthy {
+      self.healthy_connections.insert(connection_id);
+    } else {
+      self.healthy_connections.remove(&connection_id);
+    }
+    was_healthy != self.node_is_healthy(node_id)
   }
 
-  fn peer_is_healthy(&self, peer_id: PeerId) -> bool {
-    self
-      .healthy_connections
-      .iter()
-      .any(|(healthy_peer, _)| *healthy_peer == peer_id)
+  fn node_is_healthy(&self, node_id: NodeId) -> bool {
+    self.healthy_connections.iter().any(|connection_id| {
+      self
+        .connections
+        .get(connection_id)
+        .is_some_and(|connection| connection.node_id == node_id)
+    })
   }
 
   fn snapshot(&self) -> LinkSnapshot {
-    let healthy_peers = self
-      .connected
+    let connected_nodes: BTreeSet<_> = self
+      .connections
+      .values()
+      .map(|connection| connection.node_id)
+      .collect();
+    let healthy_nodes = connected_nodes
       .iter()
       .copied()
-      .filter(|peer_id| self.peer_is_healthy(*peer_id))
+      .filter(|node_id| self.node_is_healthy(*node_id))
       .collect();
     LinkSnapshot {
       node_id: self.node_id,
-      local_peer_id: self.local_peer_id,
       listen_addresses: self.listeners.iter().cloned().collect(),
-      connected_peers: self.connected.iter().copied().collect(),
-      healthy_peers,
+      connected_nodes: connected_nodes.into_iter().collect(),
+      healthy_nodes,
+      connection_count: self.connections.len(),
     }
+  }
+}
+
+#[derive(Debug, Clone, Eq, Ord, PartialEq, PartialOrd)]
+struct ConnectionPreference {
+  transport: u8,
+  initiator: u8,
+  remote_address: Vec<u8>,
+}
+
+fn connection_preference(
+  local_peer_id: PeerId, peer_id: PeerId, endpoint: &ConnectedPoint,
+) -> ConnectionPreference {
+  const DIRECT_QUIC: u8 = 0;
+  const DIRECT_TCP: u8 = 1;
+  const RELAYED_QUIC: u8 = 2;
+  const RELAYED_TCP: u8 = 3;
+  const OTHER_TRANSPORT: u8 = 4;
+
+  let transport_address = match endpoint {
+    ConnectedPoint::Dialer { address, .. }
+    | ConnectedPoint::Listener {
+      local_addr: address,
+      ..
+    } => address,
+  };
+  let quic = transport_address
+    .iter()
+    .any(|protocol| matches!(protocol, Protocol::QuicV1));
+  let tcp = transport_address
+    .iter()
+    .any(|protocol| matches!(protocol, Protocol::Tcp(_)));
+  let transport = match (endpoint.is_relayed(), quic, tcp) {
+    (false, true, _) => DIRECT_QUIC,
+    (false, _, true) => DIRECT_TCP,
+    (true, true, _) => RELAYED_QUIC,
+    (true, _, true) => RELAYED_TCP,
+    _ => OTHER_TRANSPORT,
+  };
+  let local_is_canonical_initiator = local_peer_id.to_bytes() < peer_id.to_bytes();
+  let preferred_role = endpoint.is_dialer() == local_is_canonical_initiator;
+  ConnectionPreference {
+    transport,
+    initiator: u8::from(!preferred_role),
+    remote_address: endpoint.get_remote_address().to_vec(),
   }
 }
 
@@ -262,31 +447,72 @@ fn build_swarm(
 
 #[cfg(test)]
 mod tests {
-  use libp2p::{PeerId, swarm::ConnectionId};
+  use libp2p::{
+    PeerId,
+    core::{ConnectedPoint, Endpoint, transport::PortUse},
+    swarm::ConnectionId,
+  };
 
   use super::*;
-  use crate::NodeId;
+  use crate::{AuthorizationRecord, NodeId};
+
+  fn state() -> LinkState {
+    let identity = NodeIdentity::generate();
+    let (cluster_id, record) = AuthorizationRecord::genesis(&identity).unwrap();
+    let registry = AuthorizationRegistry::from_records(cluster_id, [record]).unwrap();
+    LinkState::new(identity.node_id(), identity.peer_id(), registry)
+  }
+
+  fn endpoint(address: &str) -> ConnectedPoint {
+    ConnectedPoint::Dialer {
+      address: address.parse().unwrap(),
+      role_override: Endpoint::Dialer,
+      port_use: PortUse::New,
+    }
+  }
 
   #[test]
-  fn healthy_peer_state_requires_only_one_healthy_connection() {
-    let mut state = LinkState::new(
-      NodeId::from_bytes([0; NodeId::BYTE_LENGTH]),
-      PeerId::random(),
-    );
+  fn healthy_node_state_requires_only_one_healthy_connection() {
+    let mut state = state();
     let peer = PeerId::random();
+    let node = NodeId::from_bytes([1; NodeId::BYTE_LENGTH]);
     let first = ConnectionId::new_unchecked(1);
     let second = ConnectionId::new_unchecked(2);
-    state.connected.insert(peer);
+    state.connection_established(peer, node, first, endpoint("/ip4/127.0.0.1/tcp/4001"));
+    state.connection_established(
+      peer,
+      node,
+      second,
+      endpoint("/ip4/127.0.0.1/udp/4001/quic-v1"),
+    );
 
     assert!(state.set_connection_health(peer, first, true));
     assert!(!state.set_connection_health(peer, second, true));
     assert!(!state.set_connection_health(peer, first, false));
-    assert!(state.snapshot().healthy_peers.contains(&peer));
+    assert!(state.snapshot().healthy_nodes.contains(&node));
 
-    assert!(state.connection_closed(peer, second, 1));
-    assert!(state.connected.contains(&peer));
-    assert!(!state.snapshot().healthy_peers.contains(&peer));
-    assert!(state.connection_closed(peer, first, 0));
-    assert!(!state.connected.contains(&peer));
+    assert!(state.connection_closed(peer, second));
+    assert!(state.snapshot().connected_nodes.contains(&node));
+    assert!(!state.snapshot().healthy_nodes.contains(&node));
+    assert!(state.connection_closed(peer, first));
+    assert!(!state.snapshot().connected_nodes.contains(&node));
+  }
+
+  #[test]
+  fn duplicate_preference_prefers_quic_then_the_canonical_initiator() {
+    let local = PeerId::random();
+    let remote = PeerId::random();
+    let quic = connection_preference(local, remote, &endpoint("/ip4/127.0.0.1/udp/4001/quic-v1"));
+    let tcp = connection_preference(local, remote, &endpoint("/ip4/127.0.0.1/tcp/4001"));
+
+    assert!(quic < tcp);
+
+    let listener = ConnectedPoint::Listener {
+      local_addr: "/ip4/127.0.0.1/udp/4001/quic-v1".parse().unwrap(),
+      send_back_addr: "/ip4/127.0.0.1/udp/5000/quic-v1".parse().unwrap(),
+    };
+    let canonical = connection_preference(local, remote, &listener);
+    let non_canonical = connection_preference(remote, local, &listener);
+    assert_ne!(canonical.initiator, non_canonical.initiator);
   }
 }

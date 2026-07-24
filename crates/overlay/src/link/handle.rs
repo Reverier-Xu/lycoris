@@ -1,18 +1,18 @@
 use std::time::Duration;
 
-use libp2p::{Multiaddr, PeerId};
+use libp2p::Multiaddr;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::NodeId;
+use crate::{AuthorizationRegistry, NodeId, authorization::AuthorizationError};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct LinkSnapshot {
   pub node_id: NodeId,
-  pub local_peer_id: PeerId,
   pub listen_addresses: Vec<Multiaddr>,
-  pub connected_peers: Vec<PeerId>,
-  pub healthy_peers: Vec<PeerId>,
+  pub connected_nodes: Vec<NodeId>,
+  pub healthy_nodes: Vec<NodeId>,
+  pub connection_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -31,11 +31,11 @@ impl LinkHandle {
   }
 
   /// Queue a dial attempt. Use [`Self::wait_connected`] to observe success.
-  pub async fn dial(&self, peer_id: PeerId, address: Multiaddr) -> Result<(), LinkError> {
+  pub async fn dial(&self, node_id: NodeId, address: Multiaddr) -> Result<(), LinkError> {
     let (reply, response) = oneshot::channel();
     self
       .send(LinkCommand::Dial {
-        peer_id,
+        node_id,
         address,
         reply,
       })
@@ -43,27 +43,35 @@ impl LinkHandle {
     response.await.map_err(|_| LinkError::ActorStopped)?
   }
 
-  /// Close the peer's established connections; pending dials are unaffected.
-  pub async fn disconnect(&self, peer_id: PeerId) -> Result<(), LinkError> {
+  /// Close the node's established connections; pending dials are unaffected.
+  pub async fn disconnect(&self, node_id: NodeId) -> Result<(), LinkError> {
     let (reply, response) = oneshot::channel();
     self
-      .send(LinkCommand::Disconnect { peer_id, reply })
+      .send(LinkCommand::Disconnect { node_id, reply })
       .await?;
     response.await.map_err(|_| LinkError::ActorStopped)?
   }
 
-  pub async fn wait_connected(&self, peer_id: PeerId, timeout: Duration) -> Result<(), LinkError> {
+  pub async fn set_authorization(&self, registry: AuthorizationRegistry) -> Result<(), LinkError> {
+    let (reply, response) = oneshot::channel();
+    self
+      .send(LinkCommand::SetAuthorization { registry, reply })
+      .await?;
+    response.await.map_err(|_| LinkError::ActorStopped)?
+  }
+
+  pub async fn wait_connected(&self, node_id: NodeId, timeout: Duration) -> Result<(), LinkError> {
     self
       .wait_for(timeout, |snapshot| {
-        snapshot.connected_peers.contains(&peer_id)
+        snapshot.connected_nodes.contains(&node_id)
       })
       .await
   }
 
-  pub async fn wait_healthy(&self, peer_id: PeerId, timeout: Duration) -> Result<(), LinkError> {
+  pub async fn wait_healthy(&self, node_id: NodeId, timeout: Duration) -> Result<(), LinkError> {
     self
       .wait_for(timeout, |snapshot| {
-        snapshot.healthy_peers.contains(&peer_id)
+        snapshot.healthy_nodes.contains(&node_id)
       })
       .await
   }
@@ -115,12 +123,16 @@ impl LinkHandle {
 #[derive(Debug)]
 pub(crate) enum LinkCommand {
   Dial {
-    peer_id: PeerId,
+    node_id: NodeId,
     address: Multiaddr,
     reply: oneshot::Sender<Result<(), LinkError>>,
   },
   Disconnect {
-    peer_id: PeerId,
+    node_id: NodeId,
+    reply: oneshot::Sender<Result<(), LinkError>>,
+  },
+  SetAuthorization {
+    registry: AuthorizationRegistry,
     reply: oneshot::Sender<Result<(), LinkError>>,
   },
   Shutdown {
@@ -134,10 +146,14 @@ pub enum LinkError {
   Transport(String),
   #[error("link actor is not running")]
   ActorStopped,
-  #[error("peer {0} is not connected")]
-  NotConnected(PeerId),
+  #[error("node {0} is not authorized")]
+  UnauthorizedNode(NodeId),
+  #[error("node {0} is not connected")]
+  NotConnected(NodeId),
   #[error("link state did not reach the requested condition before the deadline")]
   Timeout,
+  #[error(transparent)]
+  Authorization(#[from] AuthorizationError),
   #[error("link actor task failed: {0}")]
   Task(#[from] tokio::task::JoinError),
 }

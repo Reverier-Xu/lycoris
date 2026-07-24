@@ -29,7 +29,7 @@ the completed work reaches `main`.
   codecs.
 - [x] Persist node identities and the signed authorization registry.
 - [x] Add the single-owner libp2p link actor with QUIC and TCP/Noise/Yamux.
-- [ ] Enforce known-peer authorization and deterministic duplicate-link
+- [x] Enforce known-peer authorization and deterministic duplicate-link
   arbitration.
 - [ ] Add quarantined join-key and operator-approved enrollment.
 - [ ] Add LAN discovery, address expiry, and reconnect behavior.
