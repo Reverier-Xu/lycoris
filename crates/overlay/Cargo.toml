@@ -19,6 +19,7 @@ libp2p          = { workspace = true }
 libp2p-identity = { workspace = true }
 lycoris-core    = { workspace = true }
 postcard        = { workspace = true }
+ring            = { workspace = true }
 serde           = { workspace = true }
 thiserror       = { workspace = true }
 tokio           = { workspace = true }

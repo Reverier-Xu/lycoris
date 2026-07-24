@@ -269,8 +269,14 @@ fn authorized_pair() -> (
   let first = NodeIdentity::generate();
   let second = NodeIdentity::generate();
   let (cluster_id, first_record) = AuthorizationRecord::genesis(&first).unwrap();
-  let second_record =
-    AuthorizationRecord::admit(cluster_id, &second, &first_record, &first_record, &first).unwrap();
+  let second_record = AuthorizationRecord::admit(
+    cluster_id,
+    &second.public_identity(),
+    &first_record,
+    &first_record,
+    &first,
+  )
+  .unwrap();
   let registry =
     AuthorizationRegistry::from_records(cluster_id, [first_record.clone(), second_record.clone()])
       .unwrap();

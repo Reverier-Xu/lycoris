@@ -50,6 +50,11 @@ impl ClusterKey {
     Ok(Self(array))
   }
 
+  /// Return the raw key bytes for transcript-bound proofs.
+  pub const fn as_bytes(&self) -> &[u8; KEY_LENGTH] {
+    &self.0
+  }
+
   /// Return the key as a hex string.
   pub fn to_hex(&self) -> String {
     hex::encode(self.0)
@@ -91,24 +96,40 @@ pub fn default_cluster_key_path() -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
+  use std::fmt::Debug;
+
   use tempfile::TempDir;
 
   use super::*;
 
+  fn must<T, E: Debug>(result: Result<T, E>) -> T {
+    match result {
+      Ok(value) => value,
+      Err(error) => panic!("unexpected test error: {error:?}"),
+    }
+  }
+
+  fn must_err<T: Debug, E>(result: Result<T, E>) -> E {
+    match result {
+      Ok(value) => panic!("unexpected test success: {value:?}"),
+      Err(error) => error,
+    }
+  }
+
   #[test]
   fn generate_and_round_trip() {
-    let key = ClusterKey::generate().unwrap();
-    let dir = TempDir::new().unwrap();
+    let key = must(ClusterKey::generate());
+    let dir = must(TempDir::new());
     let path = dir.path().join("cluster.key");
-    key.save(&path).unwrap();
-    let loaded = ClusterKey::load(&path).unwrap();
+    must(key.save(&path));
+    let loaded = must(ClusterKey::load(&path));
     assert_eq!(key, loaded);
   }
 
   #[test]
   fn from_hex_accepts_valid_key() {
     let hex = "a".repeat(KEY_LENGTH * 2);
-    let key = ClusterKey::from_hex(&hex).unwrap();
+    let key = must(ClusterKey::from_hex(&hex));
     assert_eq!(key.to_hex(), hex);
   }
 
@@ -120,7 +141,7 @@ mod tests {
 
   #[test]
   fn debug_output_is_redacted() {
-    let key = ClusterKey::generate().unwrap();
+    let key = must(ClusterKey::generate());
     let rendered = format!("{key:?}");
     assert_eq!(rendered, "ClusterKey([redacted])");
     assert!(!rendered.contains(&key.to_hex()));
@@ -129,15 +150,12 @@ mod tests {
   #[test]
   fn equality_compares_every_byte() {
     let hex_of = |bytes: [u8; KEY_LENGTH]| hex::encode(bytes);
-    let key = ClusterKey::from_hex(&hex_of([0xAA; KEY_LENGTH])).unwrap();
-    assert_eq!(
-      key,
-      ClusterKey::from_hex(&hex_of([0xAA; KEY_LENGTH])).unwrap()
-    );
+    let key = must(ClusterKey::from_hex(&hex_of([0xAA; KEY_LENGTH])));
+    assert_eq!(key, must(ClusterKey::from_hex(&hex_of([0xAA; KEY_LENGTH]))));
     for index in [0, KEY_LENGTH - 1] {
       let mut bytes = [0xAA; KEY_LENGTH];
       bytes[index] ^= 0x01;
-      assert_ne!(key, ClusterKey::from_hex(&hex_of(bytes)).unwrap());
+      assert_ne!(key, must(ClusterKey::from_hex(&hex_of(bytes))));
     }
   }
 
@@ -146,22 +164,22 @@ mod tests {
   fn save_restricts_permissions_to_owner() {
     use std::os::unix::fs::PermissionsExt;
 
-    let key = ClusterKey::generate().unwrap();
-    let dir = TempDir::new().unwrap();
+    let key = must(ClusterKey::generate());
+    let dir = must(TempDir::new());
     let path = dir.path().join("cluster.key");
-    key.save(&path).unwrap();
+    must(key.save(&path));
 
-    let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+    let mode = must(std::fs::metadata(&path)).permissions().mode();
     assert_eq!(mode & 0o777, 0o600);
   }
 
   #[test]
   fn load_rejects_bad_hex() {
-    let dir = TempDir::new().unwrap();
+    let dir = must(TempDir::new());
     let path = dir.path().join("cluster.key");
-    std::fs::write(&path, "not-hex\n").unwrap();
+    must(std::fs::write(&path, "not-hex\n"));
 
-    let error = ClusterKey::load(&path).unwrap_err();
+    let error = must_err(ClusterKey::load(&path));
     assert!(
       matches!(error, ClusterKeyError::InvalidHex),
       "expected InvalidHex, got {error}"
@@ -170,10 +188,10 @@ mod tests {
 
   #[test]
   fn load_reports_io_error_for_missing_file() {
-    let dir = TempDir::new().unwrap();
+    let dir = must(TempDir::new());
     let path = dir.path().join("missing.key");
 
-    let error = ClusterKey::load(&path).unwrap_err();
+    let error = must_err(ClusterKey::load(&path));
     assert!(
       matches!(error, ClusterKeyError::Io(_)),
       "expected Io, got {error}"

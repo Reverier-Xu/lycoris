@@ -5167,6 +5167,7 @@ dependencies = [
  "libp2p-identity",
  "lycoris-core",
  "postcard",
+ "ring",
  "serde",
  "tempfile",
  "thiserror 2.0.18",

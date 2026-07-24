@@ -130,10 +130,15 @@ impl AuthorizationRegistry {
     })
   }
 
-  pub fn active_peer_for_node(&self, node_id: NodeId) -> Option<PeerId> {
+  pub fn active_record_for_node(&self, node_id: NodeId) -> Option<&AuthorizationRecord> {
     let AuthorizationStatus::Active(record) = self.status(node_id) else {
       return None;
     };
+    Some(record)
+  }
+
+  pub fn active_peer_for_node(&self, node_id: NodeId) -> Option<PeerId> {
+    let record = self.active_record_for_node(node_id)?;
     PeerId::from_bytes(record.peer_id()).ok()
   }
 
@@ -222,14 +227,14 @@ impl AuthorizationRegistry {
       || record.state() != KeyState::Active
       || record.epoch() != 0
       || record.retires().is_some()
+      || record.public_key() != record.initial_public_key()
     {
       return Err(AuthorizationError::InvalidRecord(
         "invalid admission record",
       ));
     }
     if record.authorizer().is_none()
-      && (ClusterId::from_genesis(record.node_id()) != record.cluster_id()
-        || record.public_key() != record.initial_public_key())
+      && ClusterId::from_genesis(record.node_id()) != record.cluster_id()
     {
       return Err(AuthorizationError::InvalidRecord(
         "invalid self-signed genesis",
@@ -415,7 +420,14 @@ mod tests {
     cluster_id: ClusterId, member: &NodeIdentity, sponsor_record: &AuthorizationRecord,
     sponsor: &NodeIdentity,
   ) -> AuthorizationRecord {
-    AuthorizationRecord::admit(cluster_id, member, sponsor_record, sponsor_record, sponsor).unwrap()
+    AuthorizationRecord::admit(
+      cluster_id,
+      &member.public_identity(),
+      sponsor_record,
+      sponsor_record,
+      sponsor,
+    )
+    .unwrap()
   }
 
   fn insert_admitted_member(
@@ -438,7 +450,29 @@ mod tests {
     assert!(matches!(
       registry.insert(forged),
       Err(AuthorizationError::InvalidRecord(
-        "invalid self-signed genesis"
+        "invalid admission record"
+      ))
+    ));
+  }
+
+  #[test]
+  fn sponsored_admission_must_use_the_initial_identity() {
+    let (sponsor, sponsor_record, mut registry) = genesis();
+    let initial = NodeIdentity::generate();
+    let successor = successor(&initial);
+    let admission = AuthorizationRecord::admit(
+      registry.cluster_id(),
+      &successor.public_identity(),
+      &sponsor_record,
+      &sponsor_record,
+      &sponsor,
+    )
+    .unwrap();
+
+    assert!(matches!(
+      registry.insert(admission),
+      Err(AuthorizationError::InvalidRecord(
+        "invalid admission record"
       ))
     ));
   }
@@ -529,7 +563,7 @@ mod tests {
     let stranger = NodeIdentity::generate();
     let stale_admission = AuthorizationRecord::admit(
       registry.cluster_id(),
-      &stranger,
+      &stranger.public_identity(),
       &sponsor_record,
       &rotation,
       &sponsor,
@@ -551,7 +585,7 @@ mod tests {
       .unwrap();
     let laundering = AuthorizationRecord::admit(
       registry.cluster_id(),
-      &downstream,
+      &downstream.public_identity(),
       &stale_record,
       &stale_record,
       &stranger,
@@ -584,7 +618,7 @@ mod tests {
     let stranger = NodeIdentity::generate();
     let stale_admission = AuthorizationRecord::admit(
       registry.cluster_id(),
-      &stranger,
+      &stranger.public_identity(),
       &admission,
       &admission,
       &member,
@@ -616,7 +650,7 @@ mod tests {
     let downstream = NodeIdentity::generate();
     let laundering = AuthorizationRecord::admit(
       registry.cluster_id(),
-      &downstream,
+      &downstream.public_identity(),
       &revocation,
       &revocation,
       &identity,

@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{ClusterId, NodeId, NodeIdentity, RecordId, authorization::AuthorizationError};
+use crate::{
+  ClusterId, NodeId, NodeIdentity, PublicIdentity, RecordId, authorization::AuthorizationError,
+};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub enum AuthorizationKind {
@@ -48,12 +50,13 @@ pub(crate) struct RetiredAuthorization {
 impl AuthorizationRecord {
   pub fn genesis(identity: &NodeIdentity) -> Result<(ClusterId, Self), AuthorizationError> {
     let cluster_id = ClusterId::from_genesis(identity.node_id());
-    let body = AuthorizationBody::active(cluster_id, identity, 0, AuthorizationKind::Admit);
+    let public = identity.public_identity();
+    let body = AuthorizationBody::active(cluster_id, &public, 0, AuthorizationKind::Admit);
     Ok((cluster_id, Self::sign(body, identity)?))
   }
 
   pub fn admit(
-    cluster_id: ClusterId, identity: &NodeIdentity, authorizer: &Self, authorizer_head: &Self,
+    cluster_id: ClusterId, identity: &PublicIdentity, authorizer: &Self, authorizer_head: &Self,
     signer: &NodeIdentity,
   ) -> Result<Self, AuthorizationError> {
     let mut body = AuthorizationBody::active(cluster_id, identity, 0, AuthorizationKind::Admit);
@@ -64,13 +67,7 @@ impl AuthorizationRecord {
   pub fn rotate(
     previous: &Self, previous_action_head: &Self, successor: &NodeIdentity, signer: &NodeIdentity,
   ) -> Result<Self, AuthorizationError> {
-    let mut body = AuthorizationBody::active(
-      previous.cluster_id(),
-      successor,
-      previous.epoch() + 1,
-      AuthorizationKind::Rotate,
-    );
-    body.predecessor = Some(previous.id);
+    let mut body = Self::successor_body(previous, successor, AuthorizationKind::Rotate);
     body.set_authorizer(previous, previous_action_head);
     Self::sign(body, signer)
   }
@@ -79,13 +76,7 @@ impl AuthorizationRecord {
     previous: &Self, previous_action_head: &Self, successor: &NodeIdentity, authorizer: &Self,
     authorizer_head: &Self, signer: &NodeIdentity,
   ) -> Result<Self, AuthorizationError> {
-    let mut body = AuthorizationBody::active(
-      previous.cluster_id(),
-      successor,
-      previous.epoch() + 1,
-      AuthorizationKind::Recover,
-    );
-    body.predecessor = Some(previous.id);
+    let mut body = Self::successor_body(previous, successor, AuthorizationKind::Recover);
     body.set_authorizer(authorizer, authorizer_head);
     body.retires = Some(RetiredAuthorization {
       identity: previous.id,
@@ -183,6 +174,16 @@ impl AuthorizationRecord {
     &self.signature
   }
 
+  fn successor_body(
+    previous: &Self, successor: &NodeIdentity, kind: AuthorizationKind,
+  ) -> AuthorizationBody {
+    let public = successor.public_identity();
+    let mut body =
+      AuthorizationBody::active(previous.cluster_id(), &public, previous.epoch() + 1, kind);
+    body.predecessor = Some(previous.id);
+    body
+  }
+
   fn sign(body: AuthorizationBody, signer: &NodeIdentity) -> Result<Self, AuthorizationError> {
     let signing_bytes = postcard::to_stdvec(&body)?;
     let signature = signer.sign(&signing_bytes)?;
@@ -197,13 +198,13 @@ impl AuthorizationRecord {
 
 impl AuthorizationBody {
   fn active(
-    cluster_id: ClusterId, identity: &NodeIdentity, epoch: u64, kind: AuthorizationKind,
+    cluster_id: ClusterId, identity: &PublicIdentity, epoch: u64, kind: AuthorizationKind,
   ) -> Self {
     Self {
       cluster_id,
       node_id: identity.node_id(),
-      peer_id: identity.peer_id_bytes(),
-      public_key: identity.public_key_bytes(),
+      peer_id: identity.peer_id().to_vec(),
+      public_key: identity.public_key().to_vec(),
       initial_public_key: identity.initial_public_key().to_vec(),
       epoch,
       kind,

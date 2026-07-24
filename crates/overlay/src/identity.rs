@@ -6,6 +6,52 @@ use thiserror::Error;
 
 use crate::NodeId;
 
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PublicIdentity {
+  node_id: NodeId,
+  peer_id: Vec<u8>,
+  public_key: Vec<u8>,
+  initial_public_key: Vec<u8>,
+}
+
+impl PublicIdentity {
+  pub fn new(
+    node_id: NodeId, peer_id: Vec<u8>, public_key: Vec<u8>, initial_public_key: Vec<u8>,
+  ) -> Result<Self, IdentityError> {
+    validate_initial_key(node_id, &initial_public_key)?;
+    let decoded = decode_public_key(&public_key)?;
+    if decoded.to_peer_id().to_bytes() != peer_id {
+      return Err(IdentityError::PeerIdMismatch);
+    }
+    Ok(Self {
+      node_id,
+      peer_id,
+      public_key,
+      initial_public_key,
+    })
+  }
+
+  pub const fn node_id(&self) -> NodeId {
+    self.node_id
+  }
+
+  pub fn peer_id(&self) -> &[u8] {
+    &self.peer_id
+  }
+
+  pub fn public_key(&self) -> &[u8] {
+    &self.public_key
+  }
+
+  pub fn initial_public_key(&self) -> &[u8] {
+    &self.initial_public_key
+  }
+
+  pub fn is_initial_identity(&self) -> bool {
+    self.public_key == self.initial_public_key
+  }
+}
+
 #[derive(Clone)]
 pub struct NodeIdentity {
   node_id: NodeId,
@@ -89,6 +135,15 @@ impl NodeIdentity {
     &self.initial_public_key
   }
 
+  pub fn public_identity(&self) -> PublicIdentity {
+    PublicIdentity {
+      node_id: self.node_id,
+      peer_id: self.peer_id_bytes(),
+      public_key: self.public_key_bytes(),
+      initial_public_key: self.initial_public_key.clone(),
+    }
+  }
+
   pub fn keypair(&self) -> &Keypair {
     &self.keypair
   }
@@ -117,6 +172,7 @@ pub(crate) fn decode_public_key(bytes: &[u8]) -> Result<PublicKey, IdentityError
 }
 
 fn validate_initial_key(node_id: NodeId, initial_public_key: &[u8]) -> Result<(), IdentityError> {
+  decode_public_key(initial_public_key)?;
   let derived = NodeId::from_initial_public_key(initial_public_key);
   if derived != node_id {
     return Err(IdentityError::NodeIdMismatch {
@@ -144,6 +200,8 @@ pub enum IdentityError {
   KeyEncoding(#[from] libp2p_identity::DecodingError),
   #[error("identity signing failed: {0}")]
   Signing(#[from] libp2p_identity::SigningError),
+  #[error("peer id does not match the identity public key")]
+  PeerIdMismatch,
   #[error("initial public key derives {derived}, not stored node id {expected}")]
   NodeIdMismatch { expected: NodeId, derived: NodeId },
 }
@@ -200,5 +258,29 @@ mod tests {
 
     assert!(signer.verify(b"record", &signature));
     assert!(!other.verify(b"record", &signature));
+  }
+
+  #[test]
+  fn public_identity_validates_the_peer_binding() {
+    let identity = NodeIdentity::generate();
+    let public = identity.public_identity();
+    let validated = PublicIdentity::new(
+      public.node_id(),
+      public.peer_id().to_vec(),
+      public.public_key().to_vec(),
+      public.initial_public_key().to_vec(),
+    )
+    .unwrap();
+    assert_eq!(validated, public);
+
+    assert!(matches!(
+      PublicIdentity::new(
+        public.node_id(),
+        NodeIdentity::generate().peer_id_bytes(),
+        public.public_key().to_vec(),
+        public.initial_public_key().to_vec(),
+      ),
+      Err(IdentityError::PeerIdMismatch)
+    ));
   }
 }

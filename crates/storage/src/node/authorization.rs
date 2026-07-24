@@ -45,7 +45,7 @@ mod tests {
     let member_identity = NodeIdentity::generate();
     let admission = AuthorizationRecord::admit(
       cluster_id,
-      &member_identity,
+      &member_identity.public_identity(),
       &genesis,
       &genesis,
       &genesis_identity,

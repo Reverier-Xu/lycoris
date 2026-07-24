@@ -31,7 +31,7 @@ the completed work reaches `main`.
 - [x] Add the single-owner libp2p link actor with QUIC and TCP/Noise/Yamux.
 - [x] Enforce known-peer authorization and deterministic duplicate-link
   arbitration.
-- [ ] Add quarantined join-key and operator-approved enrollment.
+- [x] Add quarantined join-key and operator-approved enrollment.
 - [ ] Add LAN discovery, address expiry, and reconnect behavior.
 - [ ] Add relay reservations and DCUtR upgrade behavior.
 - [ ] Add signed link-state and bounded sparse-graph request routing.
