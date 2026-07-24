@@ -5,6 +5,7 @@ mod authorization;
 mod codec;
 mod id;
 mod identity;
+mod link;
 mod protocol;
 
 pub use authorization::{
@@ -14,7 +15,8 @@ pub use authorization::{
 pub use codec::{FrameError, decode_frame, encode_frame};
 pub use id::{ClusterId, NodeId, ParseIdentifierError, RecordId, RequestId};
 pub use identity::{IdentityError, NodeIdentity};
-pub use libp2p_identity::PeerId;
+pub use libp2p::{Multiaddr, PeerId};
+pub use link::{LinkConfig, LinkError, LinkHandle, LinkRuntime, LinkSnapshot};
 pub use protocol::{
   Envelope, EnvelopeHeader, MAX_FRAME_BYTES, MAX_PAYLOAD_BYTES, MessageKind, PROTOCOL_VERSION,
   ProtocolId,

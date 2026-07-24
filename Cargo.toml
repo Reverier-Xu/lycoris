@@ -33,39 +33,49 @@ strip         = true
 unsafe_code = "forbid"
 
 [workspace.dependencies]
-async-trait        = "0.1"
-blake3             = "1.8"
-clap               = "4.6"
-directories        = "6.0"
-futures-util       = "0.3"
-hex                = "0.4"
-is-root            = "0.1"
-lancedb            = "0.31"
-libp2p-identity    = { version = "0.2", features = ["ed25519", "peerid", "rand"] }
-owo-colors         = "4.3"
-postcard           = { version = "1.1", features = ["use-std"] }
-prost              = "0.14"
-rcgen              = { version = "0.14", features = ["x509-parser"] }
-redb               = "4.1"
-ring               = "0.17"
-semver             = "1.0"
-serde              = { version = "1.0", features = ["derive"] }
-serde_json         = "1.0"
-service-manager    = "0.11"
-tempfile           = "3"
-thiserror          = "2.0"
-time               = "0.3"
-tokio              = { version = "1.53", features = ["full"] }
-toml               = "1.1"
-tonic              = { version = "0.14", features = ["tls-ring"] }
-tonic-prost        = "0.14"
-tonic-prost-build  = "0.14"
-tracing            = "0.1"
+async-trait = "0.1"
+blake3 = "1.8"
+clap = "4.6"
+directories = "6.0"
+futures-util = "0.3"
+hex = "0.4"
+is-root = "0.1"
+lancedb = "0.31"
+libp2p = { version = "0.56", default-features = false, features = [
+  "dns",
+  "ed25519",
+  "noise",
+  "ping",
+  "quic",
+  "tcp",
+  "tokio",
+  "yamux",
+] }
+libp2p-identity = { version = "0.2", features = ["ed25519", "peerid", "rand"] }
+owo-colors = "4.3"
+postcard = { version = "1.1", features = ["use-std"] }
+prost = "0.14"
+rcgen = { version = "0.14", features = ["x509-parser"] }
+redb = "4.1"
+ring = "0.17"
+semver = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+service-manager = "0.11"
+tempfile = "3"
+thiserror = "2.0"
+time = "0.3"
+tokio = { version = "1.53", features = ["full"] }
+toml = "1.1"
+tonic = { version = "0.14", features = ["tls-ring"] }
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-wasmtime           = "46"
-wat                = "1"
-webpki-roots       = "1"
-x509-parser        = "0.18"
+wasmtime = "46"
+wat = "1"
+webpki-roots = "1"
+x509-parser = "0.18"
 
 mlua = { version = "0.12", features = [
   "lua54",

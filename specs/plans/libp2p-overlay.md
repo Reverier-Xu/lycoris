@@ -15,16 +15,22 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 ```
 
-Workflow changes additionally require `act`. The final dependency and release gates include the supported Linux musl, macOS, and Windows build paths.
+Workflow changes additionally require `act`. Local dependency validation targets
+Linux musl. GitHub CI verifies the supported macOS and Windows build paths after
+the completed work reaches `main`.
 
 ## Atomic deliveries
 
-- [x] Define the architecture, impact, invariants, and E2E acceptance contract.
-- [x] Lock resource convergence behavior at the mapper and synchronization boundary.
-- [x] Add overlay protocol identifiers, bounded wire types, and deterministic codecs.
+- [x] Define the architecture, impact, invariants, and E2E acceptance
+  contract.
+- [x] Lock resource convergence behavior at the mapper and synchronization
+  boundary.
+- [x] Add overlay protocol identifiers, bounded wire types, and deterministic
+  codecs.
 - [x] Persist node identities and the signed authorization registry.
-- [ ] Add the single-owner libp2p link actor with QUIC and TCP/Noise/Yamux.
-- [ ] Enforce known-peer authorization and deterministic duplicate-link arbitration.
+- [x] Add the single-owner libp2p link actor with QUIC and TCP/Noise/Yamux.
+- [ ] Enforce known-peer authorization and deterministic duplicate-link
+  arbitration.
 - [ ] Add quarantined join-key and operator-approved enrollment.
 - [ ] Add LAN discovery, address expiry, and reconnect behavior.
 - [ ] Add relay reservations and DCUtR upgrade behavior.
@@ -32,8 +38,10 @@ Workflow changes additionally require `act`. The final dependency and release ga
 - [ ] Move membership traffic and routed probes onto the overlay.
 - [ ] Move shared-resource synchronization onto `ResourceCarrier`.
 - [ ] Move extension forwarding onto `ExtensionRouter`.
-- [ ] Remove `PeerPool` and node-facing gRPC while retaining client control gRPC.
-- [ ] Replace E2E with CLI-driven single-node, merge, partition, LAN-heal, and unrelated-peer recovery scenarios using a 10-second convergence deadline.
+- [ ] Remove `PeerPool` and node-facing gRPC while retaining client control
+  gRPC.
+- [ ] Replace E2E with CLI-driven single-node, merge, partition, LAN-heal, and
+  unrelated-peer recovery scenarios using a 10-second convergence deadline.
 
 ## Commit titles
 
@@ -53,12 +61,16 @@ Workflow changes additionally require `act`. The final dependency and release ga
 14. `:recycle: remove peer grpc transport`
 15. `:white_check_mark: cover overlay recovery topologies`
 
-Commit bodies use imperative list items and document the focused tests and architectural boundary changed by that commit.
+Commit bodies use imperative list items and document the focused tests and
+architectural boundary changed by that commit.
 
 ## Final release gate
 
 - Every authorized node stores the same authorization registry after convergence.
-- Every membership and shared-resource view converges within 10 seconds of path restoration.
-- Known identity mismatch, wrong join key, replay, and foreign cluster admission fail closed.
+- Every membership and shared-resource view converges within 10 seconds of
+  path restoration.
+- Known identity mismatch, wrong join key, replay, and foreign cluster admission
+  fail closed.
 - The final daemon exposes only client-facing gRPC services.
-- The worktree is clean and the complete commit sequence is reviewed before one final push.
+- The worktree is clean and the complete commit sequence is reviewed before
+  one final push.
