@@ -55,11 +55,16 @@ the completed work reaches `main`.
 8. `:sparkles: add lan discovery and connection arbitration`
 9. `:sparkles: add relay reservations and hole punching`
 10. `:sparkles: add sparse overlay routing`
-11. `:recycle: move membership traffic onto the overlay`
-12. `:recycle: move resource sync onto the overlay`
-13. `:recycle: route extension calls across the overlay`
-14. `:recycle: remove peer grpc transport`
-15. `:white_check_mark: cover overlay recovery topologies`
+11. `:sparkles: add overlay messaging` (request-response substrate:
+    envelope codec, routed forwarding, link-state broadcast)
+12. `:recycle: move membership traffic onto the overlay`
+13. `:recycle: move resource sync onto the overlay`
+14. `:recycle: route extension calls across the overlay`
+15. `:recycle: remove peer grpc transport`
+16. `:white_check_mark: cover overlay recovery topologies`
+
+The messaging substrate commit is an implementation split of the membership
+move; the checklist above still tracks the fifteen planned outcomes.
 
 Commit bodies use imperative list items and document the focused tests and
 architectural boundary changed by that commit.

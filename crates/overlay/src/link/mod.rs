@@ -2,6 +2,7 @@ mod actor;
 mod config;
 mod directory;
 mod handle;
+mod messaging;
 
 pub use actor::LinkRuntime;
 pub use config::LinkConfig;

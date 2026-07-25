@@ -3,9 +3,13 @@ use std::time::Duration;
 use libp2p::{Multiaddr, multiaddr::Protocol};
 
 use super::*;
-use crate::{AuthorizationRecord, AuthorizationRegistry, NodeId, NodeIdentity};
+use crate::{
+  AuthorizationRecord, AuthorizationRegistry, ClusterId, Envelope, EnvelopeHeader, MessageKind,
+  NodeId, NodeIdentity, PROTOCOL_VERSION, ProtocolId, RequestId,
+};
 
 const WAIT: Duration = Duration::from_secs(5);
+const FAR_FUTURE_MS: i64 = 4_111_111_111_111;
 
 #[tokio::test]
 async fn dropping_runtime_stops_its_actor() {
@@ -263,6 +267,185 @@ async fn relayed_nodes_connect_through_a_reservation() {
   second.shutdown().await.unwrap();
   first.shutdown().await.unwrap();
   relay.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn direct_requests_echo_through_the_overlay() {
+  let (first_identity, second_identity, _, _, registry) = authorized_pair();
+  let first = start_quiet_tcp(&first_identity, registry.clone());
+  let second = start_quiet_tcp(&second_identity, registry.clone());
+  let first_handle = first.handle();
+  let second_handle = second.handle();
+  let echo = spawn_echo(second_handle.clone());
+  let second_address = wait_for_listener(&second_handle, |address| {
+    address
+      .iter()
+      .any(|protocol| matches!(protocol, Protocol::Tcp(_)))
+  })
+  .await;
+  first_handle
+    .dial(second_identity.node_id(), second_address)
+    .await
+    .unwrap();
+  first_handle
+    .wait_connected(second_identity.node_id(), WAIT)
+    .await
+    .unwrap();
+
+  let response = first_handle
+    .request(request_envelope(
+      first_identity.node_id(),
+      second_identity.node_id(),
+      registry.cluster_id(),
+      7,
+      b"ping",
+    ))
+    .await
+    .unwrap();
+
+  assert_eq!(response.payload(), b"ping");
+  assert_eq!(response.header().kind, MessageKind::Response);
+  echo.abort();
+  second.shutdown().await.unwrap();
+  first.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn routed_requests_cross_a_sparse_chain() {
+  let (middle_identity, first_identity, second_identity, registry) = authorized_trio();
+  let middle = start_quiet_tcp(&middle_identity, registry.clone());
+  let first = start_quiet_tcp(&first_identity, registry.clone());
+  let second = start_quiet_tcp(&second_identity, registry.clone());
+  let middle_handle = middle.handle();
+  let first_handle = first.handle();
+  let second_handle = second.handle();
+  let echo = spawn_echo(second_handle.clone());
+  let middle_node = middle_identity.node_id();
+  let first_node = first_identity.node_id();
+  let second_node = second_identity.node_id();
+  let middle_address = wait_for_listener(&middle_handle, |address| {
+    address
+      .iter()
+      .any(|protocol| matches!(protocol, Protocol::Tcp(_)))
+  })
+  .await;
+  first_handle
+    .dial(middle_node, middle_address.clone())
+    .await
+    .unwrap();
+  second_handle
+    .dial(middle_node, middle_address)
+    .await
+    .unwrap();
+  first_handle
+    .wait_connected(middle_node, WAIT)
+    .await
+    .unwrap();
+  second_handle
+    .wait_connected(middle_node, WAIT)
+    .await
+    .unwrap();
+  middle_handle
+    .wait_connected(first_node, WAIT)
+    .await
+    .unwrap();
+  middle_handle
+    .wait_connected(second_node, WAIT)
+    .await
+    .unwrap();
+
+  let response = tokio::time::timeout(WAIT, async {
+    loop {
+      let request = request_envelope(first_node, second_node, registry.cluster_id(), 11, b"hop");
+      match first_handle.request(request).await {
+        Ok(response) => break response,
+        Err(LinkError::NoRoute(_)) => tokio::time::sleep(Duration::from_millis(50)).await,
+        Err(error) => panic!("unexpected request failure: {error}"),
+      }
+    }
+  })
+  .await
+  .expect("routed request did not complete");
+
+  assert_eq!(response.payload(), b"hop");
+  assert_eq!(response.header().source, second_node);
+  echo.abort();
+  second.shutdown().await.unwrap();
+  first.shutdown().await.unwrap();
+  middle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn unroutable_requests_fail_closed() {
+  let (middle_identity, first_identity, second_identity, registry) = authorized_trio();
+  let first = start_quiet_tcp(&first_identity, registry.clone());
+  let first_handle = first.handle();
+
+  assert!(matches!(
+    first_handle
+      .request(request_envelope(
+        first_identity.node_id(),
+        second_identity.node_id(),
+        registry.cluster_id(),
+        13,
+        b"lost",
+      ))
+      .await,
+    Err(LinkError::NoRoute(node)) if node == second_identity.node_id()
+  ));
+  assert!(matches!(
+    first_handle
+      .request(request_envelope(
+        first_identity.node_id(),
+        first_identity.node_id(),
+        registry.cluster_id(),
+        17,
+        b"loop",
+      ))
+      .await,
+    Err(LinkError::NoRoute(node)) if node == first_identity.node_id()
+  ));
+
+  drop(middle_identity);
+  first.shutdown().await.unwrap();
+}
+
+fn request_envelope(
+  source: NodeId, destination: NodeId, cluster_id: ClusterId, nonce: u8, payload: &[u8],
+) -> Envelope {
+  let header = EnvelopeHeader {
+    version: PROTOCOL_VERSION,
+    cluster_id,
+    request_id: RequestId::from_bytes([nonce; RequestId::BYTE_LENGTH]),
+    source,
+    destination,
+    protocol: ProtocolId::Membership,
+    kind: MessageKind::Request,
+    deadline_unix_ms: FAR_FUTURE_MS,
+    remaining_hops: 8,
+  };
+  Envelope::new(header, payload.to_vec()).unwrap()
+}
+
+fn spawn_echo(handle: LinkHandle) -> tokio::task::JoinHandle<()> {
+  tokio::spawn(async move {
+    while let Some(inbound) = handle.next_inbound().await {
+      let request_header = inbound.envelope.header().clone();
+      let header = EnvelopeHeader {
+        version: PROTOCOL_VERSION,
+        cluster_id: request_header.cluster_id,
+        request_id: request_header.request_id,
+        source: handle.snapshot().node_id,
+        destination: request_header.source,
+        protocol: request_header.protocol,
+        kind: MessageKind::Response,
+        deadline_unix_ms: request_header.deadline_unix_ms,
+        remaining_hops: request_header.remaining_hops,
+      };
+      let response = Envelope::new(header, inbound.envelope.into_payload()).unwrap();
+      handle.respond(inbound.token, response).await.unwrap();
+    }
+  })
 }
 
 #[tokio::test]

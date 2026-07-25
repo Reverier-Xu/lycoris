@@ -1,6 +1,6 @@
 use std::{
   collections::{BTreeMap, BTreeSet},
-  time::Instant,
+  time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use futures_util::StreamExt;
@@ -9,22 +9,28 @@ use libp2p::{
   core::ConnectedPoint,
   dcutr, mdns,
   multiaddr::Protocol,
-  noise, ping, relay,
+  noise, ping, relay, request_response,
   swarm::{
     ConnectionId, NetworkBehaviour, SwarmEvent, behaviour::toggle::Toggle, dial_opts::DialOpts,
   },
   tcp, yamux,
 };
 use tokio::{
-  sync::{mpsc, watch},
+  sync::{mpsc, oneshot, watch},
   task::JoinHandle,
 };
 
 use super::{
   LinkCommand, LinkConfig, LinkError, LinkHandle, LinkSnapshot,
   directory::{AddressSource, PeerDirectory},
+  handle::{InboundEnvelope, InboundToken},
+  messaging::{EnvelopeCodec, OVERLAY_STREAM_PROTOCOL},
 };
-use crate::{AuthorizationRegistry, NodeId, NodeIdentity, authorization::AuthorizationError};
+use crate::{
+  AuthorizationRegistry, Envelope, EnvelopeHeader, LinkStateRecord, MessageKind, NodeId,
+  NodeIdentity, PROTOCOL_VERSION, ProtocolId, RequestId, RouteDecision, Router,
+  authorization::AuthorizationError,
+};
 
 pub struct LinkRuntime {
   handle: LinkHandle,
@@ -46,6 +52,7 @@ impl LinkRuntime {
     let state = LinkState::new(identity.node_id(), local_peer_id, authorization);
     let (snapshot_tx, snapshots) = watch::channel(state.snapshot());
     let (commands, command_rx) = mpsc::channel(config.command_capacity());
+    let (inbound_tx, inbound_rx) = mpsc::channel(config.command_capacity());
     let actor = LinkActor {
       swarm,
       command_rx,
@@ -53,10 +60,20 @@ impl LinkRuntime {
       state,
       config: config.clone(),
       maintenance: tokio::time::interval(config.reconnect_interval()),
+      identity: identity.clone(),
+      router: Router::new(identity.node_id()),
+      inbound_tx,
+      pending_outbound: BTreeMap::new(),
+      pending_inbound: BTreeMap::new(),
+      pending_forwards: BTreeMap::new(),
+      broadcast_requests: BTreeSet::new(),
+      next_inbound_token: 0,
+      request_nonce: 0,
+      last_link_state_sequence: 0,
     };
     let task = tokio::spawn(actor.run());
     Ok(Self {
-      handle: LinkHandle::new(commands, snapshots),
+      handle: LinkHandle::new(commands, snapshots, inbound_rx),
       task: Some(task),
     })
   }
@@ -88,6 +105,11 @@ struct LinkBehaviour {
   relay_client: relay::client::Behaviour,
   relay_server: relay::Behaviour,
   dcutr: dcutr::Behaviour,
+  messaging: request_response::Behaviour<EnvelopeCodec>,
+}
+
+struct ForwardContext {
+  channel: request_response::ResponseChannel<Envelope>,
 }
 
 struct LinkActor {
@@ -97,6 +119,17 @@ struct LinkActor {
   state: LinkState,
   config: LinkConfig,
   maintenance: tokio::time::Interval,
+  identity: NodeIdentity,
+  router: Router,
+  inbound_tx: mpsc::Sender<InboundEnvelope>,
+  pending_outbound:
+    BTreeMap<request_response::OutboundRequestId, oneshot::Sender<Result<Envelope, LinkError>>>,
+  pending_inbound: BTreeMap<u64, request_response::ResponseChannel<Envelope>>,
+  pending_forwards: BTreeMap<request_response::OutboundRequestId, ForwardContext>,
+  broadcast_requests: BTreeSet<request_response::OutboundRequestId>,
+  next_inbound_token: u64,
+  request_nonce: u64,
+  last_link_state_sequence: u64,
 }
 
 impl LinkActor {
@@ -119,6 +152,19 @@ impl LinkActor {
 
   fn handle_command(&mut self, command: LinkCommand) -> bool {
     match command {
+      LinkCommand::Request { envelope, reply } => {
+        self.send_routed_request(envelope, reply);
+        false
+      }
+      LinkCommand::Respond {
+        token,
+        envelope,
+        reply,
+      } => {
+        let result = self.respond(token, envelope);
+        let _ = reply.send(result);
+        false
+      }
       LinkCommand::Dial {
         node_id,
         address,
@@ -276,6 +322,285 @@ impl LinkActor {
     }
   }
 
+  fn send_routed_request(
+    &mut self, envelope: Envelope, reply: oneshot::Sender<Result<Envelope, LinkError>>,
+  ) {
+    match self.route_outbound(&envelope) {
+      Ok(peer_id) => {
+        let request_id = self
+          .swarm
+          .behaviour_mut()
+          .messaging
+          .send_request(&peer_id, envelope);
+        self.pending_outbound.insert(request_id, reply);
+      }
+      Err(error) => {
+        let _ = reply.send(Err(error));
+      }
+    }
+  }
+
+  fn route_outbound(&self, envelope: &Envelope) -> Result<PeerId, LinkError> {
+    let header = envelope.header();
+    let destination = header.destination;
+    if header.version != PROTOCOL_VERSION
+      || header.cluster_id != self.state.authorization.cluster_id()
+      || destination == self.state.node_id
+    {
+      return Err(LinkError::NoRoute(destination));
+    }
+    let next_hop = if self.state.node_is_connected(destination) {
+      destination
+    } else {
+      self
+        .router
+        .links()
+        .next_hop(self.state.node_id, destination)
+        .ok_or(LinkError::NoRoute(destination))?
+    };
+    self
+      .state
+      .active_peer_for_node(next_hop)
+      .ok_or(LinkError::NoRoute(next_hop))
+  }
+
+  fn respond(&mut self, token: InboundToken, envelope: Envelope) -> Result<(), LinkError> {
+    let channel = self
+      .pending_inbound
+      .remove(&token.0)
+      .ok_or(LinkError::UnknownInbound)?;
+    self
+      .swarm
+      .behaviour_mut()
+      .messaging
+      .send_response(channel, envelope)
+      .map_err(|_| LinkError::Transport("failed to flush the overlay response".to_string()))
+  }
+
+  fn handle_messaging(&mut self, event: request_response::Event<Envelope, Envelope>) {
+    match event {
+      request_response::Event::Message { peer, message, .. } => match message {
+        request_response::Message::Request {
+          request, channel, ..
+        } => self.handle_inbound_request(peer, request, channel),
+        request_response::Message::Response {
+          request_id,
+          response,
+        } => {
+          if let Some(reply) = self.pending_outbound.remove(&request_id) {
+            let _ = reply.send(Ok(response));
+          } else if let Some(forward) = self.pending_forwards.remove(&request_id) {
+            self.router.complete_forward();
+            let _ = self
+              .swarm
+              .behaviour_mut()
+              .messaging
+              .send_response(forward.channel, response);
+          } else if !self.broadcast_requests.remove(&request_id) {
+            tracing::debug!(?request_id, "ignoring orphan overlay response");
+          }
+        }
+      },
+      request_response::Event::OutboundFailure {
+        request_id, error, ..
+      } => {
+        if let Some(reply) = self.pending_outbound.remove(&request_id) {
+          let _ = reply.send(Err(LinkError::Transport(error.to_string())));
+        } else if let Some(forward) = self.pending_forwards.remove(&request_id) {
+          self.router.complete_forward();
+          drop(forward.channel);
+        } else {
+          self.broadcast_requests.remove(&request_id);
+        }
+      }
+      request_response::Event::InboundFailure { error, .. } => {
+        tracing::debug!(%error, "overlay inbound request failed");
+      }
+      request_response::Event::ResponseSent { .. } => {}
+    }
+  }
+
+  fn handle_inbound_request(
+    &mut self, peer_id: PeerId, envelope: Envelope,
+    channel: request_response::ResponseChannel<Envelope>,
+  ) {
+    if self.state.authorization.node_for_peer(&peer_id).is_none() {
+      tracing::debug!(%peer_id, "dropping overlay message from an unauthorized peer");
+      return;
+    }
+    let header = envelope.header();
+    if header.version != PROTOCOL_VERSION
+      || header.cluster_id != self.state.authorization.cluster_id()
+    {
+      tracing::debug!(%peer_id, "dropping overlay message from a foreign overlay");
+      return;
+    }
+    if header.protocol == ProtocolId::Route && header.kind == MessageKind::Event {
+      self.accept_link_state(&envelope);
+      self.reply_empty(channel, &envelope);
+      return;
+    }
+    match self.router.handle(envelope, now_unix_ms()) {
+      RouteDecision::Deliver(envelope) => {
+        let token = self.next_inbound_token;
+        self.next_inbound_token += 1;
+        if self
+          .inbound_tx
+          .try_send(InboundEnvelope {
+            token: InboundToken(token),
+            envelope,
+          })
+          .is_ok()
+        {
+          self.pending_inbound.insert(token, channel);
+        } else {
+          tracing::warn!("overlay inbound queue is full; dropping a delivered envelope");
+        }
+      }
+      RouteDecision::Forward { next_hop, envelope } => {
+        let Some(next_peer) = self.state.active_peer_for_node(next_hop) else {
+          self.router.complete_forward();
+          return;
+        };
+        let request_id = self
+          .swarm
+          .behaviour_mut()
+          .messaging
+          .send_request(&next_peer, envelope);
+        self
+          .pending_forwards
+          .insert(request_id, ForwardContext { channel });
+      }
+      RouteDecision::Drop(reason) => {
+        tracing::debug!(?reason, "dropping routed overlay envelope");
+      }
+    }
+  }
+
+  fn accept_link_state(&mut self, envelope: &Envelope) {
+    let record = match postcard::from_bytes::<LinkStateRecord>(envelope.payload()) {
+      Ok(record) => record,
+      Err(error) => {
+        tracing::debug!(%error, "ignoring a malformed link-state record");
+        return;
+      }
+    };
+    let Some(authorized_key) = self
+      .state
+      .authorization
+      .active_record_for_node(record.node_id())
+      .map(|record| record.public_key().to_vec())
+    else {
+      tracing::debug!(node_id = %record.node_id(), "ignoring link state from an unknown node");
+      return;
+    };
+    match self.router.links_mut().insert(record, &authorized_key) {
+      Ok(true) => tracing::debug!("accepted a newer link-state record"),
+      Ok(false) => {}
+      Err(error) => tracing::debug!(%error, "rejected a link-state record"),
+    }
+  }
+
+  fn reply_empty(
+    &mut self, channel: request_response::ResponseChannel<Envelope>, request: &Envelope,
+  ) {
+    if let Some(response) = self.response_envelope(request, Vec::new()) {
+      let _ = self
+        .swarm
+        .behaviour_mut()
+        .messaging
+        .send_response(channel, response);
+    }
+  }
+
+  fn response_envelope(&self, request: &Envelope, payload: Vec<u8>) -> Option<Envelope> {
+    let request_header = request.header();
+    let header = EnvelopeHeader {
+      version: PROTOCOL_VERSION,
+      cluster_id: self.state.authorization.cluster_id(),
+      request_id: request_header.request_id,
+      source: self.state.node_id,
+      destination: request_header.source,
+      protocol: request_header.protocol,
+      kind: MessageKind::Response,
+      deadline_unix_ms: request_header.deadline_unix_ms,
+      remaining_hops: request_header.remaining_hops,
+    };
+    Envelope::new(header, payload).ok()
+  }
+
+  fn advertise_link_state(&mut self) {
+    let now = now_unix_ms().max(0) as u64;
+    let sequence = now.max(self.last_link_state_sequence + 1);
+    self.last_link_state_sequence = sequence;
+    let edges: Vec<NodeId> = self
+      .state
+      .connections
+      .values()
+      .map(|connection| connection.node_id)
+      .collect();
+    let record = match LinkStateRecord::sign(&self.identity, edges, sequence) {
+      Ok(record) => record,
+      Err(error) => {
+        tracing::warn!(%error, "failed to sign the local link-state record");
+        return;
+      }
+    };
+    if let Err(error) = self
+      .router
+      .links_mut()
+      .insert(record.clone(), &self.identity.public_key_bytes())
+    {
+      tracing::warn!(%error, "failed to track the local link-state record");
+    }
+    let payload = match postcard::to_stdvec(&record) {
+      Ok(payload) => payload,
+      Err(error) => {
+        tracing::warn!(%error, "failed to encode the local link-state record");
+        return;
+      }
+    };
+    let peers: BTreeSet<(PeerId, NodeId)> = self
+      .state
+      .connections
+      .values()
+      .map(|connection| (connection.peer_id, connection.node_id))
+      .collect();
+    for (peer_id, node_id) in peers {
+      let header = EnvelopeHeader {
+        version: PROTOCOL_VERSION,
+        cluster_id: self.state.authorization.cluster_id(),
+        request_id: self.next_request_id(),
+        source: self.state.node_id,
+        destination: node_id,
+        protocol: ProtocolId::Route,
+        kind: MessageKind::Event,
+        deadline_unix_ms: now_unix_ms() + 10_000,
+        remaining_hops: 0,
+      };
+      let Ok(envelope) = Envelope::new(header, payload.clone()) else {
+        return;
+      };
+      let request_id = self
+        .swarm
+        .behaviour_mut()
+        .messaging
+        .send_request(&peer_id, envelope);
+      self.broadcast_requests.insert(request_id);
+    }
+  }
+
+  fn next_request_id(&mut self) -> RequestId {
+    self.request_nonce += 1;
+    let mut input = Vec::with_capacity(40);
+    input.extend_from_slice(self.state.node_id.as_bytes());
+    input.extend_from_slice(&self.request_nonce.to_be_bytes());
+    let hash = blake3::hash(&input);
+    let mut bytes = [0_u8; RequestId::BYTE_LENGTH];
+    bytes.copy_from_slice(&hash.as_bytes()[..RequestId::BYTE_LENGTH]);
+    RequestId::from_bytes(bytes)
+  }
+
   fn set_authorization(&mut self, registry: AuthorizationRegistry) -> Result<(), LinkError> {
     if registry.cluster_id() != self.state.authorization.cluster_id() {
       return Err(
@@ -296,6 +621,7 @@ impl LinkActor {
       .state
       .relay_reservations
       .retain(|node_id, _| authorization.active_peer_for_node(*node_id).is_some());
+    self.router = Router::new(self.state.node_id);
     let stale_connections: Vec<_> = self
       .state
       .connections
@@ -316,6 +642,7 @@ impl LinkActor {
   }
 
   fn handle_event(&mut self, event: SwarmEvent<LinkBehaviourEvent>) {
+    let edges_before = self.state.edge_set();
     let changed = match event {
       SwarmEvent::NewListenAddr { address, .. } => {
         self.swarm.add_external_address(address.clone());
@@ -413,6 +740,10 @@ impl LinkActor {
         }
         false
       }
+      SwarmEvent::Behaviour(LinkBehaviourEvent::Messaging(event)) => {
+        self.handle_messaging(event);
+        false
+      }
       SwarmEvent::OutgoingConnectionError {
         connection_id,
         peer_id,
@@ -434,6 +765,9 @@ impl LinkActor {
     };
     if changed {
       self.snapshot_tx.send_replace(self.state.snapshot());
+    }
+    if self.state.edge_set() != edges_before {
+      self.advertise_link_state();
     }
   }
 
@@ -528,6 +862,14 @@ impl LinkState {
         .iter()
         .all(|expected| protocols.next() == Some(expected))
     })
+  }
+
+  fn edge_set(&self) -> BTreeSet<NodeId> {
+    self
+      .connections
+      .values()
+      .map(|connection| connection.node_id)
+      .collect()
   }
 
   fn node_is_connected(&self, node_id: NodeId) -> bool {
@@ -666,6 +1008,13 @@ fn connection_preference(
   }
 }
 
+fn now_unix_ms() -> i64 {
+  SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .map(|duration| duration.as_millis() as i64)
+    .unwrap_or(0)
+}
+
 fn build_swarm(
   identity: &NodeIdentity, config: &LinkConfig,
 ) -> Result<Swarm<LinkBehaviour>, LinkError> {
@@ -709,6 +1058,13 @@ fn build_swarm(
         relay_client,
         relay_server: relay::Behaviour::new(identity.peer_id(), relay::Config::default()),
         dcutr: dcutr::Behaviour::new(identity.peer_id()),
+        messaging: request_response::Behaviour::new(
+          [(
+            OVERLAY_STREAM_PROTOCOL,
+            request_response::ProtocolSupport::Full,
+          )],
+          request_response::Config::default(),
+        ),
       }
     })
     .map_err(|error| LinkError::Transport(error.to_string()))

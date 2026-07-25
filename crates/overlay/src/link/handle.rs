@@ -1,10 +1,10 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use libp2p::Multiaddr;
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 
-use crate::{AuthorizationRegistry, NodeId, authorization::AuthorizationError};
+use crate::{AuthorizationRegistry, Envelope, NodeId, authorization::AuthorizationError};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct LinkSnapshot {
@@ -15,10 +15,22 @@ pub struct LinkSnapshot {
   pub connection_count: usize,
 }
 
+/// Token correlating an inbound routed envelope with its response channel.
+#[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+pub struct InboundToken(pub u64);
+
+/// An envelope delivered to the local node that awaits a response.
+#[derive(Debug)]
+pub struct InboundEnvelope {
+  pub token: InboundToken,
+  pub envelope: Envelope,
+}
+
 #[derive(Debug, Clone)]
 pub struct LinkHandle {
   commands: mpsc::Sender<LinkCommand>,
   snapshots: watch::Receiver<LinkSnapshot>,
+  inbound: Arc<Mutex<mpsc::Receiver<InboundEnvelope>>>,
 }
 
 impl LinkHandle {
@@ -67,6 +79,31 @@ impl LinkHandle {
     response.await.map_err(|_| LinkError::ActorStopped)?
   }
 
+  /// Send a routed request and await the correlated response envelope.
+  pub async fn request(&self, envelope: Envelope) -> Result<Envelope, LinkError> {
+    let (reply, response) = oneshot::channel();
+    self.send(LinkCommand::Request { envelope, reply }).await?;
+    response.await.map_err(|_| LinkError::ActorStopped)?
+  }
+
+  /// Respond to an envelope previously delivered via [`Self::next_inbound`].
+  pub async fn respond(&self, token: InboundToken, envelope: Envelope) -> Result<(), LinkError> {
+    let (reply, response) = oneshot::channel();
+    self
+      .send(LinkCommand::Respond {
+        token,
+        envelope,
+        reply,
+      })
+      .await?;
+    response.await.map_err(|_| LinkError::ActorStopped)?
+  }
+
+  /// Receive the next envelope delivered to this node.
+  pub async fn next_inbound(&self) -> Option<InboundEnvelope> {
+    self.inbound.lock().await.recv().await
+  }
+
   pub async fn set_authorization(&self, registry: AuthorizationRegistry) -> Result<(), LinkError> {
     let (reply, response) = oneshot::channel();
     self
@@ -99,10 +136,12 @@ impl LinkHandle {
 
   pub(crate) fn new(
     commands: mpsc::Sender<LinkCommand>, snapshots: watch::Receiver<LinkSnapshot>,
+    inbound: mpsc::Receiver<InboundEnvelope>,
   ) -> Self {
     Self {
       commands,
       snapshots,
+      inbound: Arc::new(Mutex::new(inbound)),
     }
   }
 
@@ -137,6 +176,15 @@ impl LinkHandle {
 
 #[derive(Debug)]
 pub(crate) enum LinkCommand {
+  Request {
+    envelope: Envelope,
+    reply: oneshot::Sender<Result<Envelope, LinkError>>,
+  },
+  Respond {
+    token: InboundToken,
+    envelope: Envelope,
+    reply: oneshot::Sender<Result<(), LinkError>>,
+  },
   Dial {
     node_id: NodeId,
     address: Multiaddr,
@@ -170,6 +218,10 @@ pub enum LinkError {
   UnauthorizedNode(NodeId),
   #[error("node {0} is not connected")]
   NotConnected(NodeId),
+  #[error("no overlay route to node {0}")]
+  NoRoute(NodeId),
+  #[error("inbound envelope token is unknown")]
+  UnknownInbound,
   #[error("link state did not reach the requested condition before the deadline")]
   Timeout,
   #[error(transparent)]

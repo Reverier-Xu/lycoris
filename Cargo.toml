@@ -51,6 +51,7 @@ libp2p = { version = "0.56", default-features = false, features = [
   "ping",
   "quic",
   "relay",
+  "request-response",
   "tcp",
   "tokio",
   "yamux",
