@@ -8,6 +8,7 @@ mod id;
 mod identity;
 mod link;
 mod protocol;
+mod routing;
 
 pub use admission::{
   ADMISSION_NONCE_BYTES, AdmissionCandidate, AdmissionChallenge, AdmissionError, Enrollment,
@@ -25,4 +26,8 @@ pub use link::{LinkConfig, LinkError, LinkHandle, LinkRuntime, LinkSnapshot};
 pub use protocol::{
   Envelope, EnvelopeHeader, MAX_FRAME_BYTES, MAX_PAYLOAD_BYTES, MessageKind, PROTOCOL_VERSION,
   ProtocolId,
+};
+pub use routing::{
+  DropReason, LinkStateDb, LinkStateRecord, MAX_LINK_STATE_EDGES, MAX_ROUTE_BODY_BYTES,
+  RouteDecision, Router, RoutingError,
 };

@@ -34,7 +34,7 @@ the completed work reaches `main`.
 - [x] Add quarantined join-key and operator-approved enrollment.
 - [x] Add LAN discovery, address expiry, and reconnect behavior.
 - [x] Add relay reservations and DCUtR upgrade behavior.
-- [ ] Add signed link-state and bounded sparse-graph request routing.
+- [x] Add signed link-state and bounded sparse-graph request routing.
 - [ ] Move membership traffic and routed probes onto the overlay.
 - [ ] Move shared-resource synchronization onto `ResourceCarrier`.
 - [ ] Move extension forwarding onto `ExtensionRouter`.
