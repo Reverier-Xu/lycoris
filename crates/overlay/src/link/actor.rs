@@ -7,9 +7,9 @@ use futures_util::StreamExt;
 use libp2p::{
   Multiaddr, PeerId, Swarm, SwarmBuilder,
   core::ConnectedPoint,
-  mdns,
+  dcutr, mdns,
   multiaddr::Protocol,
-  noise, ping,
+  noise, ping, relay,
   swarm::{
     ConnectionId, NetworkBehaviour, SwarmEvent, behaviour::toggle::Toggle, dial_opts::DialOpts,
   },
@@ -85,6 +85,9 @@ impl Drop for LinkRuntime {
 struct LinkBehaviour {
   ping: ping::Behaviour,
   mdns: Toggle<mdns::tokio::Behaviour>,
+  relay_client: relay::client::Behaviour,
+  relay_server: relay::Behaviour,
+  dcutr: dcutr::Behaviour,
 }
 
 struct LinkActor {
@@ -125,6 +128,15 @@ impl LinkActor {
         let _ = reply.send(result);
         false
       }
+      LinkCommand::ListenViaRelay {
+        node_id,
+        address,
+        reply,
+      } => {
+        let result = self.listen_via_relay(node_id, address);
+        let _ = reply.send(result);
+        false
+      }
       LinkCommand::Disconnect { node_id, reply } => {
         self.state.directory.pause(node_id);
         let result = self
@@ -150,6 +162,36 @@ impl LinkActor {
         true
       }
     }
+  }
+
+  fn listen_via_relay(&mut self, node_id: NodeId, address: Multiaddr) -> Result<(), LinkError> {
+    let relay_peer = self
+      .state
+      .active_peer_for_node(node_id)
+      .ok_or(LinkError::UnauthorizedNode(node_id))?;
+    let relayed_address = address
+      .clone()
+      .with(Protocol::P2p(relay_peer))
+      .with(Protocol::P2pCircuit);
+    self
+      .state
+      .relay_reservations
+      .insert(node_id, relayed_address.clone());
+    self.reserve_via(node_id, relayed_address)
+  }
+
+  fn reserve_via(&mut self, node_id: NodeId, relayed_address: Multiaddr) -> Result<(), LinkError> {
+    if self.state.has_listener_with_prefix(&relayed_address) {
+      return Ok(());
+    }
+    self
+      .swarm
+      .listen_on(relayed_address)
+      .map(|_| ())
+      .map_err(|error| {
+        self.state.relay_reservations.remove(&node_id);
+        LinkError::Transport(error.to_string())
+      })
   }
 
   fn dial(&mut self, node_id: NodeId, address: Multiaddr) -> Result<(), LinkError> {
@@ -199,6 +241,14 @@ impl LinkActor {
         tracing::debug!(%node_id, %error, "overlay reconnect attempt failed");
       }
     }
+    for (node_id, relayed_address) in self.state.relay_reservations.clone() {
+      if self.state.has_listener_with_prefix(&relayed_address) {
+        continue;
+      }
+      if let Err(error) = self.reserve_via(node_id, relayed_address) {
+        tracing::warn!(%node_id, %error, "overlay relay reservation listener failed");
+      }
+    }
   }
 
   fn handle_mdns(&mut self, event: mdns::Event) {
@@ -242,6 +292,10 @@ impl LinkActor {
       .state
       .directory
       .retain(|node_id| authorization.active_peer_for_node(node_id).is_some());
+    self
+      .state
+      .relay_reservations
+      .retain(|node_id, _| authorization.active_peer_for_node(*node_id).is_some());
     let stale_connections: Vec<_> = self
       .state
       .connections
@@ -263,7 +317,10 @@ impl LinkActor {
 
   fn handle_event(&mut self, event: SwarmEvent<LinkBehaviourEvent>) {
     let changed = match event {
-      SwarmEvent::NewListenAddr { address, .. } => self.state.listeners.insert(address),
+      SwarmEvent::NewListenAddr { address, .. } => {
+        self.swarm.add_external_address(address.clone());
+        self.state.listeners.insert(address)
+      }
       SwarmEvent::ExpiredListenAddr { address, .. } => self.state.listeners.remove(&address),
       SwarmEvent::ListenerClosed {
         addresses, reason, ..
@@ -331,6 +388,29 @@ impl LinkActor {
       SwarmEvent::Behaviour(LinkBehaviourEvent::Mdns(event)) => {
         self.handle_mdns(event);
         self.maintain();
+        false
+      }
+      SwarmEvent::Behaviour(LinkBehaviourEvent::RelayClient(event)) => {
+        tracing::debug!(?event, "overlay relay client event");
+        false
+      }
+      SwarmEvent::Behaviour(LinkBehaviourEvent::RelayServer(event)) => {
+        tracing::debug!(?event, "overlay relay server event");
+        false
+      }
+      SwarmEvent::Behaviour(LinkBehaviourEvent::Dcutr(event)) => {
+        match event.result {
+          Ok(connection_id) => tracing::debug!(
+            peer_id = %event.remote_peer_id,
+            ?connection_id,
+            "overlay hole punch upgraded a relayed connection"
+          ),
+          Err(error) => tracing::debug!(
+            peer_id = %event.remote_peer_id,
+            %error,
+            "overlay hole punch failed"
+          ),
+        }
         false
       }
       SwarmEvent::OutgoingConnectionError {
@@ -419,6 +499,7 @@ struct LinkState {
   healthy_connections: BTreeSet<ConnectionId>,
   directory: PeerDirectory,
   pending_dials: BTreeMap<ConnectionId, NodeId>,
+  relay_reservations: BTreeMap<NodeId, Multiaddr>,
 }
 
 impl LinkState {
@@ -432,11 +513,21 @@ impl LinkState {
       healthy_connections: BTreeSet::new(),
       directory: PeerDirectory::default(),
       pending_dials: BTreeMap::new(),
+      relay_reservations: BTreeMap::new(),
     }
   }
 
   fn active_peer_for_node(&self, node_id: NodeId) -> Option<PeerId> {
     self.authorization.active_peer_for_node(node_id)
+  }
+
+  fn has_listener_with_prefix(&self, prefix: &Multiaddr) -> bool {
+    self.listeners.iter().any(|address| {
+      let mut protocols = address.iter();
+      prefix
+        .iter()
+        .all(|expected| protocols.next() == Some(expected))
+    })
   }
 
   fn node_is_connected(&self, node_id: NodeId) -> bool {
@@ -589,18 +680,24 @@ fn build_swarm(
     .with_quic()
     .with_dns()
     .map_err(|error| LinkError::Transport(error.to_string()))?
-    .with_behaviour(|_| {
+    .with_relay_client(noise::Config::new, yamux::Config::default)
+    .map_err(|error| LinkError::Transport(error.to_string()))?
+    .with_behaviour(|_, relay_client| {
       let discovery_config = mdns::Config {
         ttl: config.discovered_address_ttl(),
         query_interval: config.mdns_query_interval(),
         enable_ipv6: false,
       };
-      let discovery = match mdns::tokio::Behaviour::new(discovery_config, identity.peer_id()) {
-        Ok(behaviour) => Some(behaviour),
-        Err(error) => {
-          tracing::warn!(%error, "overlay lan discovery is unavailable");
-          None
+      let discovery = if config.lan_discovery() {
+        match mdns::tokio::Behaviour::new(discovery_config, identity.peer_id()) {
+          Ok(behaviour) => Some(behaviour),
+          Err(error) => {
+            tracing::warn!(%error, "overlay lan discovery is unavailable");
+            None
+          }
         }
+      } else {
+        None
       };
       LinkBehaviour {
         ping: ping::Behaviour::new(
@@ -609,6 +706,9 @@ fn build_swarm(
             .with_timeout(config.ping_timeout()),
         ),
         mdns: discovery.into(),
+        relay_client,
+        relay_server: relay::Behaviour::new(identity.peer_id(), relay::Config::default()),
+        dcutr: dcutr::Behaviour::new(identity.peer_id()),
       }
     })
     .map_err(|error| LinkError::Transport(error.to_string()))

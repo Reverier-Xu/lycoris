@@ -43,6 +43,21 @@ impl LinkHandle {
     response.await.map_err(|_| LinkError::ActorStopped)?
   }
 
+  /// Reserve a relay slot and listen through the relay for inbound circuits.
+  pub async fn listen_via_relay(
+    &self, relay_node: NodeId, relay_address: Multiaddr,
+  ) -> Result<(), LinkError> {
+    let (reply, response) = oneshot::channel();
+    self
+      .send(LinkCommand::ListenViaRelay {
+        node_id: relay_node,
+        address: relay_address,
+        reply,
+      })
+      .await?;
+    response.await.map_err(|_| LinkError::ActorStopped)?
+  }
+
   /// Close the node's established connections; pending dials are unaffected.
   pub async fn disconnect(&self, node_id: NodeId) -> Result<(), LinkError> {
     let (reply, response) = oneshot::channel();
@@ -123,6 +138,11 @@ impl LinkHandle {
 #[derive(Debug)]
 pub(crate) enum LinkCommand {
   Dial {
+    node_id: NodeId,
+    address: Multiaddr,
+    reply: oneshot::Sender<Result<(), LinkError>>,
+  },
+  ListenViaRelay {
     node_id: NodeId,
     address: Multiaddr,
     reply: oneshot::Sender<Result<(), LinkError>>,

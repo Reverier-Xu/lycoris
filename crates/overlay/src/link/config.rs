@@ -16,6 +16,7 @@ pub struct LinkConfig {
   reconnect_max_delay: Duration,
   discovered_address_ttl: Duration,
   mdns_query_interval: Duration,
+  lan_discovery: bool,
 }
 
 impl LinkConfig {
@@ -31,6 +32,7 @@ impl LinkConfig {
       reconnect_max_delay: Duration::from_secs(30),
       discovered_address_ttl: Duration::from_secs(120),
       mdns_query_interval: Duration::from_secs(5),
+      lan_discovery: true,
     }
   }
 
@@ -41,6 +43,12 @@ impl LinkConfig {
 
   pub fn with_idle_timeout(mut self, timeout: Duration) -> Self {
     self.idle_timeout = timeout;
+    self
+  }
+
+  #[cfg(test)]
+  pub(crate) fn with_lan_discovery(mut self, enabled: bool) -> Self {
+    self.lan_discovery = enabled;
     self
   }
 
@@ -101,5 +109,9 @@ impl LinkConfig {
 
   pub(crate) const fn mdns_query_interval(&self) -> Duration {
     self.mdns_query_interval
+  }
+
+  pub(crate) const fn lan_discovery(&self) -> bool {
+    self.lan_discovery
   }
 }

@@ -42,6 +42,7 @@ hex = "0.4"
 is-root = "0.1"
 lancedb = "0.31"
 libp2p = { version = "0.56", default-features = false, features = [
+  "dcutr",
   "dns",
   "ed25519",
   "macros",
@@ -49,6 +50,7 @@ libp2p = { version = "0.56", default-features = false, features = [
   "noise",
   "ping",
   "quic",
+  "relay",
   "tcp",
   "tokio",
   "yamux",

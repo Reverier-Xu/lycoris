@@ -206,6 +206,66 @@ async fn duplicate_links_arbitrate_to_one_connection_without_losing_the_edge() {
 }
 
 #[tokio::test]
+async fn relayed_nodes_connect_through_a_reservation() {
+  let (relay_identity, first_identity, second_identity, registry) = authorized_trio();
+  let relay = start_quiet_tcp(&relay_identity, registry.clone());
+  let first = start_quiet_tcp(&first_identity, registry.clone());
+  let second = start_quiet_tcp(&second_identity, registry);
+  let relay_handle = relay.handle();
+  let first_handle = first.handle();
+  let second_handle = second.handle();
+  let relay_node = relay_identity.node_id();
+  let first_node = first_identity.node_id();
+  let second_node = second_identity.node_id();
+  let relay_address = wait_for_listener(&relay_handle, |address| {
+    address
+      .iter()
+      .any(|protocol| matches!(protocol, Protocol::Tcp(_)))
+  })
+  .await;
+  first_handle
+    .listen_via_relay(relay_node, relay_address.clone())
+    .await
+    .unwrap();
+  second_handle
+    .listen_via_relay(relay_node, relay_address)
+    .await
+    .unwrap();
+  let first_circuit = wait_for_listener(&first_handle, |address| {
+    address
+      .iter()
+      .any(|protocol| matches!(protocol, Protocol::P2pCircuit))
+  })
+  .await;
+  let second_circuit = wait_for_listener(&second_handle, |address| {
+    address
+      .iter()
+      .any(|protocol| matches!(protocol, Protocol::P2pCircuit))
+  })
+  .await;
+  assert!(first_circuit != second_circuit);
+
+  first_handle
+    .dial(second_node, second_circuit)
+    .await
+    .unwrap();
+  first_handle
+    .wait_connected(second_node, WAIT)
+    .await
+    .unwrap();
+  second_handle
+    .wait_connected(first_node, WAIT)
+    .await
+    .unwrap();
+  wait_for_connection_count(&first_handle, 2).await;
+  wait_for_connection_count(&second_handle, 2).await;
+
+  second.shutdown().await.unwrap();
+  first.shutdown().await.unwrap();
+  relay.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn configured_links_reconnect_after_a_restart() {
   let (first_identity, second_identity, _, _, registry) = authorized_pair();
   let first = LinkRuntime::start(
@@ -330,6 +390,47 @@ async fn exercise_link(listen_address: Multiaddr, matches_transport: impl Fn(&Mu
 fn single_registry(identity: &NodeIdentity) -> AuthorizationRegistry {
   let (cluster_id, record) = AuthorizationRecord::genesis(identity).unwrap();
   AuthorizationRegistry::from_records(cluster_id, [record]).unwrap()
+}
+
+fn authorized_trio() -> (
+  NodeIdentity,
+  NodeIdentity,
+  NodeIdentity,
+  AuthorizationRegistry,
+) {
+  let relay = NodeIdentity::generate();
+  let first = NodeIdentity::generate();
+  let second = NodeIdentity::generate();
+  let (cluster_id, relay_record) = AuthorizationRecord::genesis(&relay).unwrap();
+  let first_record = AuthorizationRecord::admit(
+    cluster_id,
+    &first.public_identity(),
+    &relay_record,
+    &relay_record,
+    &relay,
+  )
+  .unwrap();
+  let second_record = AuthorizationRecord::admit(
+    cluster_id,
+    &second.public_identity(),
+    &relay_record,
+    &first_record,
+    &relay,
+  )
+  .unwrap();
+  let registry =
+    AuthorizationRegistry::from_records(cluster_id, [relay_record, first_record, second_record])
+      .unwrap();
+  (relay, first, second, registry)
+}
+
+fn start_quiet_tcp(identity: &NodeIdentity, registry: AuthorizationRegistry) -> LinkRuntime {
+  LinkRuntime::start(
+    identity,
+    LinkConfig::new(vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()]).with_lan_discovery(false),
+    registry,
+  )
+  .unwrap()
 }
 
 fn fast_link_config(listen_addresses: Vec<Multiaddr>) -> LinkConfig {
