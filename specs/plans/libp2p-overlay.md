@@ -32,7 +32,7 @@ the completed work reaches `main`.
 - [x] Enforce known-peer authorization and deterministic duplicate-link
   arbitration.
 - [x] Add quarantined join-key and operator-approved enrollment.
-- [ ] Add LAN discovery, address expiry, and reconnect behavior.
+- [x] Add LAN discovery, address expiry, and reconnect behavior.
 - [ ] Add relay reservations and DCUtR upgrade behavior.
 - [ ] Add signed link-state and bounded sparse-graph request routing.
 - [ ] Move membership traffic and routed probes onto the overlay.

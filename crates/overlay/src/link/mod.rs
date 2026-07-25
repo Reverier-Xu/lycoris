@@ -1,5 +1,6 @@
 mod actor;
 mod config;
+mod directory;
 mod handle;
 
 pub use actor::LinkRuntime;

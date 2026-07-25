@@ -1,12 +1,18 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+  collections::{BTreeMap, BTreeSet},
+  time::Instant,
+};
 
 use futures_util::StreamExt;
 use libp2p::{
   Multiaddr, PeerId, Swarm, SwarmBuilder,
   core::ConnectedPoint,
+  mdns,
   multiaddr::Protocol,
   noise, ping,
-  swarm::{ConnectionId, SwarmEvent, dial_opts::DialOpts},
+  swarm::{
+    ConnectionId, NetworkBehaviour, SwarmEvent, behaviour::toggle::Toggle, dial_opts::DialOpts,
+  },
   tcp, yamux,
 };
 use tokio::{
@@ -14,7 +20,10 @@ use tokio::{
   task::JoinHandle,
 };
 
-use super::{LinkCommand, LinkConfig, LinkError, LinkHandle, LinkSnapshot};
+use super::{
+  LinkCommand, LinkConfig, LinkError, LinkHandle, LinkSnapshot,
+  directory::{AddressSource, PeerDirectory},
+};
 use crate::{AuthorizationRegistry, NodeId, NodeIdentity, authorization::AuthorizationError};
 
 pub struct LinkRuntime {
@@ -42,6 +51,8 @@ impl LinkRuntime {
       command_rx,
       snapshot_tx,
       state,
+      config: config.clone(),
+      maintenance: tokio::time::interval(config.reconnect_interval()),
     };
     let task = tokio::spawn(actor.run());
     Ok(Self {
@@ -70,11 +81,19 @@ impl Drop for LinkRuntime {
   }
 }
 
+#[derive(NetworkBehaviour)]
+struct LinkBehaviour {
+  ping: ping::Behaviour,
+  mdns: Toggle<mdns::tokio::Behaviour>,
+}
+
 struct LinkActor {
-  swarm: Swarm<ping::Behaviour>,
+  swarm: Swarm<LinkBehaviour>,
   command_rx: mpsc::Receiver<LinkCommand>,
   snapshot_tx: watch::Sender<LinkSnapshot>,
   state: LinkState,
+  config: LinkConfig,
+  maintenance: tokio::time::Interval,
 }
 
 impl LinkActor {
@@ -90,6 +109,7 @@ impl LinkActor {
           }
         }
         event = self.swarm.select_next_some() => self.handle_event(event),
+        _ = self.maintenance.tick() => self.maintain(),
       }
     }
   }
@@ -106,6 +126,7 @@ impl LinkActor {
         false
       }
       LinkCommand::Disconnect { node_id, reply } => {
+        self.state.directory.pause(node_id);
         let result = self
           .state
           .active_peer_for_node(node_id)
@@ -136,11 +157,73 @@ impl LinkActor {
       .state
       .active_peer_for_node(node_id)
       .ok_or(LinkError::UnauthorizedNode(node_id))?;
-    let options = DialOpts::peer_id(peer_id).addresses(vec![address]).build();
-    self
-      .swarm
-      .dial(options)
-      .map_err(|error| LinkError::Transport(error.to_string()))
+    let now = Instant::now();
+    self.state.directory.record(
+      node_id,
+      peer_id,
+      address.clone(),
+      AddressSource::Configured,
+      now,
+      self.config.discovered_address_ttl(),
+    );
+    self.state.directory.resume(node_id);
+    self.dial_address(node_id, peer_id, address, now)
+  }
+
+  fn dial_address(
+    &mut self, node_id: NodeId, peer_id: PeerId, address: Multiaddr, now: Instant,
+  ) -> Result<(), LinkError> {
+    let options = DialOpts::peer_id(peer_id)
+      .addresses(vec![address.clone()])
+      .build();
+    self.swarm.dial(options).map_err(|error| {
+      self.state.directory.note_failure(
+        node_id,
+        Some(&address),
+        now,
+        self.config.reconnect_min_delay(),
+        self.config.reconnect_max_delay(),
+      );
+      LinkError::Transport(error.to_string())
+    })
+  }
+
+  fn maintain(&mut self) {
+    let now = Instant::now();
+    self.state.directory.expire(now);
+    for (node_id, peer_id, address) in self.state.directory.candidates(now) {
+      if self.state.node_is_connected(node_id) || self.state.pending_for_node(node_id) {
+        continue;
+      }
+      if let Err(error) = self.dial_address(node_id, peer_id, address, now) {
+        tracing::debug!(%node_id, %error, "overlay reconnect attempt failed");
+      }
+    }
+  }
+
+  fn handle_mdns(&mut self, event: mdns::Event) {
+    let now = Instant::now();
+    match event {
+      mdns::Event::Discovered(discovered) => {
+        for (peer_id, address) in discovered {
+          if let Some(node_id) = self.state.authorization.node_for_peer(&peer_id) {
+            self.state.directory.record(
+              node_id,
+              peer_id,
+              address,
+              AddressSource::Mdns,
+              now,
+              self.config.discovered_address_ttl(),
+            );
+          }
+        }
+      }
+      mdns::Event::Expired(expired) => {
+        for (peer_id, address) in expired {
+          self.state.directory.remove(peer_id, &address);
+        }
+      }
+    }
   }
 
   fn set_authorization(&mut self, registry: AuthorizationRegistry) -> Result<(), LinkError> {
@@ -154,6 +237,11 @@ impl LinkActor {
       );
     }
     self.state.authorization = registry;
+    let authorization = self.state.authorization.clone();
+    self
+      .state
+      .directory
+      .retain(|node_id| authorization.active_peer_for_node(node_id).is_some());
     let stale_connections: Vec<_> = self
       .state
       .connections
@@ -173,7 +261,7 @@ impl LinkActor {
     Ok(())
   }
 
-  fn handle_event(&mut self, event: SwarmEvent<ping::Event>) {
+  fn handle_event(&mut self, event: SwarmEvent<LinkBehaviourEvent>) {
     let changed = match event {
       SwarmEvent::NewListenAddr { address, .. } => self.state.listeners.insert(address),
       SwarmEvent::ExpiredListenAddr { address, .. } => self.state.listeners.remove(&address),
@@ -199,8 +287,37 @@ impl LinkActor {
         peer_id,
         connection_id,
         ..
-      } => self.state.connection_closed(peer_id, connection_id),
-      SwarmEvent::Behaviour(event) => match event.result {
+      } => {
+        let node_id = self
+          .state
+          .connections
+          .get(&connection_id)
+          .map(|connection| connection.node_id);
+        self.state.pending_dials.remove(&connection_id);
+        let changed = self.state.connection_closed(peer_id, connection_id);
+        if let Some(node_id) = node_id
+          && !self.state.node_is_connected(node_id)
+        {
+          self.state.directory.note_connection_closed(
+            node_id,
+            Instant::now(),
+            self.config.reconnect_min_delay(),
+          );
+        }
+        changed
+      }
+      SwarmEvent::Dialing {
+        peer_id,
+        connection_id,
+      } => {
+        if let Some(node_id) =
+          peer_id.and_then(|peer_id| self.state.authorization.node_for_peer(&peer_id))
+        {
+          self.state.pending_dials.insert(connection_id, node_id);
+        }
+        false
+      }
+      SwarmEvent::Behaviour(LinkBehaviourEvent::Ping(event)) => match event.result {
         Ok(_) => self
           .state
           .set_connection_health(event.peer, event.connection, true),
@@ -211,8 +328,26 @@ impl LinkActor {
             .set_connection_health(event.peer, event.connection, false)
         }
       },
-      SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+      SwarmEvent::Behaviour(LinkBehaviourEvent::Mdns(event)) => {
+        self.handle_mdns(event);
+        self.maintain();
+        false
+      }
+      SwarmEvent::OutgoingConnectionError {
+        connection_id,
+        peer_id,
+        error,
+      } => {
         tracing::debug!(?peer_id, %error, "overlay dial failed");
+        if let Some(node_id) = self.state.pending_dials.remove(&connection_id) {
+          self.state.directory.note_failure(
+            node_id,
+            None,
+            Instant::now(),
+            self.config.reconnect_min_delay(),
+            self.config.reconnect_max_delay(),
+          );
+        }
         false
       }
       _ => false,
@@ -225,14 +360,20 @@ impl LinkActor {
   fn connection_established(
     &mut self, peer_id: PeerId, connection_id: ConnectionId, endpoint: ConnectedPoint,
   ) -> bool {
+    self.state.pending_dials.remove(&connection_id);
     let Some(node_id) = self.state.authorization.node_for_peer(&peer_id) else {
       tracing::debug!(%peer_id, "closing unauthorized overlay connection");
       self.swarm.close_connection(connection_id);
       return false;
     };
+    let remote_address = endpoint.get_remote_address().clone();
     let changed = self
       .state
       .connection_established(peer_id, node_id, connection_id, endpoint);
+    self
+      .state
+      .directory
+      .note_success(node_id, &remote_address, Instant::now());
     self.arbitrate_connections(peer_id, node_id);
     changed
   }
@@ -276,6 +417,8 @@ struct LinkState {
   listeners: BTreeSet<Multiaddr>,
   connections: BTreeMap<ConnectionId, ConnectionInfo>,
   healthy_connections: BTreeSet<ConnectionId>,
+  directory: PeerDirectory,
+  pending_dials: BTreeMap<ConnectionId, NodeId>,
 }
 
 impl LinkState {
@@ -287,11 +430,27 @@ impl LinkState {
       listeners: BTreeSet::new(),
       connections: BTreeMap::new(),
       healthy_connections: BTreeSet::new(),
+      directory: PeerDirectory::default(),
+      pending_dials: BTreeMap::new(),
     }
   }
 
   fn active_peer_for_node(&self, node_id: NodeId) -> Option<PeerId> {
     self.authorization.active_peer_for_node(node_id)
+  }
+
+  fn node_is_connected(&self, node_id: NodeId) -> bool {
+    self
+      .connections
+      .values()
+      .any(|connection| connection.node_id == node_id)
+  }
+
+  fn pending_for_node(&self, node_id: NodeId) -> bool {
+    self
+      .pending_dials
+      .values()
+      .any(|pending| *pending == node_id)
   }
 
   fn connection_established(
@@ -418,7 +577,7 @@ fn connection_preference(
 
 fn build_swarm(
   identity: &NodeIdentity, config: &LinkConfig,
-) -> Result<Swarm<ping::Behaviour>, LinkError> {
+) -> Result<Swarm<LinkBehaviour>, LinkError> {
   SwarmBuilder::with_existing_identity(identity.keypair().clone())
     .with_tokio()
     .with_tcp(
@@ -431,11 +590,26 @@ fn build_swarm(
     .with_dns()
     .map_err(|error| LinkError::Transport(error.to_string()))?
     .with_behaviour(|_| {
-      ping::Behaviour::new(
-        ping::Config::new()
-          .with_interval(config.ping_interval())
-          .with_timeout(config.ping_timeout()),
-      )
+      let discovery_config = mdns::Config {
+        ttl: config.discovered_address_ttl(),
+        query_interval: config.mdns_query_interval(),
+        enable_ipv6: false,
+      };
+      let discovery = match mdns::tokio::Behaviour::new(discovery_config, identity.peer_id()) {
+        Ok(behaviour) => Some(behaviour),
+        Err(error) => {
+          tracing::warn!(%error, "overlay lan discovery is unavailable");
+          None
+        }
+      };
+      LinkBehaviour {
+        ping: ping::Behaviour::new(
+          ping::Config::new()
+            .with_interval(config.ping_interval())
+            .with_timeout(config.ping_timeout()),
+        ),
+        mdns: discovery.into(),
+      }
     })
     .map_err(|error| LinkError::Transport(error.to_string()))
     .map(|builder| {

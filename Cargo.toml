@@ -44,6 +44,8 @@ lancedb = "0.31"
 libp2p = { version = "0.56", default-features = false, features = [
   "dns",
   "ed25519",
+  "macros",
+  "mdns",
   "noise",
   "ping",
   "quic",

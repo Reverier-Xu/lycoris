@@ -205,6 +205,88 @@ async fn duplicate_links_arbitrate_to_one_connection_without_losing_the_edge() {
   first.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn configured_links_reconnect_after_a_restart() {
+  let (first_identity, second_identity, _, _, registry) = authorized_pair();
+  let first = LinkRuntime::start(
+    &first_identity,
+    fast_link_config(vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()]),
+    registry.clone(),
+  )
+  .unwrap();
+  let second = LinkRuntime::start(
+    &second_identity,
+    fast_link_config(vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()]),
+    registry.clone(),
+  )
+  .unwrap();
+  let first_handle = first.handle();
+  let second_handle = second.handle();
+  let second_node = second_identity.node_id();
+  let second_address = wait_for_listener(&second_handle, |address| {
+    address
+      .iter()
+      .any(|protocol| matches!(protocol, Protocol::Tcp(_)))
+  })
+  .await;
+  first_handle
+    .dial(second_node, second_address.clone())
+    .await
+    .unwrap();
+  first_handle
+    .wait_connected(second_node, WAIT)
+    .await
+    .unwrap();
+
+  second.shutdown().await.unwrap();
+  wait_for_disconnected(&first_handle, second_node).await;
+  let restarted = LinkRuntime::start(
+    &second_identity,
+    fast_link_config(vec![second_address]),
+    registry,
+  )
+  .unwrap();
+
+  first_handle
+    .wait_connected(second_node, WAIT)
+    .await
+    .unwrap();
+
+  restarted.shutdown().await.unwrap();
+  first.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn lan_discovery_connects_authorized_nodes_without_a_dial() {
+  let (first_identity, second_identity, _, _, registry) = authorized_pair();
+  let first = LinkRuntime::start(
+    &first_identity,
+    fast_link_config(vec!["/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap()]),
+    registry.clone(),
+  )
+  .unwrap();
+  let second = LinkRuntime::start(
+    &second_identity,
+    fast_link_config(vec!["/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap()]),
+    registry,
+  )
+  .unwrap();
+  let first_handle = first.handle();
+  let second_handle = second.handle();
+
+  first_handle
+    .wait_connected(second_identity.node_id(), Duration::from_secs(10))
+    .await
+    .unwrap();
+  second_handle
+    .wait_connected(first_identity.node_id(), WAIT)
+    .await
+    .unwrap();
+
+  second.shutdown().await.unwrap();
+  first.shutdown().await.unwrap();
+}
+
 async fn exercise_link(listen_address: Multiaddr, matches_transport: impl Fn(&Multiaddr) -> bool) {
   let (first_identity, second_identity, _, _, registry) = authorized_pair();
   let first = LinkRuntime::start(
@@ -248,6 +330,16 @@ async fn exercise_link(listen_address: Multiaddr, matches_transport: impl Fn(&Mu
 fn single_registry(identity: &NodeIdentity) -> AuthorizationRegistry {
   let (cluster_id, record) = AuthorizationRecord::genesis(identity).unwrap();
   AuthorizationRegistry::from_records(cluster_id, [record]).unwrap()
+}
+
+fn fast_link_config(listen_addresses: Vec<Multiaddr>) -> LinkConfig {
+  LinkConfig::new(listen_addresses)
+    .with_reconnect_timing(
+      Duration::from_millis(50),
+      Duration::from_millis(50),
+      Duration::from_millis(200),
+    )
+    .with_discovery_timing(Duration::from_secs(5), Duration::from_millis(200))
 }
 
 fn start_tcp(identity: &NodeIdentity, registry: AuthorizationRegistry) -> LinkRuntime {

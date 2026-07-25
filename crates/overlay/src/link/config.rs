@@ -11,6 +11,11 @@ pub struct LinkConfig {
   idle_timeout: Duration,
   ping_interval: Duration,
   ping_timeout: Duration,
+  reconnect_interval: Duration,
+  reconnect_min_delay: Duration,
+  reconnect_max_delay: Duration,
+  discovered_address_ttl: Duration,
+  mdns_query_interval: Duration,
 }
 
 impl LinkConfig {
@@ -21,6 +26,11 @@ impl LinkConfig {
       idle_timeout: Duration::from_secs(60),
       ping_interval: Duration::from_secs(2),
       ping_timeout: Duration::from_secs(3),
+      reconnect_interval: Duration::from_secs(1),
+      reconnect_min_delay: Duration::from_secs(1),
+      reconnect_max_delay: Duration::from_secs(30),
+      discovered_address_ttl: Duration::from_secs(120),
+      mdns_query_interval: Duration::from_secs(5),
     }
   }
 
@@ -31,6 +41,25 @@ impl LinkConfig {
 
   pub fn with_idle_timeout(mut self, timeout: Duration) -> Self {
     self.idle_timeout = timeout;
+    self
+  }
+
+  #[cfg(test)]
+  pub(crate) fn with_reconnect_timing(
+    mut self, interval: Duration, min_delay: Duration, max_delay: Duration,
+  ) -> Self {
+    self.reconnect_interval = interval;
+    self.reconnect_min_delay = min_delay;
+    self.reconnect_max_delay = max_delay;
+    self
+  }
+
+  #[cfg(test)]
+  pub(crate) fn with_discovery_timing(
+    mut self, address_ttl: Duration, query_interval: Duration,
+  ) -> Self {
+    self.discovered_address_ttl = address_ttl;
+    self.mdns_query_interval = query_interval;
     self
   }
 
@@ -52,5 +81,25 @@ impl LinkConfig {
 
   pub(crate) const fn ping_timeout(&self) -> Duration {
     self.ping_timeout
+  }
+
+  pub(crate) const fn reconnect_interval(&self) -> Duration {
+    self.reconnect_interval
+  }
+
+  pub(crate) const fn reconnect_min_delay(&self) -> Duration {
+    self.reconnect_min_delay
+  }
+
+  pub(crate) const fn reconnect_max_delay(&self) -> Duration {
+    self.reconnect_max_delay
+  }
+
+  pub(crate) const fn discovered_address_ttl(&self) -> Duration {
+    self.discovered_address_ttl
+  }
+
+  pub(crate) const fn mdns_query_interval(&self) -> Duration {
+    self.mdns_query_interval
   }
 }
