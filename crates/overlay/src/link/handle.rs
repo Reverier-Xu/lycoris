@@ -13,6 +13,8 @@ pub struct LinkSnapshot {
   pub connected_nodes: Vec<NodeId>,
   pub healthy_nodes: Vec<NodeId>,
   pub connection_count: usize,
+  /// Unauthorized connections currently confined to the admission protocol.
+  pub quarantined_count: usize,
 }
 
 /// Token correlating an inbound routed envelope with its response channel.
@@ -23,6 +25,9 @@ pub struct InboundToken(pub u64);
 #[derive(Debug)]
 pub struct InboundEnvelope {
   pub token: InboundToken,
+  /// Transport peer that handed the envelope to this node. For admission
+  /// traffic this is the authenticated peer the enrollment proof binds to.
+  pub sender: libp2p::PeerId,
   pub envelope: Envelope,
 }
 
@@ -51,6 +56,17 @@ impl LinkHandle {
         address,
         reply,
       })
+      .await?;
+    response.await.map_err(|_| LinkError::ActorStopped)?
+  }
+
+  /// Dial a bootstrap address for admission without requiring prior
+  /// authorization. The address must embed the sponsor's `/p2p/` peer id;
+  /// the resulting connection stays quarantined until enrollment completes.
+  pub async fn dial_admission(&self, address: Multiaddr) -> Result<crate::PeerId, LinkError> {
+    let (reply, response) = oneshot::channel();
+    self
+      .send(LinkCommand::DialAdmission { address, reply })
       .await?;
     response.await.map_err(|_| LinkError::ActorStopped)?
   }
@@ -102,6 +118,19 @@ impl LinkHandle {
   /// Receive the next envelope delivered to this node.
   pub async fn next_inbound(&self) -> Option<InboundEnvelope> {
     self.inbound.lock().await.recv().await
+  }
+
+  /// Replace the authorization registry unconditionally. This is the
+  /// enrollment adoption path: a freshly admitted node exchanges its
+  /// standalone genesis registry for the sponsor's cluster checkpoint.
+  pub async fn adopt_authorization(
+    &self, registry: AuthorizationRegistry,
+  ) -> Result<(), LinkError> {
+    let (reply, response) = oneshot::channel();
+    self
+      .send(LinkCommand::AdoptAuthorization { registry, reply })
+      .await?;
+    response.await.map_err(|_| LinkError::ActorStopped)?
   }
 
   pub async fn set_authorization(&self, registry: AuthorizationRegistry) -> Result<(), LinkError> {
@@ -190,6 +219,10 @@ pub(crate) enum LinkCommand {
     address: Multiaddr,
     reply: oneshot::Sender<Result<(), LinkError>>,
   },
+  DialAdmission {
+    address: Multiaddr,
+    reply: oneshot::Sender<Result<libp2p::PeerId, LinkError>>,
+  },
   ListenViaRelay {
     node_id: NodeId,
     address: Multiaddr,
@@ -200,6 +233,10 @@ pub(crate) enum LinkCommand {
     reply: oneshot::Sender<Result<(), LinkError>>,
   },
   SetAuthorization {
+    registry: AuthorizationRegistry,
+    reply: oneshot::Sender<Result<(), LinkError>>,
+  },
+  AdoptAuthorization {
     registry: AuthorizationRegistry,
     reply: oneshot::Sender<Result<(), LinkError>>,
   },

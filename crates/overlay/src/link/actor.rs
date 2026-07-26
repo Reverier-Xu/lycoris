@@ -174,6 +174,11 @@ impl LinkActor {
         let _ = reply.send(result);
         false
       }
+      LinkCommand::DialAdmission { address, reply } => {
+        let result = self.dial_admission(address);
+        let _ = reply.send(result);
+        false
+      }
       LinkCommand::ListenViaRelay {
         node_id,
         address,
@@ -199,7 +204,12 @@ impl LinkActor {
         false
       }
       LinkCommand::SetAuthorization { registry, reply } => {
-        let result = self.set_authorization(registry);
+        let result = self.set_authorization(registry, true);
+        let _ = reply.send(result);
+        false
+      }
+      LinkCommand::AdoptAuthorization { registry, reply } => {
+        let result = self.set_authorization(registry, false);
         let _ = reply.send(result);
         false
       }
@@ -208,6 +218,24 @@ impl LinkActor {
         true
       }
     }
+  }
+
+  fn dial_admission(&mut self, address: Multiaddr) -> Result<PeerId, LinkError> {
+    let peer_id = address.iter().find_map(|protocol| match protocol {
+      Protocol::P2p(peer_id) => Some(peer_id),
+      _ => None,
+    });
+    let Some(peer_id) = peer_id else {
+      return Err(LinkError::Transport(
+        "admission dial requires a /p2p/ peer id component".to_string(),
+      ));
+    };
+    let options = DialOpts::peer_id(peer_id).addresses(vec![address]).build();
+    self
+      .swarm
+      .dial(options)
+      .map(|()| peer_id)
+      .map_err(|error| LinkError::Transport(error.to_string()))
   }
 
   fn listen_via_relay(&mut self, node_id: NodeId, address: Multiaddr) -> Result<(), LinkError> {
@@ -343,10 +371,30 @@ impl LinkActor {
   fn route_outbound(&self, envelope: &Envelope) -> Result<PeerId, LinkError> {
     let header = envelope.header();
     let destination = header.destination;
-    if header.version != PROTOCOL_VERSION
-      || header.cluster_id != self.state.authorization.cluster_id()
-      || destination == self.state.node_id
+    if header.version != PROTOCOL_VERSION || destination == self.state.node_id {
+      return Err(LinkError::NoRoute(destination));
+    }
+    if header.protocol == ProtocolId::Admission
+      && self
+        .state
+        .authorization
+        .active_peer_for_node(destination)
+        .is_none()
     {
+      let mut quarantined = self
+        .state
+        .quarantined
+        .values()
+        .map(|connection| connection.peer_id);
+      let Some(peer_id) = quarantined.next() else {
+        return Err(LinkError::NoRoute(destination));
+      };
+      if quarantined.next().is_some() {
+        return Err(LinkError::NoRoute(destination));
+      }
+      return Ok(peer_id);
+    }
+    if header.cluster_id != self.state.authorization.cluster_id() {
       return Err(LinkError::NoRoute(destination));
     }
     let next_hop = if self.state.node_is_connected(destination) {
@@ -425,7 +473,16 @@ impl LinkActor {
     channel: request_response::ResponseChannel<Envelope>,
   ) {
     if self.state.authorization.node_for_peer(&peer_id).is_none() {
-      tracing::debug!(%peer_id, "dropping overlay message from an unauthorized peer");
+      let quarantined = self
+        .state
+        .quarantined
+        .values()
+        .any(|connection| connection.peer_id == peer_id);
+      if quarantined && envelope.header().protocol == ProtocolId::Admission {
+        self.deliver(peer_id, envelope, channel);
+      } else {
+        tracing::debug!(%peer_id, "dropping overlay message from an unauthorized peer");
+      }
       return;
     }
     let header = envelope.header();
@@ -440,23 +497,12 @@ impl LinkActor {
       self.reply_empty(channel, &envelope);
       return;
     }
+    if header.protocol == ProtocolId::Admission {
+      self.deliver(peer_id, envelope, channel);
+      return;
+    }
     match self.router.handle(envelope, now_unix_ms()) {
-      RouteDecision::Deliver(envelope) => {
-        let token = self.next_inbound_token;
-        self.next_inbound_token += 1;
-        if self
-          .inbound_tx
-          .try_send(InboundEnvelope {
-            token: InboundToken(token),
-            envelope,
-          })
-          .is_ok()
-        {
-          self.pending_inbound.insert(token, channel);
-        } else {
-          tracing::warn!("overlay inbound queue is full; dropping a delivered envelope");
-        }
-      }
+      RouteDecision::Deliver(envelope) => self.deliver(peer_id, envelope, channel),
       RouteDecision::Forward { next_hop, envelope } => {
         let Some(next_peer) = self.state.active_peer_for_node(next_hop) else {
           self.router.complete_forward();
@@ -474,6 +520,27 @@ impl LinkActor {
       RouteDecision::Drop(reason) => {
         tracing::debug!(?reason, "dropping routed overlay envelope");
       }
+    }
+  }
+
+  fn deliver(
+    &mut self, peer_id: PeerId, envelope: Envelope,
+    channel: request_response::ResponseChannel<Envelope>,
+  ) {
+    let token = self.next_inbound_token;
+    self.next_inbound_token += 1;
+    if self
+      .inbound_tx
+      .try_send(InboundEnvelope {
+        token: InboundToken(token),
+        sender: peer_id,
+        envelope,
+      })
+      .is_ok()
+    {
+      self.pending_inbound.insert(token, channel);
+    } else {
+      tracing::warn!("overlay inbound queue is full; dropping a delivered envelope");
     }
   }
 
@@ -601,8 +668,10 @@ impl LinkActor {
     RequestId::from_bytes(bytes)
   }
 
-  fn set_authorization(&mut self, registry: AuthorizationRegistry) -> Result<(), LinkError> {
-    if registry.cluster_id() != self.state.authorization.cluster_id() {
+  fn set_authorization(
+    &mut self, registry: AuthorizationRegistry, check_cluster: bool,
+  ) -> Result<(), LinkError> {
+    if check_cluster && registry.cluster_id() != self.state.authorization.cluster_id() {
       return Err(
         AuthorizationError::ForeignCluster {
           expected: self.state.authorization.cluster_id(),
@@ -622,6 +691,30 @@ impl LinkActor {
       .relay_reservations
       .retain(|node_id, _| authorization.active_peer_for_node(*node_id).is_some());
     self.router = Router::new(self.state.node_id);
+    let promoted: Vec<ConnectionId> = self
+      .state
+      .quarantined
+      .iter()
+      .filter_map(|(connection_id, connection)| {
+        self
+          .state
+          .authorization
+          .node_for_peer(&connection.peer_id)
+          .map(|_| *connection_id)
+      })
+      .collect();
+    for connection_id in promoted {
+      if let Some(quarantined) = self.state.quarantined.remove(&connection_id)
+        && let Some(node_id) = self.state.authorization.node_for_peer(&quarantined.peer_id)
+      {
+        self.state.connection_established(
+          quarantined.peer_id,
+          node_id,
+          connection_id,
+          quarantined.endpoint,
+        );
+      }
+    }
     let stale_connections: Vec<_> = self
       .state
       .connections
@@ -638,6 +731,8 @@ impl LinkActor {
     for connection_id in stale_connections {
       self.swarm.close_connection(connection_id);
     }
+    self.snapshot_tx.send_replace(self.state.snapshot());
+    self.advertise_link_state();
     Ok(())
   }
 
@@ -678,7 +773,8 @@ impl LinkActor {
           .get(&connection_id)
           .map(|connection| connection.node_id);
         self.state.pending_dials.remove(&connection_id);
-        let changed = self.state.connection_closed(peer_id, connection_id);
+        let quarantined_closed = self.state.quarantined.remove(&connection_id).is_some();
+        let changed = self.state.connection_closed(peer_id, connection_id) || quarantined_closed;
         if let Some(node_id) = node_id
           && !self.state.node_is_connected(node_id)
         {
@@ -776,9 +872,17 @@ impl LinkActor {
   ) -> bool {
     self.state.pending_dials.remove(&connection_id);
     let Some(node_id) = self.state.authorization.node_for_peer(&peer_id) else {
-      tracing::debug!(%peer_id, "closing unauthorized overlay connection");
-      self.swarm.close_connection(connection_id);
-      return false;
+      if self.state.quarantined.len() >= MAX_QUARANTINED_CONNECTIONS {
+        tracing::debug!(%peer_id, "rejecting a quarantined overlay connection beyond the cap");
+        self.swarm.close_connection(connection_id);
+        return false;
+      }
+      tracing::debug!(%peer_id, "quarantining an unauthorized overlay connection");
+      self
+        .state
+        .quarantined
+        .insert(connection_id, QuarantinedConnection { peer_id, endpoint });
+      return true;
     };
     let remote_address = endpoint.get_remote_address().clone();
     let changed = self
@@ -824,6 +928,16 @@ struct ConnectionInfo {
   endpoint: ConnectedPoint,
 }
 
+/// Maximum simultaneously quarantined connections (unauthenticated peers
+/// that may only speak the bounded admission protocol).
+const MAX_QUARANTINED_CONNECTIONS: usize = 32;
+
+#[derive(Debug, Clone)]
+struct QuarantinedConnection {
+  peer_id: PeerId,
+  endpoint: ConnectedPoint,
+}
+
 struct LinkState {
   node_id: NodeId,
   local_peer_id: PeerId,
@@ -831,6 +945,7 @@ struct LinkState {
   listeners: BTreeSet<Multiaddr>,
   connections: BTreeMap<ConnectionId, ConnectionInfo>,
   healthy_connections: BTreeSet<ConnectionId>,
+  quarantined: BTreeMap<ConnectionId, QuarantinedConnection>,
   directory: PeerDirectory,
   pending_dials: BTreeMap<ConnectionId, NodeId>,
   relay_reservations: BTreeMap<NodeId, Multiaddr>,
@@ -845,6 +960,7 @@ impl LinkState {
       listeners: BTreeSet::new(),
       connections: BTreeMap::new(),
       healthy_connections: BTreeSet::new(),
+      quarantined: BTreeMap::new(),
       directory: PeerDirectory::default(),
       pending_dials: BTreeMap::new(),
       relay_reservations: BTreeMap::new(),
@@ -959,6 +1075,7 @@ impl LinkState {
       connected_nodes: connected_nodes.into_iter().collect(),
       healthy_nodes,
       connection_count: self.connections.len(),
+      quarantined_count: self.quarantined.len(),
     }
   }
 }

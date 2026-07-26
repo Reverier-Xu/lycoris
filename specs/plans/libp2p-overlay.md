@@ -57,11 +57,13 @@ the completed work reaches `main`.
 10. `:sparkles: add sparse overlay routing`
 11. `:sparkles: add overlay messaging` (request-response substrate:
     envelope codec, routed forwarding, link-state broadcast)
-12. `:recycle: move membership traffic onto the overlay`
-13. `:recycle: move resource sync onto the overlay`
-14. `:recycle: route extension calls across the overlay`
-15. `:recycle: remove peer grpc transport`
-16. `:white_check_mark: cover overlay recovery topologies`
+12. `:sparkles: add quarantined admission channels` (implementation split of
+    the membership move: admission-only quarantine, enrollment promotion)
+13. `:recycle: move membership traffic onto the overlay`
+14. `:recycle: move resource sync onto the overlay`
+15. `:recycle: route extension calls across the overlay`
+16. `:recycle: remove peer grpc transport`
+17. `:white_check_mark: cover overlay recovery topologies`
 
 The messaging substrate commit is an implementation split of the membership
 move; the checklist above still tracks the fifteen planned outcomes.

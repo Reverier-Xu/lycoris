@@ -124,6 +124,43 @@ impl EnrollmentOutcome {
   }
 }
 
+/// Bounded admission wire request carried by quarantined overlay channels.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub enum AdmissionRequest {
+  Begin(AdmissionCandidate),
+  Prove(JoinProof),
+}
+
+/// The admitted record plus the sponsor's full registry checkpoint, so the
+/// joiner can merge authorization state in one round.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AdmissionOutcome {
+  record: AuthorizationRecord,
+  records: Vec<AuthorizationRecord>,
+}
+
+impl AdmissionOutcome {
+  pub fn new(record: AuthorizationRecord, records: Vec<AuthorizationRecord>) -> Self {
+    Self { record, records }
+  }
+
+  pub const fn record(&self) -> &AuthorizationRecord {
+    &self.record
+  }
+
+  pub fn records(&self) -> &[AuthorizationRecord] {
+    &self.records
+  }
+}
+
+/// Sponsor reply to an [`AdmissionRequest`].
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub enum AdmissionResponse {
+  Challenge(AdmissionChallenge),
+  Admitted(Box<AdmissionOutcome>),
+  Rejected(String),
+}
+
 #[derive(Debug)]
 pub struct Enrollment {
   registry: AuthorizationRegistry,

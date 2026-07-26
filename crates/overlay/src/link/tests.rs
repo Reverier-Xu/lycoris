@@ -4,7 +4,8 @@ use libp2p::{Multiaddr, multiaddr::Protocol};
 
 use super::*;
 use crate::{
-  AuthorizationRecord, AuthorizationRegistry, ClusterId, Envelope, EnvelopeHeader, MessageKind,
+  AdmissionCandidate, AdmissionOutcome, AdmissionRequest, AdmissionResponse, AuthorizationRecord,
+  AuthorizationRegistry, ClusterId, Enrollment, Envelope, EnvelopeHeader, JoinProof, MessageKind,
   NodeId, NodeIdentity, PROTOCOL_VERSION, ProtocolId, RequestId,
 };
 
@@ -20,7 +21,7 @@ async fn dropping_runtime_stops_its_actor() {
   let node_id = identity.node_id();
   drop(runtime);
 
-  tokio::time::timeout(WAIT, async {
+  let observed = tokio::time::timeout(WAIT, async {
     loop {
       let dial = handle
         .dial(node_id, "/ip4/127.0.0.1/tcp/1".parse().unwrap())
@@ -31,8 +32,8 @@ async fn dropping_runtime_stops_its_actor() {
       tokio::task::yield_now().await;
     }
   })
-  .await
-  .expect("runtime drop did not stop the actor");
+  .await;
+  assert!(observed.is_ok(), "runtime drop did not stop the actor");
 }
 
 #[tokio::test]
@@ -354,7 +355,7 @@ async fn routed_requests_cross_a_sparse_chain() {
     .await
     .unwrap();
 
-  let response = tokio::time::timeout(WAIT, async {
+  let observed = tokio::time::timeout(WAIT, async {
     loop {
       let request = request_envelope(first_node, second_node, registry.cluster_id(), 11, b"hop");
       match first_handle.request(request).await {
@@ -364,8 +365,11 @@ async fn routed_requests_cross_a_sparse_chain() {
       }
     }
   })
-  .await
-  .expect("routed request did not complete");
+  .await;
+  let response = match observed {
+    Ok(response) => response,
+    Err(_) => panic!("routed request did not complete"),
+  };
 
   assert_eq!(response.payload(), b"hop");
   assert_eq!(response.header().source, second_node);
@@ -410,6 +414,174 @@ async fn unroutable_requests_fail_closed() {
   first.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn quarantined_peers_enroll_and_promote_to_a_logical_edge() {
+  let sponsor_identity = NodeIdentity::generate();
+  let sponsor_registry = single_registry(&sponsor_identity);
+  let cluster_id = sponsor_registry.cluster_id();
+  let join_key = lycoris_core::ClusterKey::generate().unwrap();
+  let sponsor = start_quiet_tcp(&sponsor_identity, sponsor_registry.clone());
+  let sponsor_handle = sponsor.handle();
+  let mut enrollment = Enrollment::new(sponsor_registry, Some(join_key.clone()));
+  let responder_identity = sponsor_identity.clone();
+  let responder_handle = sponsor_handle.clone();
+  let responder = tokio::spawn(async move {
+    while let Some(inbound) = responder_handle.next_inbound().await {
+      if inbound.envelope.header().protocol != ProtocolId::Admission {
+        continue;
+      }
+      let request: AdmissionRequest = postcard::from_bytes(inbound.envelope.payload()).unwrap();
+      let response = match request {
+        AdmissionRequest::Begin(candidate) => {
+          match enrollment.begin(candidate, &inbound.sender, &responder_identity) {
+            Ok(challenge) => AdmissionResponse::Challenge(challenge),
+            Err(error) => AdmissionResponse::Rejected(error.to_string()),
+          }
+        }
+        AdmissionRequest::Prove(proof) => {
+          match enrollment.enroll_with_join_key(&proof, &inbound.sender, &responder_identity) {
+            Ok(outcome) => {
+              let admitted = outcome.record().clone();
+              let records = outcome.records().to_vec();
+              responder_handle
+                .set_authorization(enrollment.registry().clone())
+                .await
+                .unwrap();
+              AdmissionResponse::Admitted(Box::new(AdmissionOutcome::new(admitted, records)))
+            }
+            Err(error) => AdmissionResponse::Rejected(error.to_string()),
+          }
+        }
+      };
+      let payload = postcard::to_stdvec(&response).unwrap();
+      let reply = response_envelope(&inbound.envelope, responder_identity.node_id(), payload);
+      responder_handle
+        .respond(inbound.token, reply)
+        .await
+        .unwrap();
+    }
+  });
+  let joiner_identity = NodeIdentity::generate();
+  let joiner = start_quiet_tcp(&joiner_identity, single_registry(&joiner_identity));
+  let joiner_handle = joiner.handle();
+  let sponsor_address = wait_for_listener(&sponsor_handle, |address| {
+    address
+      .iter()
+      .any(|protocol| matches!(protocol, Protocol::Tcp(_)))
+  })
+  .await;
+  let admission_address: Multiaddr =
+    format!("{sponsor_address}/p2p/{}", sponsor_identity.peer_id())
+      .parse()
+      .unwrap();
+  joiner_handle
+    .dial_admission(admission_address)
+    .await
+    .unwrap();
+  wait_for_snapshot(&joiner_handle, |snapshot| snapshot.quarantined_count > 0).await;
+  assert!(sponsor_handle.snapshot().connected_nodes.is_empty());
+
+  let candidate = AdmissionCandidate::new(&joiner_identity).unwrap();
+  let begin = AdmissionRequest::Begin(candidate.clone());
+  let challenge_response = joiner_handle
+    .request(admission_envelope(
+      joiner_identity.node_id(),
+      21,
+      postcard::to_stdvec(&begin).unwrap(),
+    ))
+    .await
+    .unwrap();
+  let AdmissionResponse::Challenge(challenge) =
+    postcard::from_bytes(challenge_response.payload()).unwrap()
+  else {
+    panic!("expected an admission challenge");
+  };
+  assert_eq!(challenge.cluster_id(), cluster_id);
+
+  let proof = JoinProof::create(&join_key, candidate, challenge).unwrap();
+  let prove = AdmissionRequest::Prove(proof);
+  let admitted_response = joiner_handle
+    .request(admission_envelope(
+      joiner_identity.node_id(),
+      23,
+      postcard::to_stdvec(&prove).unwrap(),
+    ))
+    .await
+    .unwrap();
+  let AdmissionResponse::Admitted(outcome) =
+    postcard::from_bytes(admitted_response.payload()).unwrap()
+  else {
+    panic!("expected an admission outcome");
+  };
+  assert_eq!(outcome.record().node_id(), joiner_identity.node_id());
+  let adopted =
+    AuthorizationRegistry::from_records(cluster_id, outcome.records().to_vec()).unwrap();
+  joiner_handle.adopt_authorization(adopted).await.unwrap();
+
+  sponsor_handle
+    .wait_connected(joiner_identity.node_id(), WAIT)
+    .await
+    .unwrap();
+  joiner_handle
+    .wait_connected(sponsor_identity.node_id(), WAIT)
+    .await
+    .unwrap();
+  assert_eq!(joiner_handle.snapshot().quarantined_count, 0);
+  assert_eq!(sponsor_handle.snapshot().quarantined_count, 0);
+
+  responder.abort();
+  joiner.shutdown().await.unwrap();
+  sponsor.shutdown().await.unwrap();
+}
+
+fn admission_envelope(source: NodeId, nonce: u8, payload: Vec<u8>) -> Envelope {
+  let header = EnvelopeHeader {
+    version: PROTOCOL_VERSION,
+    cluster_id: ClusterId::from_bytes([0; ClusterId::BYTE_LENGTH]),
+    request_id: RequestId::from_bytes([nonce; RequestId::BYTE_LENGTH]),
+    source,
+    destination: NodeId::from_bytes([0; NodeId::BYTE_LENGTH]),
+    protocol: ProtocolId::Admission,
+    kind: MessageKind::Request,
+    deadline_unix_ms: FAR_FUTURE_MS,
+    remaining_hops: 0,
+  };
+  Envelope::new(header, payload).unwrap()
+}
+
+fn response_envelope(request: &Envelope, source: NodeId, payload: Vec<u8>) -> Envelope {
+  let request_header = request.header();
+  let header = EnvelopeHeader {
+    version: PROTOCOL_VERSION,
+    cluster_id: request_header.cluster_id,
+    request_id: request_header.request_id,
+    source,
+    destination: request_header.source,
+    protocol: request_header.protocol,
+    kind: MessageKind::Response,
+    deadline_unix_ms: request_header.deadline_unix_ms,
+    remaining_hops: request_header.remaining_hops,
+  };
+  Envelope::new(header, payload).unwrap()
+}
+
+async fn wait_for_snapshot(handle: &LinkHandle, predicate: impl Fn(&LinkSnapshot) -> bool) {
+  let mut snapshots = handle.subscribe();
+  let observed = tokio::time::timeout(WAIT, async {
+    loop {
+      if predicate(&snapshots.borrow()) {
+        return;
+      }
+      snapshots.changed().await.unwrap();
+    }
+  })
+  .await;
+  assert!(
+    observed.is_ok(),
+    "snapshot did not reach the expected state"
+  );
+}
+
 fn request_envelope(
   source: NodeId, destination: NodeId, cluster_id: ClusterId, nonce: u8, payload: &[u8],
 ) -> Envelope {
@@ -430,19 +602,10 @@ fn request_envelope(
 fn spawn_echo(handle: LinkHandle) -> tokio::task::JoinHandle<()> {
   tokio::spawn(async move {
     while let Some(inbound) = handle.next_inbound().await {
-      let request_header = inbound.envelope.header().clone();
-      let header = EnvelopeHeader {
-        version: PROTOCOL_VERSION,
-        cluster_id: request_header.cluster_id,
-        request_id: request_header.request_id,
-        source: handle.snapshot().node_id,
-        destination: request_header.source,
-        protocol: request_header.protocol,
-        kind: MessageKind::Response,
-        deadline_unix_ms: request_header.deadline_unix_ms,
-        remaining_hops: request_header.remaining_hops,
-      };
-      let response = Envelope::new(header, inbound.envelope.into_payload()).unwrap();
+      let source = handle.snapshot().node_id;
+      let request = inbound.envelope;
+      let payload = request.payload().to_vec();
+      let response = response_envelope(&request, source, payload);
       handle.respond(inbound.token, response).await.unwrap();
     }
   })
@@ -663,7 +826,7 @@ async fn wait_for_listener(
   handle: &LinkHandle, matches_transport: impl Fn(&Multiaddr) -> bool,
 ) -> Multiaddr {
   let mut snapshots = handle.subscribe();
-  tokio::time::timeout(WAIT, async {
+  let observed = tokio::time::timeout(WAIT, async {
     loop {
       if let Some(address) = snapshots
         .borrow()
@@ -677,13 +840,16 @@ async fn wait_for_listener(
       snapshots.changed().await.unwrap();
     }
   })
-  .await
-  .expect("listener did not become ready")
+  .await;
+  match observed {
+    Ok(address) => address,
+    Err(_) => panic!("listener did not become ready"),
+  }
 }
 
 async fn wait_for_disconnected(handle: &LinkHandle, node_id: NodeId) {
   let mut snapshots = handle.subscribe();
-  tokio::time::timeout(WAIT, async {
+  let observed = tokio::time::timeout(WAIT, async {
     loop {
       if !snapshots.borrow().connected_nodes.contains(&node_id) {
         return;
@@ -691,13 +857,13 @@ async fn wait_for_disconnected(handle: &LinkHandle, node_id: NodeId) {
       snapshots.changed().await.unwrap();
     }
   })
-  .await
-  .expect("node did not disconnect");
+  .await;
+  assert!(observed.is_ok(), "node did not disconnect");
 }
 
 async fn wait_for_connection_count(handle: &LinkHandle, expected: usize) {
   let mut snapshots = handle.subscribe();
-  tokio::time::timeout(WAIT, async {
+  let observed = tokio::time::timeout(WAIT, async {
     loop {
       if snapshots.borrow().connection_count == expected {
         return;
@@ -705,8 +871,8 @@ async fn wait_for_connection_count(handle: &LinkHandle, expected: usize) {
       snapshots.changed().await.unwrap();
     }
   })
-  .await
-  .expect("connection count did not converge");
+  .await;
+  assert!(observed.is_ok(), "connection count did not converge");
 }
 
 async fn assert_remains_disconnected(handle: &LinkHandle, node_id: NodeId, duration: Duration) {
