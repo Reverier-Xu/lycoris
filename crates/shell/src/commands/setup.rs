@@ -252,6 +252,7 @@ fn bootstrap_node_assets(
     cluster: lycoris_config::ClusterConfig {
       listen_address: format!("0.0.0.0:{port}"),
       bootstrap_peers: Vec::new(),
+      overlay_listen: Vec::new(),
     },
     tls: lycoris_config::TlsConfig {
       ca_cert: ca_cert.to_string_lossy().to_string(),
@@ -346,6 +347,8 @@ fn install_service(
 mod tests {
   use super::*;
 
+  type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
   #[test]
   fn is_in_path_detects_entry() {
     let tmp = std::env::temp_dir();
@@ -353,11 +356,12 @@ mod tests {
   }
 
   #[test]
-  fn canonical_binary_path_for_normal_user_is_under_home() {
+  fn canonical_binary_path_for_normal_user_is_under_home() -> TestResult {
     if cfg!(unix) && !is_root::is_root() {
-      let path = canonical_binary_path().unwrap();
-      let home = home_dir().unwrap();
+      let path = canonical_binary_path()?;
+      let home = home_dir()?;
       assert!(path.starts_with(home));
     }
+    Ok(())
   }
 }

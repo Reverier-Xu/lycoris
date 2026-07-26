@@ -101,6 +101,11 @@ pub struct ClusterConfig {
   /// Optional list of peers to seed on first startup. After bootstrap, peer
   /// state is maintained in the database.
   pub bootstrap_peers: Vec<String>,
+  /// Overlay (node-to-node libp2p) listen addresses as multiaddrs. When
+  /// empty, the daemon binds ephemeral QUIC and TCP ports on all interfaces
+  /// and relies on LAN discovery or explicit dials for reachability.
+  #[serde(default)]
+  pub overlay_listen: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -196,6 +201,7 @@ fn default_invoke_timeout_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+  type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
   use std::fs;
 
   use super::*;
@@ -219,26 +225,28 @@ mod tests {
         "#;
 
   #[test]
-  fn parse_node_config() {
-    let cfg: DaemonConfig = toml::from_str(VALID_TOML).unwrap();
+  fn parse_node_config() -> TestResult {
+    let cfg: DaemonConfig = toml::from_str(VALID_TOML)?;
     assert_eq!(cfg.node.id, "node-01");
     assert_eq!(cfg.cluster.bootstrap_peers.len(), 1);
     assert_eq!(cfg.data_dir, "data");
+    Ok(())
   }
 
   #[test]
-  fn node_labels_default_to_empty() {
-    let cfg: DaemonConfig = toml::from_str(VALID_TOML).unwrap();
+  fn node_labels_default_to_empty() -> TestResult {
+    let cfg: DaemonConfig = toml::from_str(VALID_TOML)?;
     assert!(cfg.node.labels.is_empty());
+    Ok(())
   }
 
   #[test]
-  fn parse_node_labels() {
+  fn parse_node_labels() -> TestResult {
     let toml = VALID_TOML.replace(
       "address = \"https://127.0.0.1:5001\"",
       "address = \"https://127.0.0.1:5001\"\nlabels = { role = \"runner\", zone = \"eu\" }",
     );
-    let cfg: DaemonConfig = toml::from_str(&toml).unwrap();
+    let cfg: DaemonConfig = toml::from_str(&toml)?;
     assert_eq!(
       cfg.node.labels,
       HashMap::from([
@@ -246,34 +254,38 @@ mod tests {
         ("zone".to_string(), "eu".to_string()),
       ])
     );
+    Ok(())
   }
 
   #[test]
-  fn reject_non_string_node_label_value() {
+  fn reject_non_string_node_label_value() -> TestResult {
     let toml = VALID_TOML.replace(
       "address = \"https://127.0.0.1:5001\"",
       "address = \"https://127.0.0.1:5001\"\nlabels = { role = 1 }",
     );
     let result: Result<DaemonConfig, _> = toml::from_str(&toml);
     assert!(result.is_err());
+    Ok(())
   }
 
   #[test]
-  fn reject_empty_node_id() {
+  fn reject_empty_node_id() -> TestResult {
     let toml = VALID_TOML.replace("node-01", "");
     let result: Result<DaemonConfig, _> = toml::from_str(&toml);
     assert!(result.is_err());
+    Ok(())
   }
 
   #[test]
-  fn reject_empty_tls_field() {
+  fn reject_empty_tls_field() -> TestResult {
     let toml = VALID_TOML.replace("certs/ca.key", "");
     let result: Result<DaemonConfig, _> = toml::from_str(&toml);
     assert!(result.is_err());
+    Ok(())
   }
 
   #[test]
-  fn reject_unknown_field_in_nested_sections() {
+  fn reject_unknown_field_in_nested_sections() -> TestResult {
     for (anchor, unknown) in [
       ("id = \"node-01\"", "node_typo = 1"),
       ("listen_address = \"0.0.0.0:5001\"", "peer = 1"),
@@ -283,43 +295,47 @@ mod tests {
       let result: Result<DaemonConfig, _> = toml::from_str(&toml);
       assert!(result.is_err(), "unknown field '{unknown}' was accepted");
     }
+    Ok(())
   }
 
   #[test]
-  fn extensions_default_when_section_missing() {
-    let cfg: DaemonConfig = toml::from_str(VALID_TOML).unwrap();
+  fn extensions_default_when_section_missing() -> TestResult {
+    let cfg: DaemonConfig = toml::from_str(VALID_TOML)?;
     assert_eq!(cfg.extensions, ExtensionsConfig::default());
     assert_eq!(cfg.extensions.wasm_fuel_per_call, 100_000_000);
     assert_eq!(cfg.extensions.wasm_max_memory_bytes, 64 * 1024 * 1024);
     assert_eq!(cfg.extensions.lua_instructions_per_call, 1_000_000);
     assert_eq!(cfg.extensions.lua_max_memory_bytes, 32 * 1024 * 1024);
     assert_eq!(cfg.extensions.invoke_timeout_ms, 10_000);
+    Ok(())
   }
 
   #[test]
-  fn extensions_explicit_override_keeps_defaults_elsewhere() {
+  fn extensions_explicit_override_keeps_defaults_elsewhere() -> TestResult {
     let toml =
       format!("{VALID_TOML}\n[extensions]\nwasm_fuel_per_call = 42\ninvoke_timeout_ms = 1\n");
-    let cfg: DaemonConfig = toml::from_str(&toml).unwrap();
+    let cfg: DaemonConfig = toml::from_str(&toml)?;
     assert_eq!(cfg.extensions.wasm_fuel_per_call, 42);
     assert_eq!(cfg.extensions.invoke_timeout_ms, 1);
     assert_eq!(cfg.extensions.wasm_max_memory_bytes, 64 * 1024 * 1024);
     assert_eq!(cfg.extensions.lua_instructions_per_call, 1_000_000);
     assert_eq!(cfg.extensions.lua_max_memory_bytes, 32 * 1024 * 1024);
+    Ok(())
   }
 
   #[test]
-  fn extensions_local_defaults_to_empty() {
-    let cfg: DaemonConfig = toml::from_str(VALID_TOML).unwrap();
+  fn extensions_local_defaults_to_empty() -> TestResult {
+    let cfg: DaemonConfig = toml::from_str(VALID_TOML)?;
     assert!(cfg.extensions.local.is_empty());
+    Ok(())
   }
 
   #[test]
-  fn extensions_local_parses_per_extension_tables() {
+  fn extensions_local_parses_per_extension_tables() -> TestResult {
     let toml = format!(
       "{VALID_TOML}\n[extensions.local.openai]\napi_key = \"sk-test\"\nbase_url = \"https://api.openai.com/v1\"\nhttp_allow_hosts = \"[\\\"api.openai.com\\\"]\"\n"
     );
-    let cfg: DaemonConfig = toml::from_str(&toml).unwrap();
+    let cfg: DaemonConfig = toml::from_str(&toml)?;
     assert_eq!(
       cfg.extensions.local.get("openai"),
       Some(&HashMap::from([
@@ -334,47 +350,62 @@ mod tests {
         ),
       ]))
     );
+    Ok(())
   }
 
   #[test]
-  fn reject_non_string_extensions_local_value() {
+  fn overlay_listen_defaults_to_empty_and_parses_multiaddrs() -> TestResult {
+    let cfg: DaemonConfig = toml::from_str(VALID_TOML)?;
+    assert!(cfg.cluster.overlay_listen.is_empty());
+    let toml = VALID_TOML.replace(
+      "bootstrap_peers = [\"https://127.0.0.1:5002\"]",
+      "bootstrap_peers = [\"https://127.0.0.1:5002\"]\noverlay_listen = [\"/ip4/0.0.0.0/udp/9000/quic-v1\", \"/ip4/0.0.0.0/tcp/9001\"]",
+    );
+    let cfg: DaemonConfig = toml::from_str(&toml)?;
+    assert_eq!(cfg.cluster.overlay_listen.len(), 2);
+    Ok(())
+  }
+
+  #[test]
+  fn reject_non_string_extensions_local_value() -> TestResult {
     let toml = format!("{VALID_TOML}\n[extensions.local.openai]\napi_key = 42\n");
     let result: Result<DaemonConfig, _> = toml::from_str(&toml);
     assert!(result.is_err());
+    Ok(())
   }
 
   #[test]
-  fn reject_unknown_field_in_extensions_section() {
+  fn reject_unknown_field_in_extensions_section() -> TestResult {
     let toml = format!("{VALID_TOML}\n[extensions]\nwasm_fuel = 1\n");
     let result: Result<DaemonConfig, _> = toml::from_str(&toml);
     assert!(result.is_err());
+    Ok(())
   }
 
   #[test]
-  fn reject_non_https_node_address() {
-    let dir = tempfile::TempDir::new().unwrap();
+  fn reject_non_https_node_address() -> TestResult {
+    let dir = tempfile::TempDir::new()?;
     let path = dir.path().join("lycoris.toml");
     fs::write(
       &path,
       VALID_TOML.replace("https://127.0.0.1:5001\"", "http://127.0.0.1:5001\""),
-    )
-    .unwrap();
+    )?;
     let error = DaemonConfig::from_file(&path).unwrap_err();
     assert!(
       matches!(error, ConfigError::InvalidNodeAddress { .. }),
       "expected InvalidNodeAddress, got {error}"
     );
+    Ok(())
   }
 
   #[test]
-  fn reject_non_https_bootstrap_peer_with_index() {
-    let dir = tempfile::TempDir::new().unwrap();
+  fn reject_non_https_bootstrap_peer_with_index() -> TestResult {
+    let dir = tempfile::TempDir::new()?;
     let path = dir.path().join("lycoris.toml");
     fs::write(
       &path,
       VALID_TOML.replace("https://127.0.0.1:5002", "http://127.0.0.1:5002"),
-    )
-    .unwrap();
+    )?;
     let error = DaemonConfig::from_file(&path).unwrap_err();
     match error {
       ConfigError::InvalidPeerAddress { index, source } => {
@@ -386,5 +417,6 @@ mod tests {
       }
       other => panic!("expected InvalidPeerAddress, got {other}"),
     }
+    Ok(())
   }
 }

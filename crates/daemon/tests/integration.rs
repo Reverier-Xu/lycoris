@@ -109,6 +109,7 @@ fn build_config(
     cluster: ClusterConfig {
       listen_address: format!("127.0.0.1:{listen_port}"),
       bootstrap_peers,
+      overlay_listen: Vec::new(),
     },
     tls: TlsConfig {
       ca_cert: ca_cert_path.to_string_lossy().to_string(),

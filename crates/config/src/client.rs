@@ -118,8 +118,7 @@ impl ClientConfig {
       .or_else(|| fallback.is_file().then(|| fallback.to_path_buf()))
   }
 
-  /// Write the client configuration to a TOML file, creating parent directories
-  /// if necessary.
+  /// Persist this client configuration as TOML at `path`.
   pub fn write_to_file<P: AsRef<Path>>(&self, path: P) -> Result<(), ConfigError> {
     crate::toml_file::write(self, path.as_ref())
   }
@@ -127,6 +126,7 @@ impl ClientConfig {
 
 #[cfg(test)]
 mod tests {
+  type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
   use std::fs;
 
   use tempfile::TempDir;
@@ -144,6 +144,7 @@ mod tests {
       cluster: ClusterConfig {
         listen_address: "0.0.0.0:5001".to_string(),
         bootstrap_peers: vec![],
+        overlay_listen: vec![],
       },
       tls: TlsConfig {
         ca_cert: "ca.crt".to_string(),
@@ -157,12 +158,12 @@ mod tests {
   }
 
   #[test]
-  fn client_config_round_trip() {
-    let dir = TempDir::new().unwrap();
+  fn client_config_round_trip() -> TestResult {
+    let dir = TempDir::new()?;
     let path = dir.path().join("lycoris.client.conf");
     let original = ClientConfig::from_daemon_config(&sample_daemon_config());
-    original.write_to_file(&path).unwrap();
-    let loaded = ClientConfig::from_file(&path).unwrap();
+    original.write_to_file(&path)?;
+    let loaded = ClientConfig::from_file(&path)?;
     assert_eq!(loaded.api_address, original.api_address);
     assert_eq!(loaded.ca_cert, original.ca_cert);
     assert_eq!(
@@ -174,10 +175,11 @@ mod tests {
           .into_owned()
       )
     );
+    Ok(())
   }
 
   #[test]
-  fn reject_empty_api_address() {
+  fn reject_empty_api_address() -> TestResult {
     let toml = r#"
       api_address = ""
       ca_cert = "ca.crt"
@@ -186,11 +188,12 @@ mod tests {
     "#;
     let result: Result<ClientConfig, _> = toml::from_str(toml);
     assert!(result.is_err());
+    Ok(())
   }
 
   #[test]
-  fn reject_non_https_api_address() {
-    let dir = TempDir::new().unwrap();
+  fn reject_non_https_api_address() -> TestResult {
+    let dir = TempDir::new()?;
     let path = dir.path().join("lycoris.client.conf");
     fs::write(
       &path,
@@ -200,32 +203,34 @@ mod tests {
         cert = "node.crt"
         key = "node.key"
       "#,
-    )
-    .unwrap();
+    )?;
     let error = ClientConfig::from_file(&path).unwrap_err();
     assert!(
       matches!(error, ConfigError::InvalidNodeAddress { .. }),
       "expected InvalidNodeAddress, got {error}"
     );
+    Ok(())
   }
 
   #[test]
-  fn resolve_cluster_key_path_prefers_explicit_path() {
-    let dir = TempDir::new().unwrap();
+  fn resolve_cluster_key_path_prefers_explicit_path() -> TestResult {
+    let dir = TempDir::new()?;
     let key_path = dir.path().join("cluster.key");
-    fs::write(&key_path, "aa").unwrap();
+    fs::write(&key_path, "aa")?;
 
     let mut config = ClientConfig::from_daemon_config(&sample_daemon_config());
     config.cluster_key_path = Some(key_path.to_string_lossy().to_string());
     assert_eq!(config.resolve_cluster_key_path(), Some(key_path));
+    Ok(())
   }
 
   #[test]
-  fn resolve_cluster_key_path_falls_back_to_default_location() {
-    let dir = TempDir::new().unwrap();
+  fn resolve_cluster_key_path_falls_back_to_default_location() -> TestResult {
+    let dir = TempDir::new()?;
     let fallback = dir.path().join("default/cluster.key");
-    fs::create_dir_all(fallback.parent().unwrap()).unwrap();
-    fs::write(&fallback, "aa").unwrap();
+    let parent = fallback.parent().ok_or("fallback path has no parent")?;
+    fs::create_dir_all(parent)?;
+    fs::write(&fallback, "aa")?;
 
     // An explicit path that does not exist loses to the default location.
     let mut config = ClientConfig::from_daemon_config(&sample_daemon_config());
@@ -245,40 +250,44 @@ mod tests {
     // Neither source exists: nothing to resolve.
     let missing = dir.path().join("none.key");
     assert_eq!(config.resolve_cluster_key_path_with(&missing), None);
+    Ok(())
   }
 
   #[test]
-  fn load_or_derive_prefers_existing_client_file() {
-    let dir = TempDir::new().unwrap();
+  fn load_or_derive_prefers_existing_client_file() -> TestResult {
+    let dir = TempDir::new()?;
     let client_path = dir.path().join("lycoris.client.conf");
     let original = ClientConfig::from_daemon_config(&sample_daemon_config());
-    original.write_to_file(&client_path).unwrap();
+    original.write_to_file(&client_path)?;
 
-    let loaded = ClientConfig::load_or_derive(Some(&client_path), None).unwrap();
+    let loaded = ClientConfig::load_or_derive(Some(&client_path), None)?;
     assert_eq!(loaded.api_address, original.api_address);
+    Ok(())
   }
 
   #[test]
-  fn load_or_derive_falls_back_to_daemon_config() {
-    let dir = TempDir::new().unwrap();
+  fn load_or_derive_falls_back_to_daemon_config() -> TestResult {
+    let dir = TempDir::new()?;
     let daemon_path = dir.path().join("lycoris.toml");
-    sample_daemon_config().write_to_file(&daemon_path).unwrap();
+    sample_daemon_config().write_to_file(&daemon_path)?;
 
     let missing_client = dir.path().join("no-client.conf");
-    let loaded = ClientConfig::load_or_derive(Some(&missing_client), Some(&daemon_path)).unwrap();
+    let loaded = ClientConfig::load_or_derive(Some(&missing_client), Some(&daemon_path))?;
     assert_eq!(loaded.api_address, "https://127.0.0.1:5001");
     assert_eq!(loaded.ca_cert, "ca.crt");
 
     // A missing client path slot behaves the same as a missing file.
-    let loaded = ClientConfig::load_or_derive(None, Some(&daemon_path)).unwrap();
+    let loaded = ClientConfig::load_or_derive(None, Some(&daemon_path))?;
     assert_eq!(loaded.api_address, "https://127.0.0.1:5001");
+    Ok(())
   }
 
   #[test]
-  fn load_or_derive_propagates_missing_daemon_config() {
-    let dir = TempDir::new().unwrap();
+  fn load_or_derive_propagates_missing_daemon_config() -> TestResult {
+    let dir = TempDir::new()?;
     let missing = dir.path().join("missing.toml");
     let error = ClientConfig::load_or_derive(Some(&missing), Some(&missing)).unwrap_err();
     assert!(matches!(error, ConfigError::Io(_)));
+    Ok(())
   }
 }

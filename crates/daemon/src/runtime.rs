@@ -11,6 +11,7 @@ use crate::{
   extension::ExtensionManager,
   llm::LlmRouter,
   membership::{LOCAL_INCARNATION_KEY, MemberRegister, MembershipService, SwimConfig},
+  overlay::{OverlayError, OverlayNode},
   resource::ResourceMapper,
   rpc::{extension::ExtensionService, server::ClusterService},
   sync::{ClusterSync, ResourceSync},
@@ -41,6 +42,8 @@ pub enum RuntimeError {
   Extension(#[from] lycoris_extension::ExtensionError),
   #[error("failed to install crypto provider")]
   CryptoProvider,
+  #[error("overlay error: {0}")]
+  Overlay(#[from] OverlayError),
 }
 
 /// Process shutdown signal streams, registered synchronously at startup.
@@ -124,6 +127,9 @@ pub async fn run(config: DaemonConfig) -> Result<(), RuntimeError> {
 pub struct NodeHandles {
   /// The typed LLM facade over the node's extension subsystem.
   pub llm: LlmRouter,
+  /// The overlay messaging handle (admission, registry, and the planes that
+  /// move onto it in the overlay migration commits).
+  pub overlay: lycoris_overlay::LinkHandle,
 }
 
 /// Run the daemon until the supplied shutdown signal becomes `true`.
@@ -153,6 +159,17 @@ async fn run_inner(
   std::fs::create_dir_all(&data_dir)?;
   let storage = Storage::open(data_dir.join("lycoris.redb"))?;
   let node = storage.node();
+
+  // The overlay owns node identity and cluster authorization: the identity
+  // file is the single source of who this node is, and the persisted
+  // authorization registry is the single source of which cluster it belongs
+  // to. The legacy gRPC sync plane moves onto this handle in later commits.
+  let overlay = Arc::new(OverlayNode::start(
+    &data_dir,
+    node.clone(),
+    cluster_key.clone(),
+    &config.cluster.overlay_listen,
+  )?);
 
   let tls_bundle = ensure_tls_bundle(
     &config.tls.ca_cert,
@@ -255,6 +272,7 @@ async fn run_inner(
   if let Some(handles) = handles {
     let _ = handles.send(NodeHandles {
       llm: LlmRouter::new(extension_manager.clone(), storage.clone()),
+      overlay: overlay.handle(),
     });
   }
 
@@ -277,6 +295,16 @@ async fn run_inner(
   spawn_until_shutdown(&mut background, shutdown.clone(), {
     let cluster_sync = cluster_sync.clone();
     async move { cluster_sync.run_swim(DEFAULT_SWIM_INTERVAL).await }
+  });
+
+  spawn_until_shutdown(&mut background, shutdown.clone(), {
+    let overlay = overlay.clone();
+    async move { overlay.run_dispatcher().await }
+  });
+
+  spawn_until_shutdown(&mut background, shutdown.clone(), {
+    let overlay = overlay.clone();
+    async move { overlay.run_registry_gossip().await }
   });
 
   spawn_until_shutdown(&mut background, shutdown.clone(), {
@@ -331,6 +359,7 @@ async fn run_inner(
   // Stop tracked fire-and-forget work (gossip forwarding, action dispatch)
   // alongside the periodic loops.
   cluster_sync.abort_tasks().await;
+  overlay.shutdown().await;
 
   result?;
   Ok(())
@@ -423,49 +452,50 @@ mod tests {
 
   use super::apply_config_labels;
 
+  type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
   #[test]
-  fn apply_config_labels_writes_new_keys() {
-    let dir = TempDir::new().unwrap();
-    let storage = Storage::open(dir.path().join("lycoris.redb")).unwrap();
+  fn apply_config_labels_writes_new_keys() -> TestResult {
+    let dir = TempDir::new()?;
+    let storage = Storage::open(dir.path().join("lycoris.redb"))?;
     let labels = HashMap::from([("role".to_string(), "runner".to_string())]);
 
-    apply_config_labels(storage.node().local(), &labels).unwrap();
+    apply_config_labels(storage.node().local(), &labels)?;
 
-    assert_eq!(storage.node().local().labels().unwrap(), labels);
+    assert_eq!(storage.node().local().labels()?, labels);
+    Ok(())
   }
 
   #[test]
-  fn apply_config_labels_overwrites_config_keys_and_keeps_the_rest() {
-    let dir = TempDir::new().unwrap();
-    let storage = Storage::open(dir.path().join("lycoris.redb")).unwrap();
+  fn apply_config_labels_overwrites_config_keys_and_keeps_the_rest() -> TestResult {
+    let dir = TempDir::new()?;
+    let storage = Storage::open(dir.path().join("lycoris.redb"))?;
     // A value stored out-of-band (previous config, older deployment) is
     // overwritten when the config names the key and kept when it does not.
-    storage.node().local().set_label("role", "worker").unwrap();
-    storage.node().local().set_label("zone", "eu").unwrap();
+    storage.node().local().set_label("role", "worker")?;
+    storage.node().local().set_label("zone", "eu")?;
     let config_labels = HashMap::from([("role".to_string(), "runner".to_string())]);
 
-    apply_config_labels(storage.node().local(), &config_labels).unwrap();
+    apply_config_labels(storage.node().local(), &config_labels)?;
 
-    assert_eq!(
-      storage.node().local().labels().unwrap(),
-      HashMap::from([
-        ("role".to_string(), "runner".to_string()),
-        ("zone".to_string(), "eu".to_string()),
-      ])
-    );
+    let labels = storage.node().local().labels()?;
+    assert_eq!(labels.get("role").map(String::as_str), Some("runner"));
+    assert_eq!(labels.get("zone").map(String::as_str), Some("eu"));
+    Ok(())
   }
 
   #[test]
-  fn apply_config_labels_with_an_empty_map_changes_nothing() {
-    let dir = TempDir::new().unwrap();
-    let storage = Storage::open(dir.path().join("lycoris.redb")).unwrap();
-    storage.node().local().set_label("zone", "eu").unwrap();
+  fn apply_config_labels_with_an_empty_map_changes_nothing() -> TestResult {
+    let dir = TempDir::new()?;
+    let storage = Storage::open(dir.path().join("lycoris.redb"))?;
+    storage.node().local().set_label("zone", "eu")?;
 
-    apply_config_labels(storage.node().local(), &HashMap::new()).unwrap();
+    apply_config_labels(storage.node().local(), &HashMap::new())?;
 
     assert_eq!(
-      storage.node().local().labels().unwrap(),
+      storage.node().local().labels()?,
       HashMap::from([("zone".to_string(), "eu".to_string())])
     );
+    Ok(())
   }
 }

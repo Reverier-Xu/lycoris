@@ -659,13 +659,7 @@ impl LinkActor {
 
   fn next_request_id(&mut self) -> RequestId {
     self.request_nonce += 1;
-    let mut input = Vec::with_capacity(40);
-    input.extend_from_slice(self.state.node_id.as_bytes());
-    input.extend_from_slice(&self.request_nonce.to_be_bytes());
-    let hash = blake3::hash(&input);
-    let mut bytes = [0_u8; RequestId::BYTE_LENGTH];
-    bytes.copy_from_slice(&hash.as_bytes()[..RequestId::BYTE_LENGTH]);
-    RequestId::from_bytes(bytes)
+    RequestId::derive(self.state.node_id, self.request_nonce)
   }
 
   fn set_authorization(
@@ -1203,16 +1197,20 @@ mod tests {
   use super::*;
   use crate::{AuthorizationRecord, NodeId};
 
+  fn must<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
+    result.unwrap_or_else(|error| panic!("unexpected failure: {error:?}"))
+  }
+
   fn state() -> LinkState {
     let identity = NodeIdentity::generate();
-    let (cluster_id, record) = AuthorizationRecord::genesis(&identity).unwrap();
-    let registry = AuthorizationRegistry::from_records(cluster_id, [record]).unwrap();
+    let (cluster_id, record) = must(AuthorizationRecord::genesis(&identity));
+    let registry = must(AuthorizationRegistry::from_records(cluster_id, [record]));
     LinkState::new(identity.node_id(), identity.peer_id(), registry)
   }
 
   fn endpoint(address: &str) -> ConnectedPoint {
     ConnectedPoint::Dialer {
-      address: address.parse().unwrap(),
+      address: must(address.parse()),
       role_override: Endpoint::Dialer,
       port_use: PortUse::New,
     }
@@ -1255,8 +1253,8 @@ mod tests {
     assert!(quic < tcp);
 
     let listener = ConnectedPoint::Listener {
-      local_addr: "/ip4/127.0.0.1/udp/4001/quic-v1".parse().unwrap(),
-      send_back_addr: "/ip4/127.0.0.1/udp/5000/quic-v1".parse().unwrap(),
+      local_addr: must("/ip4/127.0.0.1/udp/4001/quic-v1".parse()),
+      send_back_addr: must("/ip4/127.0.0.1/udp/5000/quic-v1".parse()),
     };
     let canonical = connection_preference(local, remote, &listener);
     let non_canonical = connection_preference(remote, local, &listener);

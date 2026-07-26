@@ -13,14 +13,17 @@ version.workspace      = true
 
 [dependencies]
 async-trait.workspace        = true
+blake3.workspace             = true
 lycoris-client.workspace     = true
 lycoris-config.workspace     = true
 lycoris-core.workspace       = true
 lycoris-extension.workspace  = true
 lycoris-membership.workspace = true
+lycoris-overlay.workspace    = true
 lycoris-proto.workspace      = true
 lycoris-storage.workspace    = true
 lycoris-tls.workspace        = true
+postcard.workspace           = true
 serde.workspace              = true
 serde_json.workspace         = true
 thiserror.workspace          = true

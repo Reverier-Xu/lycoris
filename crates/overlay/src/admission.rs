@@ -185,6 +185,14 @@ impl Enrollment {
     self.registry
   }
 
+  /// Merge a registry checkpoint received from a peer, returning the number
+  /// of records that changed the local registry.
+  pub fn merge_checkpoint(
+    &mut self, records: Vec<AuthorizationRecord>,
+  ) -> Result<usize, AuthorizationError> {
+    self.registry.merge(records)
+  }
+
   pub fn quarantined(&self) -> Vec<AdmissionCandidate> {
     self
       .quarantined
@@ -379,48 +387,46 @@ pub enum AdmissionError {
 mod tests {
   use super::*;
 
-  fn sponsor() -> (NodeIdentity, AuthorizationRegistry) {
+  type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+  fn sponsor() -> TestResult<(NodeIdentity, AuthorizationRegistry)> {
     let identity = NodeIdentity::generate();
-    let (cluster_id, record) = AuthorizationRecord::genesis(&identity).unwrap();
-    let registry = AuthorizationRegistry::from_records(cluster_id, [record]).unwrap();
-    (identity, registry)
+    let (cluster_id, record) = AuthorizationRecord::genesis(&identity)?;
+    let registry = AuthorizationRegistry::from_records(cluster_id, [record])?;
+    Ok((identity, registry))
   }
 
-  fn candidate(byte: u8) -> (NodeIdentity, AdmissionCandidate) {
+  fn candidate(byte: u8) -> TestResult<(NodeIdentity, AdmissionCandidate)> {
     let identity = NodeIdentity::generate();
     let candidate =
-      AdmissionCandidate::with_nonce(identity.public_identity(), [byte; ADMISSION_NONCE_BYTES])
-        .unwrap();
-    (identity, candidate)
+      AdmissionCandidate::with_nonce(identity.public_identity(), [byte; ADMISSION_NONCE_BYTES])?;
+    Ok((identity, candidate))
   }
 
-  fn keyed_enrollment() -> (NodeIdentity, ClusterKey, Enrollment) {
-    let (sponsor, registry) = sponsor();
-    let join_key = ClusterKey::generate().unwrap();
+  fn keyed_enrollment() -> TestResult<(NodeIdentity, ClusterKey, Enrollment)> {
+    let (sponsor, registry) = sponsor()?;
+    let join_key = ClusterKey::generate()?;
     let enrollment = Enrollment::new(registry, Some(join_key.clone()));
-    (sponsor, join_key, enrollment)
+    Ok((sponsor, join_key, enrollment))
   }
 
   fn pending_candidate(
     enrollment: &mut Enrollment, sponsor: &NodeIdentity, byte: u8,
-  ) -> (NodeIdentity, AdmissionCandidate, AdmissionChallenge) {
-    let (identity, candidate) = candidate(byte);
-    let challenge = enrollment
-      .begin(candidate.clone(), &identity.peer_id(), sponsor)
-      .unwrap();
-    (identity, candidate, challenge)
+  ) -> TestResult<(NodeIdentity, AdmissionCandidate, AdmissionChallenge)> {
+    let (identity, candidate) = candidate(byte)?;
+    let challenge = enrollment.begin(candidate.clone(), &identity.peer_id(), sponsor)?;
+    Ok((identity, candidate, challenge))
   }
 
   #[test]
-  fn join_key_enrollment_admits_and_returns_a_registry_checkpoint() {
-    let (sponsor, join_key, mut enrollment) = keyed_enrollment();
+  fn join_key_enrollment_admits_and_returns_a_registry_checkpoint() -> TestResult {
+    let (sponsor, join_key, mut enrollment) = keyed_enrollment()?;
     let (candidate_identity, candidate, challenge) =
-      pending_candidate(&mut enrollment, &sponsor, 7);
-    let proof = JoinProof::create(&join_key, candidate, challenge).unwrap();
+      pending_candidate(&mut enrollment, &sponsor, 7)?;
+    let proof = JoinProof::create(&join_key, candidate, challenge)?;
 
-    let outcome = enrollment
-      .enroll_with_join_key(&proof, &candidate_identity.peer_id(), &sponsor)
-      .unwrap();
+    let outcome =
+      enrollment.enroll_with_join_key(&proof, &candidate_identity.peer_id(), &sponsor)?;
 
     assert_eq!(outcome.record().node_id(), candidate_identity.node_id());
     assert_eq!(outcome.records().len(), 2);
@@ -434,87 +440,83 @@ mod tests {
       enrollment.enroll_with_join_key(&proof, &candidate_identity.peer_id(), &sponsor),
       Err(AdmissionError::UnknownCandidate(node)) if node == candidate_identity.node_id()
     ));
+    Ok(())
   }
 
   #[test]
-  fn join_proof_contains_a_mac_but_never_the_join_key() {
-    let (sponsor, join_key, mut enrollment) = keyed_enrollment();
+  fn join_proof_contains_a_mac_but_never_the_join_key() -> TestResult {
+    let (sponsor, join_key, mut enrollment) = keyed_enrollment()?;
     let (_candidate_identity, candidate, challenge) =
-      pending_candidate(&mut enrollment, &sponsor, 13);
-    let proof = JoinProof::create(&join_key, candidate, challenge).unwrap();
-    let encoded = postcard::to_stdvec(&proof).unwrap();
+      pending_candidate(&mut enrollment, &sponsor, 13)?;
+    let proof = JoinProof::create(&join_key, candidate, challenge)?;
+    let encoded = postcard::to_stdvec(&proof)?;
 
     assert!(
       !encoded
         .windows(join_key.as_bytes().len())
         .any(|window| window == join_key.as_bytes())
     );
+    Ok(())
   }
 
   #[test]
-  fn wrong_key_and_replayed_challenge_fail_closed() {
-    let (sponsor, registry) = sponsor();
-    let join_key = ClusterKey::generate().unwrap();
-    let wrong_key = ClusterKey::generate().unwrap();
+  fn wrong_key_and_replayed_challenge_fail_closed() -> TestResult {
+    let (sponsor, registry) = sponsor()?;
+    let join_key = ClusterKey::generate()?;
+    let wrong_key = ClusterKey::generate()?;
     let mut enrollment = Enrollment::new(registry, Some(join_key.clone()));
-    let (candidate_identity, candidate) = candidate(8);
-    let first_challenge = enrollment
-      .begin(candidate.clone(), &candidate_identity.peer_id(), &sponsor)
-      .unwrap();
-    let wrong_proof =
-      JoinProof::create(&wrong_key, candidate.clone(), first_challenge.clone()).unwrap();
+    let (candidate_identity, candidate) = candidate(8)?;
+    let first_challenge =
+      enrollment.begin(candidate.clone(), &candidate_identity.peer_id(), &sponsor)?;
+    let wrong_proof = JoinProof::create(&wrong_key, candidate.clone(), first_challenge.clone())?;
 
     assert!(matches!(
       enrollment.enroll_with_join_key(&wrong_proof, &candidate_identity.peer_id(), &sponsor),
       Err(AdmissionError::InvalidJoinProof)
     ));
 
-    enrollment
-      .begin(candidate.clone(), &candidate_identity.peer_id(), &sponsor)
-      .unwrap();
-    let replayed = JoinProof::create(&join_key, candidate, first_challenge).unwrap();
+    enrollment.begin(candidate.clone(), &candidate_identity.peer_id(), &sponsor)?;
+    let replayed = JoinProof::create(&join_key, candidate, first_challenge)?;
     assert!(matches!(
       enrollment.enroll_with_join_key(&replayed, &candidate_identity.peer_id(), &sponsor),
       Err(AdmissionError::ProofMismatch(node)) if node == candidate_identity.node_id()
     ));
+    Ok(())
   }
 
   #[test]
-  fn operator_approval_admits_a_quarantined_candidate_without_a_join_key() {
-    let (sponsor, registry) = sponsor();
+  fn operator_approval_admits_a_quarantined_candidate_without_a_join_key() -> TestResult {
+    let (sponsor, registry) = sponsor()?;
     let mut enrollment = Enrollment::new(registry, None);
-    let (candidate_identity, candidate) = candidate(9);
-    enrollment
-      .begin(candidate, &candidate_identity.peer_id(), &sponsor)
-      .unwrap();
+    let (candidate_identity, candidate) = candidate(9)?;
+    enrollment.begin(candidate, &candidate_identity.peer_id(), &sponsor)?;
 
     assert_eq!(enrollment.quarantined().len(), 1);
-    let outcome = enrollment
-      .approve(candidate_identity.node_id(), &sponsor)
-      .unwrap();
+    let outcome = enrollment.approve(candidate_identity.node_id(), &sponsor)?;
 
     assert_eq!(outcome.record().node_id(), candidate_identity.node_id());
     assert!(enrollment.quarantined().is_empty());
+    Ok(())
   }
 
   #[test]
-  fn known_node_id_cannot_enter_the_join_path() {
-    let (sponsor, registry) = sponsor();
+  fn known_node_id_cannot_enter_the_join_path() -> TestResult {
+    let (sponsor, registry) = sponsor()?;
     let mut enrollment = Enrollment::new(registry, None);
-    let candidate = AdmissionCandidate::new(&sponsor).unwrap();
+    let candidate = AdmissionCandidate::new(&sponsor)?;
 
     assert!(matches!(
       enrollment.begin(candidate, &sponsor.peer_id(), &sponsor),
       Err(AdmissionError::IdentityConflict(node)) if node == sponsor.node_id()
     ));
+    Ok(())
   }
 
   #[test]
-  fn rotated_identity_material_is_not_a_new_admission() {
+  fn rotated_identity_material_is_not_a_new_admission() -> TestResult {
     let initial = NodeIdentity::generate();
     let successor =
-      NodeIdentity::generate_successor(initial.node_id(), initial.initial_public_key().to_vec())
-        .unwrap();
+      NodeIdentity::generate_successor(initial.node_id(), initial.initial_public_key().to_vec())?;
 
     assert!(matches!(
       AdmissionCandidate::with_nonce(
@@ -523,14 +525,15 @@ mod tests {
       ),
       Err(AdmissionError::NonInitialIdentity(node)) if node == initial.node_id()
     ));
+    Ok(())
   }
 
   #[test]
-  fn candidate_material_must_match_the_authenticated_transport_peer() {
-    let (sponsor, registry) = sponsor();
-    let join_key = ClusterKey::generate().unwrap();
+  fn candidate_material_must_match_the_authenticated_transport_peer() -> TestResult {
+    let (sponsor, registry) = sponsor()?;
+    let join_key = ClusterKey::generate()?;
     let mut enrollment = Enrollment::new(registry, Some(join_key.clone()));
-    let (candidate_identity, candidate) = candidate(12);
+    let (candidate_identity, candidate) = candidate(12)?;
     let other = NodeIdentity::generate();
 
     assert!(matches!(
@@ -539,26 +542,26 @@ mod tests {
     ));
     assert!(enrollment.quarantined().is_empty());
 
-    let challenge = enrollment
-      .begin(candidate.clone(), &candidate_identity.peer_id(), &sponsor)
-      .unwrap();
-    let proof = JoinProof::create(&join_key, candidate, challenge).unwrap();
+    let challenge = enrollment.begin(candidate.clone(), &candidate_identity.peer_id(), &sponsor)?;
+    let proof = JoinProof::create(&join_key, candidate, challenge)?;
     assert!(matches!(
       enrollment.enroll_with_join_key(&proof, &other.peer_id(), &sponsor),
       Err(AdmissionError::CandidatePeerMismatch(node)) if node == candidate_identity.node_id()
     ));
+    Ok(())
   }
 
   #[test]
-  fn an_unauthorized_identity_cannot_sponsor_admission() {
-    let (_, registry) = sponsor();
+  fn an_unauthorized_identity_cannot_sponsor_admission() -> TestResult {
+    let (_, registry) = sponsor()?;
     let stranger = NodeIdentity::generate();
     let mut enrollment = Enrollment::new(registry, None);
-    let (candidate_identity, candidate) = candidate(11);
+    let (candidate_identity, candidate) = candidate(11)?;
 
     assert!(matches!(
       enrollment.begin(candidate, &candidate_identity.peer_id(), &stranger),
       Err(AdmissionError::SponsorNotAuthorized(node)) if node == stranger.node_id()
     ));
+    Ok(())
   }
 }

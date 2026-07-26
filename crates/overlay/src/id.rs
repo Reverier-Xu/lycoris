@@ -68,6 +68,21 @@ impl NodeId {
   }
 }
 
+impl RequestId {
+  /// Derive a deterministic, unique-per-`(node, nonce)` request identifier.
+  /// Callers keep their own monotonic nonce, so ids never collide across
+  /// reboots and never repeat within a node.
+  pub fn derive(node_id: NodeId, nonce: u64) -> Self {
+    let mut input = Vec::with_capacity(40);
+    input.extend_from_slice(node_id.as_bytes());
+    input.extend_from_slice(&nonce.to_be_bytes());
+    let hash = blake3::hash(&input);
+    let mut bytes = [0_u8; Self::BYTE_LENGTH];
+    bytes.copy_from_slice(&hash.as_bytes()[..Self::BYTE_LENGTH]);
+    Self::from_bytes(bytes)
+  }
+}
+
 impl RecordId {
   pub(crate) fn from_signed_record(record: &[u8]) -> Self {
     Self(domain_hash(b"lycoris/authorization-record/1", record))
