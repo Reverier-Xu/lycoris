@@ -10,6 +10,7 @@
 
 mod antientropy;
 mod gossip;
+#[cfg(test)]
 pub(crate) mod peers;
 mod resource;
 mod swim;

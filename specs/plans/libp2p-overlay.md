@@ -37,7 +37,7 @@ the completed work reaches `main`.
 - [x] Add signed link-state and bounded sparse-graph request routing.
 - [x] Move membership traffic and routed probes onto the overlay.
 - [x] Move shared-resource synchronization onto `ResourceCarrier`.
-- [ ] Move extension forwarding onto `ExtensionRouter`.
+- [x] Move extension forwarding onto `ExtensionRouter`.
 - [ ] Remove `PeerPool` and node-facing gRPC while retaining client control
   gRPC.
 - [ ] Replace E2E with CLI-driven single-node, merge, partition, LAN-heal, and

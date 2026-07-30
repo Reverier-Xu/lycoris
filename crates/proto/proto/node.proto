@@ -380,6 +380,13 @@ message RegisterExtensionRequest {
   map<string, string> labels = 8;
 }
 
+message ExtensionForwardResponse {
+  oneof result {
+    ExtensionInvokeResponse success = 1;
+    string error = 2;
+  }
+}
+
 message RegisterExtensionResponse {
   bool accepted = 1;
   // Rejection reason when `accepted` is false.

@@ -13,6 +13,7 @@ pub(crate) mod resource;
 pub(crate) mod rpc;
 pub(crate) mod selector;
 pub(crate) mod sync;
+#[cfg(test)]
 pub(crate) mod transport;
 
 /// Read a persisted monotonic `u64` counter from the node meta table.

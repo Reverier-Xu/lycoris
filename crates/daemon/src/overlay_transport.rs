@@ -15,17 +15,19 @@ use lycoris_overlay::{
   NodeId, PROTOCOL_VERSION, ProtocolId,
 };
 use lycoris_proto::node::{
-  FetchRegistersRequest, FetchRegistersResponse, MerkleNodesRequest, MerkleNodesResponse,
-  MerkleRootRequest, MerkleRootResponse, NodeInfo as ProtoNodeInfo, NodeRequest, NodeResponse,
-  ProbeRequest, ProbeResponse, PushNodeRequest, PushNodeResponse, PushRegistersRequest,
-  PushRegistersResponse, Resource, StateMessage, StateResponse, SyncNodesRequest,
-  SyncNodesResponse, SyncResourcesRequest, SyncResourcesResponse, node_request, node_response,
+  ExtensionForwardResponse, ExtensionInvokeRequest, ExtensionInvokeResponse, FetchRegistersRequest,
+  FetchRegistersResponse, MerkleNodesRequest, MerkleNodesResponse, MerkleRootRequest,
+  MerkleRootResponse, NodeInfo as ProtoNodeInfo, NodeRequest, NodeResponse, ProbeRequest,
+  ProbeResponse, PushNodeRequest, PushNodeResponse, PushRegistersRequest, PushRegistersResponse,
+  Resource, StateMessage, StateResponse, SyncNodesRequest, SyncNodesResponse, SyncResourcesRequest,
+  SyncResourcesResponse, extension_forward_response, node_request, node_response,
 };
 use prost::Message as _;
 use tokio::sync::Mutex;
 
 use crate::{
-  overlay::{NodeRequestHandler, ResourceRequestHandler},
+  extension::ExtensionManager,
+  overlay::{ExtensionRequestHandler, NodeRequestHandler, ResourceRequestHandler},
   sync::{ClusterSync, RPC_TIMEOUT, ResourceSync},
 };
 
@@ -75,6 +77,12 @@ impl OverlayPool {
 
   pub(crate) fn connect_resource(&self, peer: NodeId) -> OverlayResourceClient {
     OverlayResourceClient {
+      route: self.route(peer),
+    }
+  }
+
+  pub(crate) fn connect_extension(&self, peer: NodeId) -> OverlayExtensionClient {
+    OverlayExtensionClient {
       route: self.route(peer),
     }
   }
@@ -281,6 +289,170 @@ impl OverlayPeerClient {
     decoded
       .kind
       .ok_or_else(|| unavailable("empty membership response"))
+  }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct OverlayExtensionClient {
+  route: OverlayPeerRoute,
+}
+
+impl OverlayExtensionClient {
+  async fn invoke(
+    &mut self, extension_id: &str, method: &str, payload: &[u8], origin_node_id: &str,
+  ) -> Result<ExtensionInvokeResponse, ClientError> {
+    let request = ExtensionInvokeRequest {
+      extension_id: extension_id.to_string(),
+      method: method.to_string(),
+      payload: payload.to_vec(),
+      origin_node_id: origin_node_id.to_string(),
+    };
+    let response = self
+      .route
+      .request(ProtocolId::Extension, request.encode_to_vec())
+      .await?;
+    let response = ExtensionForwardResponse::decode(response.as_slice())
+      .map_err(|error| unavailable(format!("invalid extension response: {error}")))?;
+    match response.result {
+      Some(extension_forward_response::Result::Success(response)) => Ok(response),
+      Some(extension_forward_response::Result::Error(reason)) => Err(ClientError::Rejected {
+        operation: "extension invoke".to_string(),
+        reason,
+      }),
+      None => Err(unavailable("empty extension response")),
+    }
+  }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum ExtensionPool {
+  Overlay(OverlayPool),
+  #[cfg(test)]
+  Legacy(crate::transport::PeerPool),
+}
+
+impl From<OverlayPool> for ExtensionPool {
+  fn from(pool: OverlayPool) -> Self {
+    Self::Overlay(pool)
+  }
+}
+
+#[cfg(test)]
+impl From<crate::transport::PeerPool> for ExtensionPool {
+  fn from(pool: crate::transport::PeerPool) -> Self {
+    Self::Legacy(pool)
+  }
+}
+
+impl ExtensionPool {
+  pub(crate) fn peer_key(&self, node_id: &str, address: &str) -> String {
+    match self {
+      Self::Overlay(_) => {
+        let _ = address;
+        node_id.to_string()
+      }
+      #[cfg(test)]
+      Self::Legacy(_) => address.to_string(),
+    }
+  }
+
+  pub(crate) async fn connect(&self, peer: &str) -> Result<ExtensionPeerClient, ClientError> {
+    match self {
+      Self::Overlay(pool) => {
+        let node_id = peer
+          .parse::<NodeId>()
+          .map_err(|error| unavailable(format!("invalid overlay node id: {error}")))?;
+        Ok(ExtensionPeerClient::Overlay(
+          pool.connect_extension(node_id),
+        ))
+      }
+      #[cfg(test)]
+      Self::Legacy(pool) => Ok(ExtensionPeerClient::Legacy(Box::new(
+        pool.connect(peer).await?,
+      ))),
+    }
+  }
+
+  pub(crate) async fn order_candidates(
+    &self, node: &lycoris_storage::NodeDomain, local: &str, candidates: &[String],
+  ) -> Vec<String> {
+    match self {
+      Self::Overlay(pool) => {
+        let _ = (node, local);
+        pool
+          .authorized_peers()
+          .await
+          .into_iter()
+          .filter(|peer| candidates.contains(peer))
+          .collect()
+      }
+      #[cfg(test)]
+      Self::Legacy(_) => {
+        crate::sync::peers::order_candidates(node, local, candidates, lycoris_core::now_ms())
+      }
+    }
+  }
+
+  pub(crate) fn mark_seen(&self, node: &lycoris_storage::NodeDomain, peer: &str) {
+    match self {
+      Self::Overlay(_) => {
+        let _ = (node, peer);
+      }
+      #[cfg(test)]
+      Self::Legacy(_) => {
+        if let Err(error) = node.peers().mark_seen(peer, lycoris_core::now_ms()) {
+          tracing::warn!(%peer, %error, "failed to mark peer seen");
+        }
+      }
+    }
+  }
+
+  pub(crate) async fn mark_failed(&self, node: &lycoris_storage::NodeDomain, peer: &str) {
+    match self {
+      Self::Overlay(_) => {
+        let _ = (node, peer);
+      }
+      #[cfg(test)]
+      Self::Legacy(pool) => {
+        if let Err(error) = node.peers().mark_attempt(peer, false) {
+          tracing::warn!(%peer, %error, "failed to record failed peer attempt");
+        }
+        pool.remove(peer).await;
+      }
+    }
+  }
+}
+
+#[derive(Debug)]
+pub(crate) enum ExtensionPeerClient {
+  Overlay(OverlayExtensionClient),
+  #[cfg(test)]
+  Legacy(Box<lycoris_client::PeerClient>),
+}
+
+impl ExtensionPeerClient {
+  pub(crate) async fn invoke(
+    &mut self, extension_id: &str, method: &str, payload: &[u8], origin_node_id: &str,
+  ) -> Result<ExtensionInvokeResponse, ClientError> {
+    match self {
+      Self::Overlay(client) => {
+        client
+          .invoke(extension_id, method, payload, origin_node_id)
+          .await
+      }
+      #[cfg(test)]
+      Self::Legacy(client) => {
+        client
+          .extension
+          .invoke(
+            extension_id,
+            method,
+            payload.to_vec(),
+            Some(origin_node_id.to_string()),
+          )
+          .await
+      }
+    }
   }
 }
 
@@ -600,6 +772,52 @@ impl MembershipPeerClient {
           .await?;
         Ok(())
       }
+    }
+  }
+}
+
+/// Extension forwarding handler. Overlay calls are always one-hop forwarded
+/// requests, so the manager receives a non-empty origin and cannot re-forward.
+pub(crate) struct OverlayExtensionRequestHandler {
+  manager: Arc<ExtensionManager>,
+}
+
+impl OverlayExtensionRequestHandler {
+  pub(crate) fn new(manager: Arc<ExtensionManager>) -> Self {
+    Self { manager }
+  }
+}
+
+#[async_trait::async_trait]
+impl ExtensionRequestHandler for OverlayExtensionRequestHandler {
+  async fn handle(&self, request: ExtensionInvokeRequest) -> ExtensionForwardResponse {
+    let result = if request.extension_id.is_empty() || request.method.is_empty() {
+      Err("extension id and method must not be empty".to_string())
+    } else if let Err(error) = serde_json::from_slice::<serde_json::Value>(&request.payload) {
+      Err(format!("payload is not valid JSON: {error}"))
+    } else if request.origin_node_id.is_empty() {
+      Err("forwarded extension request must carry an origin node id".to_string())
+    } else {
+      self
+        .manager
+        .invoke(
+          &request.extension_id,
+          &request.method,
+          &request.payload,
+          Some(request.origin_node_id),
+        )
+        .await
+        .map(|outcome| ExtensionInvokeResponse {
+          payload: outcome.payload,
+          executed_by: outcome.executed_by,
+        })
+        .map_err(|error| error.to_string())
+    };
+    ExtensionForwardResponse {
+      result: Some(match result {
+        Ok(response) => extension_forward_response::Result::Success(response),
+        Err(error) => extension_forward_response::Result::Error(error),
+      }),
     }
   }
 }

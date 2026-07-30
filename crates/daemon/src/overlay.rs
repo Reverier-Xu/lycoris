@@ -1,11 +1,10 @@
 //! Daemon-side bootstrap of the libp2p overlay: node identity, authorization
 //! registry, admission, registry exchange, and protocol dispatch.
 //!
-//! Membership and shared resources now ride this module's `LinkHandle`;
-//! extension forwarding remains on its legacy carrier until its focused
-//! cutover. This module owns who the node is (`NodeIdentity`), which cluster
-//! it belongs to (the persisted `AuthorizationRegistry`), and how new nodes
-//! enroll (the bounded admission protocol plus checkpoint gossip).
+//! Membership, shared resources, and extension forwarding now ride this
+//! module's `LinkHandle`. This module owns who the node is (`NodeIdentity`),
+//! which cluster it belongs to (the persisted `AuthorizationRegistry`), and how
+//! new nodes enroll (the bounded admission protocol plus checkpoint gossip).
 
 use std::{
   path::Path,
@@ -20,7 +19,10 @@ use lycoris_overlay::{
   LinkConfig, LinkError, LinkHandle, LinkRuntime, MessageKind, Multiaddr, NodeId, NodeIdentity,
   PROTOCOL_VERSION, ProtocolId,
 };
-use lycoris_proto::node::{NodeRequest, NodeResponse, SyncResourcesRequest, SyncResourcesResponse};
+use lycoris_proto::node::{
+  ExtensionForwardResponse, ExtensionInvokeRequest, NodeRequest, NodeResponse,
+  SyncResourcesRequest, SyncResourcesResponse,
+};
 use lycoris_storage::NodeDomain;
 use prost::Message as _;
 use thiserror::Error;
@@ -42,6 +44,11 @@ pub(crate) trait NodeRequestHandler: Send + Sync {
 #[async_trait::async_trait]
 pub(crate) trait ResourceRequestHandler: Send + Sync {
   async fn handle(&self, request: SyncResourcesRequest) -> SyncResourcesResponse;
+}
+
+#[async_trait::async_trait]
+pub(crate) trait ExtensionRequestHandler: Send + Sync {
+  async fn handle(&self, request: ExtensionInvokeRequest) -> ExtensionForwardResponse;
 }
 
 #[derive(Debug, Error)]
@@ -77,6 +84,7 @@ pub struct OverlayNode {
   node: NodeDomain,
   node_handler: Arc<RwLock<Option<Arc<dyn NodeRequestHandler>>>>,
   resource_handler: Arc<RwLock<Option<Arc<dyn ResourceRequestHandler>>>>,
+  extension_handler: Arc<RwLock<Option<Arc<dyn ExtensionRequestHandler>>>>,
 }
 
 impl OverlayNode {
@@ -99,6 +107,7 @@ impl OverlayNode {
       node,
       node_handler: Arc::new(RwLock::new(None)),
       resource_handler: Arc::new(RwLock::new(None)),
+      extension_handler: Arc::new(RwLock::new(None)),
     })
   }
 
@@ -129,6 +138,10 @@ impl OverlayNode {
 
   pub(crate) async fn set_resource_handler(&self, handler: Arc<dyn ResourceRequestHandler>) {
     *self.resource_handler.write().await = Some(handler);
+  }
+
+  pub(crate) async fn set_extension_handler(&self, handler: Arc<dyn ExtensionRequestHandler>) {
+    *self.extension_handler.write().await = Some(handler);
   }
 
   /// True when the registry contains only this node's genesis record, i.e.
@@ -232,6 +245,7 @@ impl OverlayNode {
         ProtocolId::Registry => self.handle_registry(inbound).await,
         ProtocolId::Membership => self.handle_membership(inbound).await,
         ProtocolId::Resource => self.handle_resource(inbound).await,
+        ProtocolId::Extension => self.handle_extension(inbound).await,
         _ => {}
       }
     }
@@ -343,6 +357,24 @@ impl OverlayNode {
     };
     let Some(handler) = self.resource_handler.read().await.clone() else {
       tracing::debug!("dropping a resource request before the handler is installed");
+      return;
+    };
+    let response = handler.handle(request).await;
+    self
+      .send_reply_payload(&inbound, response.encode_to_vec())
+      .await;
+  }
+
+  async fn handle_extension(&self, inbound: lycoris_overlay::InboundEnvelope) {
+    let request = match ExtensionInvokeRequest::decode(inbound.envelope.payload()) {
+      Ok(request) => request,
+      Err(error) => {
+        tracing::debug!(%error, "dropping a malformed extension request");
+        return;
+      }
+    };
+    let Some(handler) = self.extension_handler.read().await.clone() else {
+      tracing::debug!("dropping an extension request before the handler is installed");
       return;
     };
     let response = handler.handle(request).await;

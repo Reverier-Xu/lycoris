@@ -1,6 +1,6 @@
 use std::{collections::HashMap, path::Path, time::Duration};
 
-use lycoris_client::ClusterClient;
+use lycoris_client::{ClusterClient, ExtensionClient};
 use lycoris_config::{ClusterConfig, DaemonConfig, ExtensionsConfig, NodeConfig, TlsConfig};
 use lycoris_core::ClusterKey;
 use lycoris_daemon::{overlay_transport::OverlayPool, runtime::NodeHandles};
@@ -10,7 +10,9 @@ use lycoris_overlay::{
   LinkRuntime, MessageKind, Multiaddr, NodeId, NodeIdentity, PROTOCOL_VERSION, ProtocolId,
   RequestId,
 };
-use lycoris_proto::node::{ResourceKind, ResourceScope as ProtoResourceScope};
+use lycoris_proto::node::{
+  RegisterExtensionRequest, ResourceKind, ResourceScope as ProtoResourceScope,
+};
 use lycoris_storage::{DEFAULT_EMBEDDING_DIM, MemoryEntry, ResourceScope, Storage};
 use tempfile::TempDir;
 use tokio::sync::{oneshot, watch};
@@ -66,17 +68,38 @@ impl TestDaemon {
     wait_for_tcp_listen(&self.handles.overlay).await
   }
 
-  async fn client(&self, cluster_key: &ClusterKey) -> ClusterClient {
+  fn tls_bundle(&self) -> lycoris_tls::TlsBundle {
     let certs = self.dir.path().join("certs");
-    let tls = lycoris_tls::load_tls_bundle(
+    match lycoris_tls::load_tls_bundle(
       &certs.join("node.crt"),
       &certs.join("node.key"),
       &certs.join("ca.crt"),
-    )
-    .unwrap();
+    ) {
+      Ok(tls) => tls,
+      Err(error) => panic!("failed to load test TLS material: {error}"),
+    }
+  }
+
+  async fn client(&self, cluster_key: &ClusterKey) -> ClusterClient {
+    let tls = self.tls_bundle();
     let started = std::time::Instant::now();
     loop {
       match ClusterClient::connect(&self.control_url, &tls).await {
+        Ok(client) => return client.with_cluster_key(cluster_key.to_hex()),
+        Err(error) if started.elapsed() < WAIT => {
+          let _ = error;
+          tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Err(error) => panic!("failed to connect to {}: {error}", self.control_url),
+      }
+    }
+  }
+
+  async fn extension_client(&self, cluster_key: &ClusterKey) -> ExtensionClient {
+    let tls = self.tls_bundle();
+    let started = std::time::Instant::now();
+    loop {
+      match ExtensionClient::connect(&self.control_url, &tls).await {
         Ok(client) => return client.with_cluster_key(cluster_key.to_hex()),
         Err(error) if started.elapsed() < WAIT => {
           let _ = error;
@@ -102,7 +125,13 @@ async fn spawn_daemon(
     .map(|address| address.port())
     .unwrap();
   let control_url = format!("https://127.0.0.1:{control_port}");
-  let config = daemon_config(dir.path(), control_port, overlay_listen, join);
+  let mut config = daemon_config(dir.path(), control_port, overlay_listen, join);
+  if config.cluster.join.is_some() {
+    config
+      .node
+      .labels
+      .insert("role".to_string(), "runner".to_string());
+  }
   let (handles_tx, handles_rx) = oneshot::channel();
   let (shutdown_tx, shutdown_rx) = watch::channel(false);
   let key = cluster_key.clone();
@@ -161,6 +190,25 @@ async fn wait_for_member(client: &mut ClusterClient, node_id: NodeId) {
   assert!(
     observed.is_ok(),
     "membership did not converge within 10 seconds"
+  );
+}
+
+async fn wait_for_extension_route(client: &mut ExtensionClient, expected_node: NodeId) {
+  let observed = tokio::time::timeout(WAIT, async {
+    loop {
+      match client
+        .invoke("overlay-echo", "invoke", br#"{"ok":true}"#.to_vec(), None)
+        .await
+      {
+        Ok(response) if response.executed_by == expected_node.to_string() => return,
+        Ok(_) | Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+      }
+    }
+  })
+  .await;
+  assert!(
+    observed.is_ok(),
+    "extension route did not converge within 10 seconds"
   );
 }
 
@@ -516,6 +564,25 @@ async fn daemon_joins_an_existing_cluster_on_startup() {
   wait_for_member(&mut a_client, b_node).await;
   wait_for_member(&mut b_client, a_node).await;
   wait_for_resource(&mut b_client, "overlay-memory").await;
+
+  let mut extension_client = daemon_a.extension_client(&cluster_key).await;
+  let registered = extension_client
+    .register(RegisterExtensionRequest {
+      id: "overlay-echo".to_string(),
+      name: "overlay echo".to_string(),
+      version: 1,
+      engine: "lua".to_string(),
+      entry: "invoke".to_string(),
+      artifact: b"function invoke(method, payload) return payload end".to_vec(),
+      manifest: HashMap::from([
+        ("semver".to_string(), "1.0.0".to_string()),
+        ("selector".to_string(), r#"{"role":"runner"}"#.to_string()),
+      ]),
+      labels: HashMap::new(),
+    })
+    .await;
+  assert!(registered.is_ok(), "failed to register overlay extension");
+  wait_for_extension_route(&mut extension_client, b_node).await;
 
   // A second pool sharing the daemon handle proves request-id allocation is
   // runtime-wide rather than local to one protocol adapter.

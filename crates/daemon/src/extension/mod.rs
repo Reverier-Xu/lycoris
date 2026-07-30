@@ -51,9 +51,9 @@ use tokio::{
 
 use crate::{
   membership::{EXTENSION_ANNOTATION_PREFIX, MembershipService},
+  overlay_transport::ExtensionPool,
   selector::matches_selector,
-  sync::{ClusterSync, peers::order_candidates},
-  transport::PeerPool,
+  sync::ClusterSync,
 };
 
 /// Reconcile safety-net cadence (design section 6); the apply-path notify is
@@ -230,12 +230,10 @@ pub struct ExtensionManager {
   /// completed via [`Self::with_cluster_sync`]; unit tests leave it unset and
   /// assert the membership effect directly.
   cluster_sync: Option<ClusterSync>,
-  /// Forwarding transport for calls no local instance can serve. `Option`
-  /// (same pattern as `cluster_sync`): the pool needs the TLS bundle and the
-  /// daemon's cluster key, so it is injected via [`Self::with_peer_pool`]
-  /// after construction; unit tests that never reach the network leave it
-  /// unset.
-  pool: Option<PeerPool>,
+  /// Forwarding transport for calls no local instance can serve. The daemon
+  /// injects the overlay pool after constructing `ClusterSync`; tests that
+  /// never reach the network leave it unset.
+  pool: Option<ExtensionPool>,
   notify: Arc<Notify>,
 }
 
@@ -265,10 +263,9 @@ impl ExtensionManager {
     self
   }
 
-  /// Inject the peer channel pool used to forward invocations to capable
-  /// peers (extension system design, section 7).
-  pub fn with_peer_pool(mut self, pool: PeerPool) -> Self {
-    self.pool = Some(pool);
+  /// Inject the transport used to forward invocations to capable peers.
+  pub(crate) fn with_extension_pool(mut self, pool: impl Into<ExtensionPool>) -> Self {
+    self.pool = Some(pool.into());
     self
   }
 
@@ -427,22 +424,15 @@ impl ExtensionManager {
     };
 
     let mut last_error = None;
-    for address in &candidates {
-      match Self::forward(pool, address, id, method, payload, &local_id).await {
+    for peer in &candidates {
+      match Self::forward(pool, peer, id, method, payload, &local_id).await {
         Ok(outcome) => {
-          if let Err(error) = self.storage.node().peers().mark_seen(address, now_ms()) {
-            tracing::warn!(%address, %error, "failed to mark peer seen");
-          }
+          pool.mark_seen(self.storage.node(), peer);
           return Ok(outcome);
         }
         Err(error) => {
-          tracing::warn!(extension = %id, %address, %error, "forwarded extension call failed");
-          // Feed the failure back into the selection policy (backoff) and
-          // drop the cached channel so the next attempt reconnects.
-          if let Err(error) = self.storage.node().peers().mark_attempt(address, false) {
-            tracing::warn!(%address, %error, "failed to record failed peer attempt");
-          }
-          pool.remove(address).await;
+          tracing::warn!(extension = %id, %peer, %error, "forwarded extension call failed");
+          pool.mark_failed(self.storage.node(), peer).await;
           last_error = Some(error);
         }
       }
@@ -476,21 +466,28 @@ impl ExtensionManager {
       .filter(|register| {
         register.node_id() != local_id && register.annotations().contains_key(&capability)
       })
-      .map(|register| register.address().to_string())
+      .map(|register| match &self.pool {
+        Some(pool) => pool.peer_key(register.node_id(), register.address()),
+        None => register.node_id().to_string(),
+      })
       .collect();
-    order_candidates(self.storage.node(), &local_address, &candidates, now_ms())
+    match &self.pool {
+      Some(pool) => {
+        pool
+          .order_candidates(self.storage.node(), &local_address, &candidates)
+          .await
+      }
+      None => candidates,
+    }
   }
 
   /// Forward the call to one candidate with `origin_node_id` set to the local
   /// node, so the receiving node executes locally and never re-forwards.
   async fn forward(
-    pool: &PeerPool, address: &str, id: &str, method: &str, payload: &[u8], local_id: &str,
+    pool: &ExtensionPool, peer: &str, id: &str, method: &str, payload: &[u8], local_id: &str,
   ) -> Result<InvokeOutcome, ExtensionManagerError> {
-    let mut client = pool.connect(address).await?;
-    let response = client
-      .extension
-      .invoke(id, method, payload.to_vec(), Some(local_id.to_string()))
-      .await?;
+    let mut client = pool.connect(peer).await?;
+    let response = client.invoke(id, method, payload, local_id).await?;
     Ok(InvokeOutcome {
       payload: response.payload,
       executed_by: response.executed_by,
@@ -1042,6 +1039,12 @@ mod tests {
   async fn route_candidates_filters_and_orders_by_the_peer_policy() {
     let dir = TempDir::new().unwrap();
     let (storage, membership, manager) = test_manager(&dir);
+    let tls_dir = TempDir::new().unwrap();
+    let certs = lycoris_testkit::certs::write_test_certs(tls_dir.path(), 1);
+    let tls =
+      lycoris_tls::load_tls_bundle(&certs.nodes[0].cert, &certs.nodes[0].key, &certs.ca_cert)
+        .unwrap();
+    let manager = manager.with_extension_pool(crate::transport::PeerPool::new(&tls, None));
     // The local node advertises the capability too; it must never be its own
     // forwarding candidate.
     let _ = membership
@@ -1111,7 +1114,7 @@ mod tests {
     let tls =
       lycoris_tls::load_tls_bundle(&certs.nodes[0].cert, &certs.nodes[0].key, &certs.ca_cert)
         .unwrap();
-    let manager = manager.with_peer_pool(crate::transport::PeerPool::new(&tls, None));
+    let manager = manager.with_extension_pool(crate::transport::PeerPool::new(&tls, None));
 
     // The only candidate is unreachable (nothing listens on port 1).
     let _ = membership
