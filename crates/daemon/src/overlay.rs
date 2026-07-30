@@ -73,6 +73,8 @@ pub enum OverlayError {
   JoinRejected(String),
   #[error("join failed: {0}")]
   JoinFailed(String),
+  #[error("bootstrap address has no authorized peer identity")]
+  UnknownBootstrapPeer,
 }
 
 /// The daemon's overlay identity, registry, and messaging handle.
@@ -210,6 +212,21 @@ impl OverlayNode {
     self.node.authorization().replace(&registry.records())?;
     self.handle.adopt_authorization(registry.clone()).await?;
     self.enrollment.lock().await.adopt_registry(registry);
+    Ok(())
+  }
+
+  /// Redial a persisted sponsor after restart using its authorized peer id.
+  pub(crate) async fn reconnect(&self, address: Multiaddr) -> Result<(), OverlayError> {
+    let peer_id = address.iter().find_map(|protocol| match protocol {
+      lycoris_overlay::MultiaddrProtocol::P2p(peer_id) => Some(peer_id),
+      _ => None,
+    });
+    let peer_id = peer_id.ok_or(OverlayError::UnknownBootstrapPeer)?;
+    let registry = self.enrollment.lock().await.registry().clone();
+    let node_id = registry
+      .node_for_peer(&peer_id)
+      .ok_or(OverlayError::UnknownBootstrapPeer)?;
+    self.handle.dial(node_id, address).await?;
     Ok(())
   }
 

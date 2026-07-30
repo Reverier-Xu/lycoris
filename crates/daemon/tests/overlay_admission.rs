@@ -110,10 +110,11 @@ impl TestDaemon {
     }
   }
 
-  async fn stop(self) {
+  async fn stop(self) -> TempDir {
     let _ = self.shutdown.send(true);
     let stopped = tokio::time::timeout(WAIT, self.task).await;
     assert!(stopped.is_ok(), "daemon did not shut down cleanly");
+    self.dir
   }
 }
 
@@ -590,6 +591,22 @@ async fn daemon_joins_an_existing_cluster_on_startup() {
   let mut peer = pool.connect(a_node);
   assert!(peer.probe(3, "").await.unwrap().ack);
 
-  daemon_b.stop().await;
+  let b_dir = daemon_b.stop().await;
+  let restarted_b = spawn_daemon(
+    b_dir,
+    vec!["/ip4/127.0.0.1/tcp/0".to_string()],
+    Some(format!("{a_address}/p2p/{a_peer}")),
+    &cluster_key,
+  )
+  .await;
+  assert_eq!(restarted_b.node_id(), b_node);
+  restarted_b
+    .handles
+    .overlay
+    .wait_connected(a_node, WAIT)
+    .await
+    .unwrap();
+
+  restarted_b.stop().await;
   daemon_a.stop().await;
 }

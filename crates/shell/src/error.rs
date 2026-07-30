@@ -39,12 +39,8 @@ pub(crate) enum ShellError {
   UnknownScope(String),
   #[error("failed to register node: {0}")]
   Register(lycoris_client::ClientError),
-  #[error("failed to join cluster: {0}")]
-  Join(lycoris_client::ClientError),
   #[error("failed to leave cluster: {0}")]
   Leave(lycoris_client::ClientError),
-  #[error("failed to set primary endpoint: {0}")]
-  SetPrimary(lycoris_client::ClientError),
   #[error("cluster key error: {0}")]
   ClusterKey(#[from] lycoris_core::ClusterKeyError),
   #[error("no cluster key found; run 'lycoris cluster init' first")]

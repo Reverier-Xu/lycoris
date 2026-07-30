@@ -1,6 +1,6 @@
 use lycoris_client::{ClusterClient, ExtensionClient};
-use lycoris_config::{ClientConfig, DaemonConfig};
-use lycoris_core::{ClusterKey, default_cluster_key_path};
+use lycoris_config::{ClientConfig, DaemonConfig, default_daemon_config_path};
+use lycoris_core::{ClusterKey, cluster_key_path_in};
 use lycoris_proto::node::{NodeInfo, ResourceKind};
 
 use crate::error::ShellError;
@@ -85,13 +85,16 @@ pub(crate) async fn register(
 }
 
 pub(crate) fn init_cluster(key: Option<String>) -> Result<(), ShellError> {
+  let (config_path, mut config) = daemon_config_with_path()?;
   let cluster_key = match key {
     Some(hex) => ClusterKey::from_hex(hex.trim())?,
     None => ClusterKey::generate()?,
   };
 
-  let path = default_cluster_key_path();
+  let path = cluster_key_path_in(std::path::Path::new(&config.data_dir));
   cluster_key.save(&path)?;
+  config.cluster.join = None;
+  config.write_to_file(config_path)?;
   tracing::info!(
     key = %cluster_key.to_hex(),
     path = %path.display(),
@@ -101,45 +104,37 @@ pub(crate) fn init_cluster(key: Option<String>) -> Result<(), ShellError> {
 }
 
 #[tracing::instrument(name = "join_cluster", skip_all, fields(%peer))]
-pub(crate) async fn join_cluster(
-  client_config: &ClientConfig, peer: String, key: Option<String>,
+pub(crate) fn join_cluster(peer: String, key: Option<String>) -> Result<(), ShellError> {
+  let (config_path, _) = daemon_config_with_path()?;
+  configure_join(&config_path, peer, key)
+}
+
+fn configure_join(
+  config_path: &std::path::Path, peer: String, key: Option<String>,
 ) -> Result<(), ShellError> {
-  let key = resolve_key(client_config, key)?;
-  let daemon_config = DaemonConfig::load(None)?;
-  let tls = lycoris_tls::load_tls_bundle(
-    &client_config.cert,
-    &client_config.key,
-    &client_config.ca_cert,
-  )?;
-  let mut client = ClusterClient::connect(&peer, &tls)
-    .await
-    .map_err(|source| ShellError::Connect {
-      address: peer.clone(),
-      source,
-    })?
-    .with_cluster_key(key);
+  let address: lycoris_overlay::Multiaddr = peer
+    .parse()
+    .map_err(|_| ShellError::setup("join peer must be a valid libp2p multiaddr"))?;
+  let canonical = address.to_string();
+  let mut suffix = canonical.rsplit('/');
+  let has_peer_suffix =
+    suffix.next().is_some_and(|peer| !peer.is_empty()) && suffix.next() == Some("p2p");
+  if !has_peer_suffix {
+    return Err(ShellError::setup("join peer must end in /p2p/<peer-id>"));
+  }
 
-  let node_id = configured_node_id(&daemon_config)?;
-  let node = NodeInfo::new(
-    node_id.clone(),
-    daemon_config.node.address.clone(),
-    std::collections::HashMap::new(),
-    std::collections::HashMap::new(),
-  );
-
-  client.join(node).await.map_err(ShellError::Join)?;
-
-  let mut local_client = connect_cluster(client_config).await?;
-  local_client
-    .set_primary_endpoint(&peer)
-    .await
-    .map_err(ShellError::SetPrimary)?;
-
-  tracing::info!(
-    %node_id,
-    %peer,
-    "node joined cluster"
-  );
+  let mut config = DaemonConfig::from_file(config_path)?;
+  let key_path = cluster_key_path_in(std::path::Path::new(&config.data_dir));
+  let cluster_key = match key {
+    Some(hex) => ClusterKey::from_hex(hex.trim())?,
+    None => ClusterKey::load(&key_path)?,
+  };
+  // Persist the secret first. A crash before the config write leaves the node
+  // standalone; the reverse ordering could start a join without its key.
+  cluster_key.save(&key_path)?;
+  config.cluster.join = Some(canonical.clone());
+  config.write_to_file(config_path)?;
+  tracing::info!(peer = %canonical, "overlay join configured; restart the daemon to enroll");
   Ok(())
 }
 
@@ -154,13 +149,51 @@ pub(crate) async fn leave_cluster(client_config: &ClientConfig) -> Result<(), Sh
 }
 
 pub(crate) fn show_key() -> Result<(), ShellError> {
-  let path = default_cluster_key_path();
+  let (_, config) = daemon_config_with_path()?;
+  let path = cluster_key_path_in(std::path::Path::new(&config.data_dir));
   if !path.is_file() {
     return Err(ShellError::ClusterKeyNotFound);
   }
 
   let key = ClusterKey::load(&path)?;
   tracing::info!(key = %key.to_hex(), "cluster key");
+  Ok(())
+}
+
+fn daemon_config_with_path() -> Result<(std::path::PathBuf, DaemonConfig), ShellError> {
+  let path = default_daemon_config_path().ok_or(lycoris_config::ConfigError::NotFound)?;
+  let config = DaemonConfig::from_file(&path)?;
+  Ok((path, config))
+}
+
+pub(crate) fn show_identity(json: bool) -> Result<(), ShellError> {
+  let (_, config) = daemon_config_with_path()?;
+  let identity = lycoris_overlay::NodeIdentity::load(
+    std::path::Path::new(&config.data_dir).join("node.identity"),
+  )?;
+  let peer_id = identity.peer_id().to_string();
+  let addresses: Vec<String> = config
+    .cluster
+    .overlay_listen
+    .iter()
+    .map(|address| format!("{address}/p2p/{peer_id}"))
+    .collect();
+  if json {
+    println!(
+      "{}",
+      serde_json::json!({
+        "node_id": identity.node_id().to_string(),
+        "peer_id": peer_id,
+        "join_addresses": addresses,
+      })
+    );
+  } else {
+    println!("node id: {}", identity.node_id());
+    println!("peer id: {peer_id}");
+    for address in addresses {
+      println!("join address: {address}");
+    }
+  }
   Ok(())
 }
 
@@ -275,5 +308,68 @@ fn local_node_labels() -> std::collections::HashMap<String, String> {
       tracing::warn!(%error, "failed to load daemon config, local selector matches will not be marked");
       std::collections::HashMap::new()
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use lycoris_config::{ClusterConfig, ExtensionsConfig, NodeConfig, TlsConfig};
+  use tempfile::TempDir;
+
+  use super::*;
+
+  fn test_config(data_dir: &std::path::Path) -> DaemonConfig {
+    DaemonConfig {
+      node: NodeConfig {
+        id: "node".to_string(),
+        address: "https://127.0.0.1:7796".to_string(),
+        labels: std::collections::HashMap::new(),
+      },
+      cluster: ClusterConfig {
+        listen_address: "127.0.0.1:7796".to_string(),
+        bootstrap_peers: Vec::new(),
+        overlay_listen: vec!["/ip4/127.0.0.1/tcp/7797".to_string()],
+        join: None,
+      },
+      tls: TlsConfig {
+        ca_cert: "ca.crt".to_string(),
+        ca_key: "ca.key".to_string(),
+        cert: "node.crt".to_string(),
+        key: "node.key".to_string(),
+      },
+      data_dir: data_dir.to_string_lossy().to_string(),
+      extensions: ExtensionsConfig::default(),
+    }
+  }
+
+  #[test]
+  fn configure_join_persists_the_target_key_and_multiaddr() -> Result<(), Box<dyn std::error::Error>>
+  {
+    let dir = TempDir::new()?;
+    let config_path = dir.path().join("lycoris.conf");
+    let data_dir = dir.path().join("data");
+    test_config(&data_dir).write_to_file(&config_path)?;
+    let sponsor = lycoris_overlay::NodeIdentity::generate();
+    let peer = format!("/ip4/127.0.0.1/tcp/9000/p2p/{}", sponsor.peer_id());
+    let key = ClusterKey::generate()?;
+
+    configure_join(&config_path, peer.clone(), Some(key.to_hex()))?;
+
+    let loaded = DaemonConfig::from_file(&config_path)?;
+    assert_eq!(loaded.cluster.join.as_deref(), Some(peer.as_str()));
+    assert_eq!(ClusterKey::load(cluster_key_path_in(&data_dir))?, key);
+    Ok(())
+  }
+
+  #[test]
+  fn configure_join_rejects_control_plane_urls() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new()?;
+    let error = configure_join(
+      &dir.path().join("missing.conf"),
+      "https://127.0.0.1:7796".to_string(),
+      None,
+    );
+    assert!(error.is_err());
+    Ok(())
   }
 }

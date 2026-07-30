@@ -171,18 +171,20 @@ async fn run_inner(
     &config.cluster.overlay_listen,
   )?);
 
-  // Join an existing cluster before any sync plane starts: enrollment adopts
-  // the sponsor's authorization registry, and every later plane inherits it.
-  if let Some(join_address) = &config.cluster.join
-    && overlay.registry_is_solo().await
-  {
-    let key = cluster_key.as_ref().ok_or_else(|| {
-      OverlayError::JoinFailed("joining a cluster requires the cluster key".to_string())
-    })?;
+  // A solo node enrolls through the sponsor; an already-enrolled node uses
+  // the same persisted address as its explicit WAN restart dial.
+  if let Some(join_address) = &config.cluster.join {
     let address: lycoris_overlay::Multiaddr = join_address
       .parse()
       .map_err(|_| OverlayError::InvalidListenAddress(join_address.clone()))?;
-    overlay.join(address, key).await?;
+    if overlay.registry_is_solo().await {
+      let key = cluster_key.as_ref().ok_or_else(|| {
+        OverlayError::JoinFailed("joining a cluster requires the cluster key".to_string())
+      })?;
+      overlay.join(address, key).await?;
+    } else {
+      overlay.reconnect(address).await?;
+    }
   }
 
   let node_id = overlay.node_id().to_string();

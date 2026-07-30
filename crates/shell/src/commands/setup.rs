@@ -246,6 +246,21 @@ fn bootstrap_node_assets(
     tracing::info!(path = %config_path.display(), "config file already exists, skipping");
     return Ok(());
   }
+  let overlay_port = port
+    .checked_add(1)
+    .ok_or_else(|| ShellError::setup("control port leaves no port for the overlay"))?;
+  let authority = advertise_addr
+    .strip_prefix("https://")
+    .ok_or_else(|| ShellError::setup("advertise address must use https"))?;
+  let (host, _) = authority
+    .rsplit_once(':')
+    .ok_or_else(|| ShellError::setup("advertise address must include a port"))?;
+  let host = host.trim_matches(['[', ']']);
+  let address_prefix = match host.parse::<std::net::IpAddr>() {
+    Ok(std::net::IpAddr::V4(address)) => format!("/ip4/{address}"),
+    Ok(std::net::IpAddr::V6(address)) => format!("/ip6/{address}"),
+    Err(_) => format!("/dns/{host}"),
+  };
   let daemon_config = DaemonConfig {
     node: lycoris_config::NodeConfig {
       id: node_id.to_string(),
@@ -255,7 +270,10 @@ fn bootstrap_node_assets(
     cluster: lycoris_config::ClusterConfig {
       listen_address: format!("0.0.0.0:{port}"),
       bootstrap_peers: Vec::new(),
-      overlay_listen: Vec::new(),
+      overlay_listen: vec![
+        format!("{address_prefix}/tcp/{overlay_port}"),
+        format!("{address_prefix}/udp/{overlay_port}/quic-v1"),
+      ],
       join: None,
     },
     tls: lycoris_config::TlsConfig {

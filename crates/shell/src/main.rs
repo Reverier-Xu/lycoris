@@ -57,6 +57,7 @@ async fn dispatch(command: Command) -> Result<(), ShellError> {
 async fn dispatch_cluster(command: ClusterCommand) -> Result<(), ShellError> {
   match command {
     ClusterCommand::Init { key } => commands::cluster::init_cluster(key),
+    ClusterCommand::Identity { json } => commands::cluster::show_identity(json),
     ClusterCommand::Key => commands::cluster::show_key(),
     ClusterCommand::Get {
       resource,
@@ -71,10 +72,7 @@ async fn dispatch_cluster(command: ClusterCommand) -> Result<(), ShellError> {
       let config = ClientConfig::load_default()?;
       commands::cluster::register(&config, id, address, key).await
     }
-    ClusterCommand::Join { peer, key } => {
-      let config = ClientConfig::load_default()?;
-      commands::cluster::join_cluster(&config, peer, key).await
-    }
+    ClusterCommand::Join { peer, key } => commands::cluster::join_cluster(peer, key),
     ClusterCommand::Leave => {
       let config = ClientConfig::load_default()?;
       commands::cluster::leave_cluster(&config).await

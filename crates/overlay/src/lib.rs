@@ -21,7 +21,7 @@ pub use authorization::{
 pub use codec::{FrameError, decode_frame, encode_frame};
 pub use id::{ClusterId, NodeId, ParseIdentifierError, RecordId, RequestId};
 pub use identity::{IdentityError, NodeIdentity, PublicIdentity};
-pub use libp2p::{Multiaddr, PeerId};
+pub use libp2p::{Multiaddr, PeerId, multiaddr::Protocol as MultiaddrProtocol};
 pub use link::{
   InboundEnvelope, InboundToken, LinkConfig, LinkError, LinkHandle, LinkRuntime, LinkSnapshot,
 };

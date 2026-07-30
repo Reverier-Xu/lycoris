@@ -76,8 +76,7 @@ pub(crate) enum ClusterCommand {
     key: Option<String>,
   },
 
-  /// Initialize this machine as a new cluster, generating or storing a
-  /// cluster key.
+  /// Initialize this machine as a new standalone cluster.
   Init {
     /// Optional 32-byte cluster key in hex. If omitted, a random key is
     /// generated.
@@ -85,15 +84,22 @@ pub(crate) enum ClusterCommand {
     key: Option<String>,
   },
 
-  /// Join an existing cluster by contacting one of its members.
+  /// Configure this daemon to join an existing overlay cluster on next start.
   Join {
-    /// Address of an existing cluster member.
+    /// Sponsor libp2p multiaddr ending in `/p2p/<peer-id>`.
     #[arg(long)]
     peer: String,
     /// Cluster shared key in hex. Falls back to the local cluster key file
     /// when omitted, so the key does not have to appear on the command line.
     #[arg(long)]
     key: Option<String>,
+  },
+
+  /// Print this node's derived overlay identity and join addresses.
+  Identity {
+    /// Emit a stable JSON document.
+    #[arg(long)]
+    json: bool,
   },
 
   /// Leave the cluster.
