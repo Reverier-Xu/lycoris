@@ -1,9 +1,9 @@
 //! Daemon-side bootstrap of the libp2p overlay: node identity, authorization
 //! registry, admission, registry exchange, and protocol dispatch.
 //!
-//! Membership now rides this module's `LinkHandle`; shared resources and
-//! extension forwarding remain on their legacy carriers until their focused
-//! cutovers. This module owns who the node is (`NodeIdentity`), which cluster
+//! Membership and shared resources now ride this module's `LinkHandle`;
+//! extension forwarding remains on its legacy carrier until its focused
+//! cutover. This module owns who the node is (`NodeIdentity`), which cluster
 //! it belongs to (the persisted `AuthorizationRegistry`), and how new nodes
 //! enroll (the bounded admission protocol plus checkpoint gossip).
 
@@ -20,7 +20,7 @@ use lycoris_overlay::{
   LinkConfig, LinkError, LinkHandle, LinkRuntime, MessageKind, Multiaddr, NodeId, NodeIdentity,
   PROTOCOL_VERSION, ProtocolId,
 };
-use lycoris_proto::node::{NodeRequest, NodeResponse};
+use lycoris_proto::node::{NodeRequest, NodeResponse, SyncResourcesRequest, SyncResourcesResponse};
 use lycoris_storage::NodeDomain;
 use prost::Message as _;
 use thiserror::Error;
@@ -37,6 +37,11 @@ const JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 #[async_trait::async_trait]
 pub(crate) trait NodeRequestHandler: Send + Sync {
   async fn handle(&self, request: NodeRequest) -> NodeResponse;
+}
+
+#[async_trait::async_trait]
+pub(crate) trait ResourceRequestHandler: Send + Sync {
+  async fn handle(&self, request: SyncResourcesRequest) -> SyncResourcesResponse;
 }
 
 #[derive(Debug, Error)]
@@ -71,6 +76,7 @@ pub struct OverlayNode {
   enrollment: Arc<Mutex<Enrollment>>,
   node: NodeDomain,
   node_handler: Arc<RwLock<Option<Arc<dyn NodeRequestHandler>>>>,
+  resource_handler: Arc<RwLock<Option<Arc<dyn ResourceRequestHandler>>>>,
 }
 
 impl OverlayNode {
@@ -92,6 +98,7 @@ impl OverlayNode {
       enrollment: Arc::new(Mutex::new(Enrollment::new(registry, cluster_key))),
       node,
       node_handler: Arc::new(RwLock::new(None)),
+      resource_handler: Arc::new(RwLock::new(None)),
     })
   }
 
@@ -118,6 +125,10 @@ impl OverlayNode {
   /// exists).
   pub(crate) async fn set_node_handler(&self, handler: Arc<dyn NodeRequestHandler>) {
     *self.node_handler.write().await = Some(handler);
+  }
+
+  pub(crate) async fn set_resource_handler(&self, handler: Arc<dyn ResourceRequestHandler>) {
+    *self.resource_handler.write().await = Some(handler);
   }
 
   /// True when the registry contains only this node's genesis record, i.e.
@@ -213,15 +224,14 @@ impl OverlayNode {
     }
   }
 
-  /// Dispatch inbound overlay envelopes: the bounded admission protocol and
-  /// registry checkpoints. Membership, resource, and extension traffic move
-  /// here in their own commits; until then those envelopes are dropped.
+  /// Dispatch inbound overlay envelopes to the installed plane handlers.
   pub async fn run_dispatcher(&self) {
     while let Some(inbound) = self.handle.next_inbound().await {
       match inbound.envelope.header().protocol {
         ProtocolId::Admission => self.handle_admission(inbound).await,
         ProtocolId::Registry => self.handle_registry(inbound).await,
         ProtocolId::Membership => self.handle_membership(inbound).await,
+        ProtocolId::Resource => self.handle_resource(inbound).await,
         _ => {}
       }
     }
@@ -315,6 +325,24 @@ impl OverlayNode {
     let handler = self.node_handler.read().await.clone();
     let Some(handler) = handler else {
       tracing::debug!("dropping a membership request before the handler is installed");
+      return;
+    };
+    let response = handler.handle(request).await;
+    self
+      .send_reply_payload(&inbound, response.encode_to_vec())
+      .await;
+  }
+
+  async fn handle_resource(&self, inbound: lycoris_overlay::InboundEnvelope) {
+    let request = match SyncResourcesRequest::decode(inbound.envelope.payload()) {
+      Ok(request) => request,
+      Err(error) => {
+        tracing::debug!(%error, "dropping a malformed resource request");
+        return;
+      }
+    };
+    let Some(handler) = self.resource_handler.read().await.clone() else {
+      tracing::debug!("dropping a resource request before the handler is installed");
       return;
     };
     let response = handler.handle(request).await;

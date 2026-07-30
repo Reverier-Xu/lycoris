@@ -4,10 +4,9 @@
 //! (membership anti-entropy and the SWIM failure detector), SWIM action
 //! dispatch ([`swim`]), gossip fan-out with deduplication ([`gossip`]), and
 //! Merkle anti-entropy plus the compatibility full-sync path
-//! ([`antientropy`]). Membership requests use the routed overlay adapter;
-//! resource anti-entropy keeps a separate legacy `PeerPool` until its next
-//! cutover. Endpoint ranking for that remaining legacy plane lives in
-//! [`peers`].
+//! ([`antientropy`]). Membership and resource requests use routed overlay
+//! adapters. Endpoint ranking in [`peers`] remains for extension forwarding
+//! until its cutover and for test-only legacy transport fixtures.
 
 mod antientropy;
 mod gossip;
@@ -39,9 +38,8 @@ pub(crate) const RPC_TIMEOUT: Duration = Duration::from_secs(3);
 ///
 /// `ClusterSync` owns the background loops and the inbound business logic
 /// behind the `Sync`/`Membership` RPCs (served in `crate::rpc::cluster`).
-/// Membership requests use `MembershipPool` (overlay in production); shared
-/// resources retain their separate legacy pool until the resource-plane
-/// cutover. The storage node domain remains the source for CRDT persistence.
+/// Membership and resource requests use overlay-backed pools in production;
+/// the storage node domain remains the source for CRDT persistence.
 #[derive(Debug, Clone)]
 pub struct ClusterSync {
   local_node_id: String,

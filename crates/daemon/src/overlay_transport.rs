@@ -18,15 +18,15 @@ use lycoris_proto::node::{
   FetchRegistersRequest, FetchRegistersResponse, MerkleNodesRequest, MerkleNodesResponse,
   MerkleRootRequest, MerkleRootResponse, NodeInfo as ProtoNodeInfo, NodeRequest, NodeResponse,
   ProbeRequest, ProbeResponse, PushNodeRequest, PushNodeResponse, PushRegistersRequest,
-  PushRegistersResponse, StateMessage, StateResponse, SyncNodesRequest, SyncNodesResponse,
-  node_request, node_response,
+  PushRegistersResponse, Resource, StateMessage, StateResponse, SyncNodesRequest,
+  SyncNodesResponse, SyncResourcesRequest, SyncResourcesResponse, node_request, node_response,
 };
 use prost::Message as _;
 use tokio::sync::Mutex;
 
 use crate::{
-  overlay::NodeRequestHandler,
-  sync::{ClusterSync, RPC_TIMEOUT},
+  overlay::{NodeRequestHandler, ResourceRequestHandler},
+  sync::{ClusterSync, RPC_TIMEOUT, ResourceSync},
 };
 
 const ROUTE_HOPS: u8 = 8;
@@ -69,6 +69,18 @@ impl OverlayPool {
   /// overlay routes each request when it is sent.
   pub fn connect(&self, peer: NodeId) -> OverlayPeerClient {
     OverlayPeerClient {
+      route: self.route(peer),
+    }
+  }
+
+  pub(crate) fn connect_resource(&self, peer: NodeId) -> OverlayResourceClient {
+    OverlayResourceClient {
+      route: self.route(peer),
+    }
+  }
+
+  fn route(&self, peer: NodeId) -> OverlayPeerRoute {
+    OverlayPeerRoute {
       handle: self.handle.clone(),
       local: self.local,
       cluster_id: self.cluster_id,
@@ -84,7 +96,7 @@ impl OverlayPool {
     self.cluster_id
   }
 
-  async fn authorized_peers(&self) -> Vec<String> {
+  pub(crate) async fn authorized_peers(&self) -> Vec<String> {
     let Some(enrollment) = &self.enrollment else {
       return self
         .handle
@@ -126,13 +138,38 @@ impl OverlayPool {
   }
 }
 
-/// Membership-plane client for one overlay peer.
 #[derive(Debug, Clone)]
-pub struct OverlayPeerClient {
+struct OverlayPeerRoute {
   handle: LinkHandle,
   local: NodeId,
   cluster_id: ClusterId,
   peer: NodeId,
+}
+
+impl OverlayPeerRoute {
+  async fn request(&self, protocol: ProtocolId, payload: Vec<u8>) -> Result<Vec<u8>, ClientError> {
+    let header = EnvelopeHeader {
+      version: PROTOCOL_VERSION,
+      cluster_id: self.cluster_id,
+      request_id: self.handle.next_request_id(),
+      source: self.local,
+      destination: self.peer,
+      protocol,
+      kind: MessageKind::Request,
+      deadline_unix_ms: lycoris_core::now_ms() + RPC_TIMEOUT.as_millis() as i64,
+      remaining_hops: ROUTE_HOPS,
+    };
+    let envelope = Envelope::new(header, payload)
+      .map_err(|error| unavailable(format!("overlay request too large: {error}")))?;
+    let response = self.handle.request(envelope).await.map_err(unavailable)?;
+    Ok(response.payload().to_vec())
+  }
+}
+
+/// Membership-plane client for one overlay peer.
+#[derive(Debug, Clone)]
+pub struct OverlayPeerClient {
+  route: OverlayPeerRoute,
 }
 
 impl OverlayPeerClient {
@@ -235,25 +272,108 @@ impl OverlayPeerClient {
 
   async fn call(&mut self, kind: node_request::Kind) -> Result<node_response::Kind, ClientError> {
     let request = NodeRequest { kind: Some(kind) };
-    let header = EnvelopeHeader {
-      version: PROTOCOL_VERSION,
-      cluster_id: self.cluster_id,
-      request_id: self.handle.next_request_id(),
-      source: self.local,
-      destination: self.peer,
-      protocol: ProtocolId::Membership,
-      kind: MessageKind::Request,
-      deadline_unix_ms: lycoris_core::now_ms() + RPC_TIMEOUT.as_millis() as i64,
-      remaining_hops: ROUTE_HOPS,
-    };
-    let envelope = Envelope::new(header, request.encode_to_vec())
-      .map_err(|error| unavailable(format!("membership request too large: {error}")))?;
-    let response = self.handle.request(envelope).await.map_err(unavailable)?;
-    let decoded = NodeResponse::decode(response.payload())
+    let response = self
+      .route
+      .request(ProtocolId::Membership, request.encode_to_vec())
+      .await?;
+    let decoded = NodeResponse::decode(response.as_slice())
       .map_err(|error| unavailable(format!("invalid membership response: {error}")))?;
     decoded
       .kind
       .ok_or_else(|| unavailable("empty membership response"))
+  }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct OverlayResourceClient {
+  route: OverlayPeerRoute,
+}
+
+impl OverlayResourceClient {
+  async fn sync_resources(
+    &mut self, resources: Vec<Resource>,
+  ) -> Result<Vec<Resource>, ClientError> {
+    let request = SyncResourcesRequest { resources };
+    let response = self
+      .route
+      .request(ProtocolId::Resource, request.encode_to_vec())
+      .await?;
+    Ok(
+      SyncResourcesResponse::decode(response.as_slice())
+        .map_err(|error| unavailable(format!("invalid resource response: {error}")))?
+        .resources,
+    )
+  }
+}
+
+/// Resource transport. Production uses the overlay; the legacy branch keeps
+/// the existing isolated unit fixtures without shipping a runtime fallback.
+#[derive(Debug, Clone)]
+pub(crate) enum ResourcePool {
+  Overlay(OverlayPool),
+  #[cfg(test)]
+  Legacy(crate::transport::PeerPool),
+}
+
+impl From<OverlayPool> for ResourcePool {
+  fn from(pool: OverlayPool) -> Self {
+    Self::Overlay(pool)
+  }
+}
+
+#[cfg(test)]
+impl From<crate::transport::PeerPool> for ResourcePool {
+  fn from(pool: crate::transport::PeerPool) -> Self {
+    Self::Legacy(pool)
+  }
+}
+
+impl ResourcePool {
+  pub(crate) async fn connect(&self, peer: &str) -> Result<ResourcePeerClient, ClientError> {
+    match self {
+      Self::Overlay(pool) => {
+        let node_id = peer
+          .parse::<NodeId>()
+          .map_err(|error| unavailable(format!("invalid overlay node id: {error}")))?;
+        Ok(ResourcePeerClient::Overlay(pool.connect_resource(node_id)))
+      }
+      #[cfg(test)]
+      Self::Legacy(pool) => Ok(ResourcePeerClient::Legacy(Box::new(
+        pool.connect(peer).await?,
+      ))),
+    }
+  }
+
+  pub(crate) async fn candidates(
+    &self, node: &lycoris_storage::NodeDomain, local: &str,
+  ) -> Vec<String> {
+    match self {
+      Self::Overlay(pool) => {
+        let _ = (node, local);
+        pool.authorized_peers().await
+      }
+      #[cfg(test)]
+      Self::Legacy(_) => crate::sync::peers::targets(node, local, lycoris_core::now_ms()),
+    }
+  }
+}
+
+#[derive(Debug)]
+pub(crate) enum ResourcePeerClient {
+  Overlay(OverlayResourceClient),
+  #[cfg(test)]
+  Legacy(Box<lycoris_client::PeerClient>),
+}
+
+impl ResourcePeerClient {
+  pub(crate) async fn sync_resources(
+    &mut self, resources: Vec<Resource>,
+  ) -> Result<Vec<Resource>, ClientError> {
+    match self {
+      Self::Overlay(client) => client.sync_resources(resources).await,
+      #[cfg(test)]
+      Self::Legacy(client) => client.sync.sync_resources(resources).await,
+    }
   }
 }
 
@@ -480,6 +600,26 @@ impl MembershipPeerClient {
           .await?;
         Ok(())
       }
+    }
+  }
+}
+
+/// Resource-plane request handler backed by `ResourceSync`'s merge boundary.
+pub(crate) struct OverlayResourceRequestHandler {
+  sync: ResourceSync,
+}
+
+impl OverlayResourceRequestHandler {
+  pub(crate) fn new(sync: ResourceSync) -> Self {
+    Self { sync }
+  }
+}
+
+#[async_trait::async_trait]
+impl ResourceRequestHandler for OverlayResourceRequestHandler {
+  async fn handle(&self, request: SyncResourcesRequest) -> SyncResourcesResponse {
+    SyncResourcesResponse {
+      resources: self.sync.merge_and_list_shared(request.resources).await,
     }
   }
 }

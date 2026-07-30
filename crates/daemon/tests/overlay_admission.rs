@@ -11,6 +11,7 @@ use lycoris_overlay::{
   RequestId,
 };
 use lycoris_proto::node::{ResourceKind, ResourceScope as ProtoResourceScope};
+use lycoris_storage::{DEFAULT_EMBEDDING_DIM, MemoryEntry, ResourceScope, Storage};
 use tempfile::TempDir;
 use tokio::sync::{oneshot, watch};
 
@@ -161,6 +162,45 @@ async fn wait_for_member(client: &mut ClusterClient, node_id: NodeId) {
     observed.is_ok(),
     "membership did not converge within 10 seconds"
   );
+}
+
+async fn wait_for_resource(client: &mut ClusterClient, id: &str) {
+  let observed = tokio::time::timeout(WAIT, async {
+    loop {
+      match client.get_resource(ResourceKind::Memory, id).await {
+        Ok(Some(_)) => return,
+        Ok(None) | Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+      }
+    }
+  })
+  .await;
+  assert!(
+    observed.is_ok(),
+    "resource did not converge within 10 seconds"
+  );
+}
+
+async fn seed_shared_memory(data_dir: &Path) -> Result<NodeId, Box<dyn std::error::Error>> {
+  let identity = NodeIdentity::load_or_generate(data_dir.join("node.identity"))?;
+  let content = b"overlay resource".to_vec();
+  let storage = Storage::open(data_dir.join("lycoris.redb"))?;
+  storage
+    .agent()
+    .memory()
+    .store(&MemoryEntry {
+      id: "overlay-memory".to_string(),
+      content_hash: MemoryEntry::compute_content_hash(&content),
+      content,
+      embedding: vec![0.0; DEFAULT_EMBEDDING_DIM],
+      metadata: HashMap::new(),
+      scope: ResourceScope::ClusterShared,
+      source_node_id: Some(identity.node_id().to_string()),
+      created_at_ms: 1,
+      updated_at_ms: 1,
+      version: 1,
+    })
+    .await?;
+  Ok(identity.node_id())
 }
 
 async fn wait_for_tcp_listen(handle: &LinkHandle) -> Multiaddr {
@@ -421,8 +461,11 @@ async fn membership_requests_ride_the_overlay() {
 async fn daemon_joins_an_existing_cluster_on_startup() {
   let _ = lycoris_tls::install_crypto_provider();
   let cluster_key = ClusterKey::generate().unwrap();
+  let daemon_a_dir = TempDir::new().unwrap();
+  let seeded = seed_shared_memory(daemon_a_dir.path()).await;
+  assert!(seeded.is_ok(), "failed to seed the shared resource");
   let daemon_a = spawn_daemon(
-    TempDir::new().unwrap(),
+    daemon_a_dir,
     vec!["/ip4/127.0.0.1/tcp/0".to_string()],
     None,
     &cluster_key,
@@ -472,6 +515,7 @@ async fn daemon_joins_an_existing_cluster_on_startup() {
   let mut b_client = daemon_b.client(&cluster_key).await;
   wait_for_member(&mut a_client, b_node).await;
   wait_for_member(&mut b_client, a_node).await;
+  wait_for_resource(&mut b_client, "overlay-memory").await;
 
   // A second pool sharing the daemon handle proves request-id allocation is
   // runtime-wide rather than local to one protocol adapter.

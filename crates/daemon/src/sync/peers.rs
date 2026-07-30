@@ -32,6 +32,7 @@ const FAILURE_BACKOFF_MS: i64 = 30_000;
 /// either no peers are known at all, or every known endpoint is backing off.
 /// The anti-entropy loop treats that as isolation and retries the complete
 /// seed set once per cycle (see `super::antientropy`).
+#[cfg(test)]
 pub(crate) fn targets(node: &NodeDomain, local_address: &str, now_ms: i64) -> Vec<String> {
   order_candidates(
     node,

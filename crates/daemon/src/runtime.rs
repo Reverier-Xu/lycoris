@@ -12,7 +12,7 @@ use crate::{
   llm::LlmRouter,
   membership::{LOCAL_INCARNATION_KEY, MemberRegister, MembershipService, SwimConfig},
   overlay::{OverlayError, OverlayNode},
-  overlay_transport::MembershipRequestHandler,
+  overlay_transport::{MembershipRequestHandler, OverlayResourceRequestHandler},
   resource::ResourceMapper,
   rpc::{extension::ExtensionService, server::ClusterService},
   sync::{ClusterSync, ResourceSync},
@@ -257,14 +257,16 @@ async fn run_inner(
   let mapper = ResourceMapper::new(storage.clone(), membership_service.clone())
     .with_extension_notify(extension_manager.notify());
 
+  // The overlay owns node-to-node membership and resource traffic; the
+  // remaining peer pool is isolated to extension forwarding until its cutover.
   let pool = PeerPool::new(&tls_bundle, cluster_key.as_ref().map(ClusterKey::to_hex));
-  let resources = ResourceSync::new(mapper.clone(), node.clone(), pool.clone());
-  let membership_pool = overlay.membership_pool().await;
+  let overlay_pool = overlay.membership_pool().await;
+  let resources = ResourceSync::new(mapper.clone(), node.clone(), overlay_pool.clone());
   let cluster_sync = ClusterSync::new(
     node_id,
     membership_service.clone(),
     node.clone(),
-    membership_pool,
+    overlay_pool,
     resources.clone(),
   );
   let extension_manager = Arc::new(
@@ -273,11 +275,15 @@ async fn run_inner(
       .with_peer_pool(pool),
   );
 
-  // The overlay dispatcher serves membership-plane requests through the same
-  // serve methods the gRPC services use.
+  // Install the overlay plane handlers before the dispatcher starts.
   overlay
     .set_node_handler(Arc::new(MembershipRequestHandler::new(
       cluster_sync.clone(),
+    )))
+    .await;
+  overlay
+    .set_resource_handler(Arc::new(OverlayResourceRequestHandler::new(
+      resources.clone(),
     )))
     .await;
 

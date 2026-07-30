@@ -1,31 +1,36 @@
 //! Shared-resource anti-entropy between peers.
 //!
-//! `ResourceSync` wraps the `ResourceMapper` facade and `PeerPool` so that
-//! the membership component does not need to know how shared skills, rules,
+//! `ResourceSync` wraps the `ResourceMapper` facade and an isolated resource
+//! transport so membership does not need to know how shared skills, rules,
 //! workspaces, and memories are serialized or merged.
 
 use std::time::Duration;
 
 use lycoris_client::ClientError;
-use lycoris_core::now_ms;
 use lycoris_proto::node::Resource;
 use lycoris_storage::NodeDomain;
 use tokio::time::{self, MissedTickBehavior, timeout};
 
-use super::{RPC_TIMEOUT, peers::targets};
-use crate::{resource::ResourceMapper, transport::PeerPool};
+use super::RPC_TIMEOUT;
+use crate::{overlay_transport::ResourcePool, resource::ResourceMapper};
 
 /// Drives shared-resource anti-entropy between peers.
 #[derive(Debug, Clone)]
 pub struct ResourceSync {
   mapper: ResourceMapper,
   node: NodeDomain,
-  pool: PeerPool,
+  pool: ResourcePool,
 }
 
 impl ResourceSync {
-  pub fn new(mapper: ResourceMapper, node: NodeDomain, pool: PeerPool) -> Self {
-    Self { mapper, node, pool }
+  pub(crate) fn new(
+    mapper: ResourceMapper, node: NodeDomain, pool: impl Into<ResourcePool>,
+  ) -> Self {
+    Self {
+      mapper,
+      node,
+      pool: pool.into(),
+    }
   }
 
   /// Run resource anti-entropy as an independent periodic task (D5/I3).
@@ -53,7 +58,7 @@ impl ResourceSync {
   /// membership paths; this task only logs failures so the two sync planes
   /// stay orthogonal.
   async fn sync_with_peers(&self, local_address: &str) {
-    for peer in targets(&self.node, local_address, now_ms()) {
+    for peer in self.pool.candidates(&self.node, local_address).await {
       let _ = self.sync_with_peer(&peer).await;
     }
   }
@@ -70,18 +75,18 @@ impl ResourceSync {
       }
     };
 
-    let remote_resources =
-      match timeout(RPC_TIMEOUT, client.sync.sync_resources(local_resources)).await {
-        Ok(Ok(resources)) => resources,
-        Ok(Err(error)) => {
-          tracing::warn!(%peer, %error, "resource sync rpc failed");
-          return Ok(());
-        }
-        Err(_) => {
-          tracing::warn!(%peer, "resource sync rpc timed out");
-          return Ok(());
-        }
-      };
+    let remote_resources = match timeout(RPC_TIMEOUT, client.sync_resources(local_resources)).await
+    {
+      Ok(Ok(resources)) => resources,
+      Ok(Err(error)) => {
+        tracing::warn!(%peer, %error, "resource sync rpc failed");
+        return Ok(());
+      }
+      Err(_) => {
+        tracing::warn!(%peer, "resource sync rpc timed out");
+        return Ok(());
+      }
+    };
 
     for resource in remote_resources {
       if let Err(error) = self.mapper.apply_resource(&resource).await {

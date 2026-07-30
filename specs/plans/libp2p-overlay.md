@@ -36,7 +36,7 @@ the completed work reaches `main`.
 - [x] Add relay reservations and DCUtR upgrade behavior.
 - [x] Add signed link-state and bounded sparse-graph request routing.
 - [x] Move membership traffic and routed probes onto the overlay.
-- [ ] Move shared-resource synchronization onto `ResourceCarrier`.
+- [x] Move shared-resource synchronization onto `ResourceCarrier`.
 - [ ] Move extension forwarding onto `ExtensionRouter`.
 - [ ] Remove `PeerPool` and node-facing gRPC while retaining client control
   gRPC.
