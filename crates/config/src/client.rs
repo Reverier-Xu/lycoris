@@ -145,6 +145,7 @@ mod tests {
         listen_address: "0.0.0.0:5001".to_string(),
         bootstrap_peers: vec![],
         overlay_listen: vec![],
+        join: None,
       },
       tls: TlsConfig {
         ca_cert: "ca.crt".to_string(),

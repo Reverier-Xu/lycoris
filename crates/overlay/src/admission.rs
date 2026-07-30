@@ -193,6 +193,13 @@ impl Enrollment {
     self.registry.merge(records)
   }
 
+  /// Replace the registry with the adopted cluster checkpoint after a
+  /// successful enrollment, clearing any pending quarantined candidates.
+  pub fn adopt_registry(&mut self, registry: AuthorizationRegistry) {
+    self.registry = registry;
+    self.quarantined.clear();
+  }
+
   pub fn quarantined(&self) -> Vec<AdmissionCandidate> {
     self
       .quarantined

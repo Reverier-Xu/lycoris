@@ -11,6 +11,8 @@ pub(crate) enum ShellError {
   RuntimeCreation(std::io::Error),
   #[error("failed to load configuration: {0}")]
   ConfigLoad(#[from] lycoris_config::ConfigError),
+  #[error("failed to load node identity: {0}")]
+  NodeIdentity(#[from] lycoris_overlay::IdentityError),
   #[error("failed to load client TLS material: {0}")]
   TlsLoad(#[from] lycoris_tls::TlsError),
   #[error("failed to connect to {address}: {source}")]

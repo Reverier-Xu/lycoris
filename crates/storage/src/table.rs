@@ -158,6 +158,24 @@ impl<T: Serialize + DeserializeOwned> RedbTableStorage<T> {
     Ok(())
   }
 
+  /// Atomically replace every row in this table.
+  pub(crate) fn replace_all(&self, records: Vec<(String, T)>) -> Result<(), StorageError> {
+    let encoded: Vec<_> = records
+      .into_iter()
+      .map(|(id, record)| Ok((id, Bytes(encode(&record)?))))
+      .collect::<Result<_, StorageError>>()?;
+    let write_txn = self.db.begin_write().map_err(redb_err)?;
+    {
+      let mut table = write_txn.open_table(self.table).map_err(redb_err)?;
+      table.retain(|_, _| false).map_err(redb_err)?;
+      for (id, record) in encoded {
+        table.insert(id.as_str(), record).map_err(redb_err)?;
+      }
+    }
+    write_txn.commit().map_err(redb_err)?;
+    Ok(())
+  }
+
   /// Delete the record with the given id.
   pub fn delete(&self, id: &str) -> Result<(), StorageError> {
     let write_txn = self.db.begin_write().map_err(redb_err)?;

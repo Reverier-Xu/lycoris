@@ -92,15 +92,19 @@ impl NodeIdentity {
     })
   }
 
+  pub fn load(path: impl AsRef<Path>) -> Result<Self, IdentityError> {
+    Self::decode(&std::fs::read(path)?)
+  }
+
   pub fn load_or_generate(path: impl AsRef<Path>) -> Result<Self, IdentityError> {
-    match std::fs::read(path.as_ref()) {
-      Ok(bytes) => Self::decode(&bytes),
-      Err(error) if error.kind() == io::ErrorKind::NotFound => {
+    match Self::load(path.as_ref()) {
+      Ok(identity) => Ok(identity),
+      Err(IdentityError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
         let identity = Self::generate();
         identity.save(path)?;
         Ok(identity)
       }
-      Err(error) => Err(error.into()),
+      Err(error) => Err(error),
     }
   }
 

@@ -27,6 +27,17 @@ impl AuthorizationStorage {
   pub fn records(&self) -> Result<Vec<AuthorizationRecord>, StorageError> {
     self.records.list()
   }
+
+  /// Atomically replace the persisted authorization checkpoint.
+  pub fn replace(&self, records: &[AuthorizationRecord]) -> Result<(), StorageError> {
+    self.records.replace_all(
+      records
+        .iter()
+        .cloned()
+        .map(|record| (record.id().to_string(), record))
+        .collect(),
+    )
+  }
 }
 
 #[cfg(test)]
@@ -35,6 +46,27 @@ mod tests {
   use tempfile::TempDir;
 
   use crate::Storage;
+
+  #[test]
+  fn replacement_removes_the_standalone_genesis() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new()?;
+    let storage = Storage::open(dir.path().join("lycoris.redb"))?;
+    let local = NodeIdentity::generate();
+    let (_, local_genesis) = AuthorizationRecord::genesis(&local)?;
+    storage.node().authorization().put(&local_genesis)?;
+
+    let sponsor = NodeIdentity::generate();
+    let (_, sponsor_genesis) = AuthorizationRecord::genesis(&sponsor)?;
+    storage
+      .node()
+      .authorization()
+      .replace(std::slice::from_ref(&sponsor_genesis))?;
+
+    let records = storage.node().authorization().records()?;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].id(), sponsor_genesis.id());
+    Ok(())
+  }
 
   #[test]
   fn complete_authorization_set_survives_reopen() {

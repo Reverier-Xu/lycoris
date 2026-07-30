@@ -8,6 +8,7 @@ pub(crate) mod extension;
 
 pub(crate) mod membership;
 pub(crate) mod overlay;
+pub mod overlay_transport;
 pub(crate) mod resource;
 pub(crate) mod rpc;
 pub(crate) mod selector;

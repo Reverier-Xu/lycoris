@@ -4,12 +4,10 @@
 //! (membership anti-entropy and the SWIM failure detector), SWIM action
 //! dispatch ([`swim`]), gossip fan-out with deduplication ([`gossip`]), and
 //! Merkle anti-entropy plus the compatibility full-sync path
-//! ([`antientropy`]). The tonic service wiring lives in `crate::rpc::cluster`;
-//! resource anti-entropy is the sibling [`ResourceSync`] task
-//! ([`resource`]). Peer channels come from `crate::transport::PeerPool`,
-//! peer endpoint bookkeeping reads the storage node domain held here
-//! directly, and every sync plane picks endpoints through the single
-//! selection policy in [`peers`] (D9).
+//! ([`antientropy`]). Membership requests use the routed overlay adapter;
+//! resource anti-entropy keeps a separate legacy `PeerPool` until its next
+//! cutover. Endpoint ranking for that remaining legacy plane lives in
+//! [`peers`].
 
 mod antientropy;
 mod gossip;
@@ -19,6 +17,7 @@ mod swim;
 
 use std::{future::Future, sync::Arc, time::Duration};
 
+use lycoris_core::now_ms;
 use lycoris_storage::NodeDomain;
 pub(crate) use resource::ResourceSync;
 use tokio::{
@@ -28,27 +27,27 @@ use tokio::{
 };
 
 use self::gossip::{DedupSet, MAX_SEEN_PUSHES, MAX_SEEN_STATES, PersistedSequence};
-use crate::{membership::MembershipService, transport::PeerPool};
+use crate::{membership::MembershipService, overlay_transport::MembershipPool};
 
 /// Timeout applied to each individual peer RPC call driven by this module
 /// tree. Exchange flows (a Merkle anti-entropy round, a gossip send) wrap
 /// every call separately and never the exchange as a whole, so per-call
 /// fallback branches stay reachable.
-const RPC_TIMEOUT: Duration = Duration::from_secs(3);
+pub(crate) const RPC_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Orchestrates peer-to-peer membership synchronization.
 ///
 /// `ClusterSync` owns the background loops and the inbound business logic
 /// behind the `Sync`/`Membership` RPCs (served in `crate::rpc::cluster`).
-/// Peer channels and shared-resource sync live in `PeerPool` and
-/// `ResourceSync` respectively; peer endpoint bookkeeping goes through the
-/// storage node domain held in `node`.
+/// Membership requests use `MembershipPool` (overlay in production); shared
+/// resources retain their separate legacy pool until the resource-plane
+/// cutover. The storage node domain remains the source for CRDT persistence.
 #[derive(Debug, Clone)]
 pub struct ClusterSync {
   local_node_id: String,
   service: Arc<MembershipService>,
   node: NodeDomain,
-  pool: PeerPool,
+  pool: MembershipPool,
   resources: ResourceSync,
   seen_pushes: Arc<Mutex<DedupSet<(String, u64)>>>,
   seen_states: Arc<Mutex<DedupSet<(String, u64, u8)>>>,
@@ -59,21 +58,57 @@ pub struct ClusterSync {
 }
 
 impl ClusterSync {
-  pub fn new(
-    local_node_id: String, service: Arc<MembershipService>, node: NodeDomain, pool: PeerPool,
-    resources: ResourceSync,
+  pub(crate) fn new(
+    local_node_id: String, service: Arc<MembershipService>, node: NodeDomain,
+    pool: impl Into<MembershipPool>, resources: ResourceSync,
   ) -> Self {
     let sequence = PersistedSequence::load(node.meta().clone());
     Self {
       local_node_id,
       service,
       node,
-      pool,
+      pool: pool.into(),
       resources,
       seen_pushes: Arc::new(Mutex::new(DedupSet::new(MAX_SEEN_PUSHES))),
       seen_states: Arc::new(Mutex::new(DedupSet::new(MAX_SEEN_STATES))),
       sequence,
       tasks: Arc::new(Mutex::new(JoinSet::new())),
+    }
+  }
+
+  /// Allocate a push dedup key before broadcasting the corresponding gossip.
+  pub(super) async fn allocate_push(&self) -> (String, u64) {
+    let sequence = self.sequence.next();
+    let origin = self.local_node_id.clone();
+    self
+      .seen_pushes
+      .lock()
+      .await
+      .insert((origin.clone(), sequence));
+    (origin, sequence)
+  }
+
+  /// Record a successful membership exchange.
+  pub(super) fn record_sync_success(&self, peer: &str) {
+    if let Err(error) = self.pool.mark_seen(&self.node, peer, now_ms()) {
+      tracing::warn!(%peer, %error, "failed to mark peer seen");
+    }
+  }
+
+  /// Seed non-local member addresses into the legacy peer bookkeeping used by
+  /// resources and extension routing. Membership itself routes by `NodeId`.
+  pub(super) async fn seed_member_nodes(&self) {
+    let local_address = self.local_address().await.unwrap_or_default();
+    for register in self
+      .service
+      .list_nodes(&std::collections::HashMap::new())
+      .await
+    {
+      if register.address() != local_address
+        && let Err(error) = self.node.peers().seed(register.address())
+      {
+        tracing::warn!(address = %register.address(), %error, "failed to seed known peer");
+      }
     }
   }
 
@@ -133,10 +168,11 @@ impl ClusterSync {
     self.tasks.lock().await.abort_all();
   }
 
-  /// Record a failed contact with `peer`: mark the attempt failed so the
-  /// selection policy backs off ([`peers`]), and evict the cached channel.
+  /// Record a failed membership contact. Overlay health is owned by the link
+  /// actor; the test-only legacy adapter keeps exercising persisted endpoint
+  /// backoff.
   pub(super) async fn record_peer_failure(&self, peer: &str) {
-    if let Err(error) = self.node.peers().mark_attempt(peer, false) {
+    if let Err(error) = self.pool.mark_failed(&self.node, peer) {
       tracing::warn!(%peer, %error, "failed to record failed peer attempt");
     }
     self.pool.remove(peer).await;

@@ -82,6 +82,9 @@ impl DaemonConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
+  /// Operator-chosen control-plane name used in TLS material and local
+  /// presentation. Cluster membership identity is always the public-key
+  /// derived overlay `NodeId`, never this value.
   #[serde(deserialize_with = "non_empty_string")]
   pub id: String,
   #[serde(deserialize_with = "non_empty_string")]
@@ -106,6 +109,11 @@ pub struct ClusterConfig {
   /// and relies on LAN discovery or explicit dials for reachability.
   #[serde(default)]
   pub overlay_listen: Vec<String>,
+  /// Optional sponsor bootstrap multiaddr (ending in `/p2p/<peer>`). When set
+  /// and the node has not joined a cluster yet, the daemon enrolls through
+  /// the sponsor with the cluster key before starting the sync planes.
+  #[serde(default)]
+  pub join: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -349,6 +357,22 @@ mod tests {
           "[\"api.openai.com\"]".to_string()
         ),
       ]))
+    );
+    Ok(())
+  }
+
+  #[test]
+  fn join_defaults_to_none_and_parses_a_multiaddr() -> TestResult {
+    let cfg: DaemonConfig = toml::from_str(VALID_TOML)?;
+    assert!(cfg.cluster.join.is_none());
+    let toml = VALID_TOML.replace(
+      "bootstrap_peers = [\"https://127.0.0.1:5002\"]",
+      "bootstrap_peers = [\"https://127.0.0.1:5002\"]\njoin = \"/ip4/10.0.0.2/tcp/9000/p2p/12D3KooWABC\"",
+    );
+    let cfg: DaemonConfig = toml::from_str(&toml)?;
+    assert_eq!(
+      cfg.cluster.join.as_deref(),
+      Some("/ip4/10.0.0.2/tcp/9000/p2p/12D3KooWABC")
     );
     Ok(())
   }

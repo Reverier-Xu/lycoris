@@ -387,3 +387,32 @@ message RegisterExtensionResponse {
   // blake3 hex digest of the accepted artifact.
   string content_hash = 3;
 }
+
+// Overlay multiplex: every membership-plane operation rides one request-
+// response stream as a NodeRequest/NodeResponse pair inside an overlay
+// envelope, replacing the per-method node-facing gRPC endpoints.
+message NodeRequest {
+  oneof kind {
+    ProbeRequest probe = 1;
+    FetchRegistersRequest fetch_registers = 2;
+    MerkleRootRequest merkle_root = 3;
+    MerkleNodesRequest merkle_nodes = 4;
+    PushRegistersRequest push_registers = 5;
+    StateMessage state = 6;
+    SyncNodesRequest sync_nodes = 7;
+    PushNodeRequest push_node = 8;
+  }
+}
+
+message NodeResponse {
+  oneof kind {
+    ProbeResponse probe = 1;
+    FetchRegistersResponse fetch_registers = 2;
+    MerkleRootResponse merkle_root = 3;
+    MerkleNodesResponse merkle_nodes = 4;
+    PushRegistersResponse push_registers = 5;
+    StateResponse state = 6;
+    SyncNodesResponse sync_nodes = 7;
+    PushNodeResponse push_node = 8;
+  }
+}

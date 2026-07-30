@@ -1,10 +1,18 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+  sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+  },
+  time::Duration,
+};
 
 use libp2p::Multiaddr;
 use thiserror::Error;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 
-use crate::{AuthorizationRegistry, Envelope, NodeId, authorization::AuthorizationError};
+use crate::{
+  AuthorizationRegistry, Envelope, NodeId, RequestId, authorization::AuthorizationError,
+};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct LinkSnapshot {
@@ -36,6 +44,7 @@ pub struct LinkHandle {
   commands: mpsc::Sender<LinkCommand>,
   snapshots: watch::Receiver<LinkSnapshot>,
   inbound: Arc<Mutex<mpsc::Receiver<InboundEnvelope>>>,
+  request_nonce: Arc<AtomicU64>,
 }
 
 impl LinkHandle {
@@ -157,6 +166,13 @@ impl LinkHandle {
       .await
   }
 
+  /// Allocate the next request id from the runtime-wide sequence shared by
+  /// link-state broadcasts and every upper protocol.
+  pub fn next_request_id(&self) -> RequestId {
+    let nonce = self.request_nonce.fetch_add(1, Ordering::Relaxed) + 1;
+    RequestId::derive(self.snapshot().node_id, nonce)
+  }
+
   pub(crate) async fn shutdown(&self) -> Result<(), LinkError> {
     let (reply, response) = oneshot::channel();
     self.send(LinkCommand::Shutdown { reply }).await?;
@@ -165,12 +181,13 @@ impl LinkHandle {
 
   pub(crate) fn new(
     commands: mpsc::Sender<LinkCommand>, snapshots: watch::Receiver<LinkSnapshot>,
-    inbound: mpsc::Receiver<InboundEnvelope>,
+    inbound: mpsc::Receiver<InboundEnvelope>, request_nonce: Arc<AtomicU64>,
   ) -> Self {
     Self {
       commands,
       snapshots,
       inbound: Arc::new(Mutex::new(inbound)),
+      request_nonce,
     }
   }
 

@@ -24,6 +24,7 @@ lycoris-proto.workspace      = true
 lycoris-storage.workspace    = true
 lycoris-tls.workspace        = true
 postcard.workspace           = true
+prost.workspace              = true
 serde.workspace              = true
 serde_json.workspace         = true
 thiserror.workspace          = true

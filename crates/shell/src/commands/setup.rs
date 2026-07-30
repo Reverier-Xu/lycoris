@@ -221,6 +221,9 @@ fn bootstrap_node_assets(
   ensure_dir(&cert_dir)?;
   ensure_dir(config_dir)?;
 
+  let identity = lycoris_overlay::NodeIdentity::load_or_generate(data_dir.join("node.identity"))?;
+  tracing::info!(node_id = %identity.node_id(), "overlay identity ready");
+
   // 1. TLS certificates — idempotent.
   let ca_cert = cert_dir.join("ca.crt");
   let ca_key = cert_dir.join("ca.key");
@@ -253,6 +256,7 @@ fn bootstrap_node_assets(
       listen_address: format!("0.0.0.0:{port}"),
       bootstrap_peers: Vec::new(),
       overlay_listen: Vec::new(),
+      join: None,
     },
     tls: lycoris_config::TlsConfig {
       ca_cert: ca_cert.to_string_lossy().to_string(),

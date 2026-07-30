@@ -18,7 +18,7 @@ use lycoris_proto::node::{NodeInfo as ProtoNodeInfo, StateMessage};
 use lycoris_storage::MetaStorage;
 use tokio::time::timeout;
 
-use super::{ClusterSync, RPC_TIMEOUT, peers::targets};
+use super::{ClusterSync, RPC_TIMEOUT};
 use crate::membership::convert::proto_to_register;
 
 pub(super) const MAX_SEEN_PUSHES: usize = 10_000;
@@ -98,21 +98,15 @@ impl<T: Clone + Eq + Hash> DedupSet<T> {
 impl ClusterSync {
   /// Notify peers about a local registry change via push.
   pub async fn push_change(&self, info: ProtoNodeInfo) {
-    let sequence = self.sequence.next();
-    let origin = self.local_node_id.clone();
-
-    self
-      .seen_pushes
-      .lock()
-      .await
-      .insert((origin.clone(), sequence));
-
+    let (origin, sequence) = self.allocate_push().await;
     self.broadcast_push(info, origin, sequence).await;
   }
 
   pub(super) async fn broadcast_push(&self, info: ProtoNodeInfo, origin: String, sequence: u64) {
-    let local_address = self.local_address().await.unwrap_or_default();
-    let targets = targets(&self.node, &local_address, now_ms());
+    let targets = self
+      .pool
+      .candidates(&self.node, &self.local_node_id, now_ms())
+      .await;
     // Fan out concurrently: a sequential loop costs up to N x RPC_TIMEOUT per
     // round, which stalls the dispatching task and lets work pile up while a
     // partition makes targets time out one by one.
@@ -146,7 +140,7 @@ impl ClusterSync {
   ) {
     match timeout(RPC_TIMEOUT, send).await {
       Ok(Ok(())) => {
-        if let Err(error) = self.node.peers().mark_seen(peer, now_ms()) {
+        if let Err(error) = self.pool.mark_seen(&self.node, peer, now_ms()) {
           tracing::warn!(%peer, %error, "failed to mark peer seen");
         }
       }
@@ -165,13 +159,15 @@ impl ClusterSync {
     &self, peer: &str, info: ProtoNodeInfo, origin: String, sequence: u64,
   ) -> Result<(), ClientError> {
     let mut client = self.pool.connect(peer).await?;
-    client.sync.push_node(info, origin, sequence).await?;
+    client.push_node(info, origin, sequence).await?;
     Ok(())
   }
 
   pub(super) async fn broadcast_state_message(&self, message: StateMessage) {
-    let local_address = self.local_address().await.unwrap_or_default();
-    let targets = targets(&self.node, &local_address, now_ms());
+    let targets = self
+      .pool
+      .candidates(&self.node, &self.local_node_id, now_ms())
+      .await;
     // Concurrent fan-out, same as `broadcast_push`.
     let mut fanout = tokio::task::JoinSet::new();
     for peer in targets {
@@ -198,7 +194,7 @@ impl ClusterSync {
     &self, peer: &str, message: StateMessage,
   ) -> Result<(), ClientError> {
     let mut client = self.pool.connect(peer).await?;
-    client.membership.state(message).await?;
+    client.state(message).await?;
     Ok(())
   }
 

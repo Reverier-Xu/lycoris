@@ -13,6 +13,18 @@ const WAIT: Duration = Duration::from_secs(5);
 const FAR_FUTURE_MS: i64 = 4_111_111_111_111;
 
 #[tokio::test]
+async fn cloned_handles_share_one_request_id_sequence() -> Result<(), LinkError> {
+  let identity = NodeIdentity::generate();
+  let runtime = start_tcp(&identity, single_registry(&identity));
+  let first = runtime.handle();
+  let second = runtime.handle();
+
+  assert_ne!(first.next_request_id(), second.next_request_id());
+  runtime.shutdown().await?;
+  Ok(())
+}
+
+#[tokio::test]
 async fn dropping_runtime_stops_its_actor() {
   let identity = NodeIdentity::generate();
   let registry = single_registry(&identity);

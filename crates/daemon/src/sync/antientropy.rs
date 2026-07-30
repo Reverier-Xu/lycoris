@@ -13,23 +13,29 @@ use lycoris_membership::{DiffResult, MERKLE_TREE_DEPTH, MerkleDiff, NodeRef, Rem
 use lycoris_proto::node::NodeInfo as ProtoNodeInfo;
 use tokio::time::timeout;
 
-use super::{ClusterSync, RPC_TIMEOUT, peers::targets};
-use crate::membership::convert::{proto_to_register, register_to_proto};
+use super::{ClusterSync, RPC_TIMEOUT};
+use crate::{
+  membership::convert::{proto_to_register, register_to_proto},
+  overlay_transport::MembershipPeerClient,
+};
 
 impl ClusterSync {
   pub(super) async fn sync_with_peers(&self) {
-    let local_address = self.local_address().await.unwrap_or_default();
-    let candidates = targets(&self.node, &local_address, now_ms());
+    let local_peer = self.local_node_id.clone();
+    let candidates = self
+      .pool
+      .candidates(&self.node, &local_peer, now_ms())
+      .await;
 
     let Some((preferred, fallbacks)) = candidates.split_first() else {
-      self.retry_seeds_when_isolated(&local_address).await;
+      self.retry_seeds_when_isolated(&local_peer).await;
       return;
     };
 
     // The policy's top choice gets a sequential attempt first: in the common
     // case (healthy primary) one RPC round suffices.
     if self.sync_attempt(preferred).await {
-      self.stick_primary(preferred, &local_address);
+      self.stick_primary(preferred, &local_peer);
       return;
     }
 
@@ -48,7 +54,7 @@ impl ClusterSync {
       match result {
         Ok((peer, true)) => {
           if !connected {
-            self.stick_primary(&peer, &local_address);
+            self.stick_primary(&peer, &local_peer);
           }
           connected = true;
         }
@@ -60,7 +66,7 @@ impl ClusterSync {
     }
 
     if !connected {
-      self.retry_seeds_when_isolated(&local_address).await;
+      self.retry_seeds_when_isolated(&local_peer).await;
     }
   }
 
@@ -87,12 +93,15 @@ impl ClusterSync {
   /// Make `peer` the stored primary when it is not already. Failover must
   /// stick: otherwise every round would waste its first attempt on a dead
   /// primary once the backoff window lapses.
-  fn stick_primary(&self, peer: &str, local_address: &str) {
-    let current = self.node.peers().get_primary().unwrap_or(None);
-    if current.as_deref() == Some(peer) {
-      return;
+  fn stick_primary(&self, peer: &str, local: &str) {
+    match self.pool.is_primary(&self.node, peer) {
+      Ok(true) => return,
+      Ok(false) => {}
+      Err(error) => {
+        tracing::warn!(%peer, %error, "failed to read the primary peer");
+      }
     }
-    if let Err(error) = self.node.peers().set_primary(peer, local_address) {
+    if let Err(error) = self.pool.promote(&self.node, peer, local) {
       tracing::warn!(%peer, %error, "failed to promote peer to primary");
     }
   }
@@ -107,15 +116,8 @@ impl ClusterSync {
   /// seeds at cycle cadence instead of storming them, and heals within one
   /// cycle of reconnection (I2). A node that knows no peers at all has
   /// nothing to retry — single-node clusters are legitimate and stay quiet.
-  async fn retry_seeds_when_isolated(&self, local_address: &str) {
-    let seeds: Vec<String> = self
-      .node
-      .peers()
-      .known_addresses()
-      .unwrap_or_default()
-      .into_iter()
-      .filter(|address| address != local_address)
-      .collect();
+  async fn retry_seeds_when_isolated(&self, local: &str) {
+    let seeds = self.pool.retry_candidates(&self.node, local).await;
     if seeds.is_empty() {
       return;
     }
@@ -126,7 +128,7 @@ impl ClusterSync {
     );
     for seed in seeds {
       if self.sync_attempt(&seed).await {
-        self.stick_primary(&seed, local_address);
+        self.stick_primary(&seed, local);
         return;
       }
     }
@@ -134,9 +136,8 @@ impl ClusterSync {
 
   async fn sync_with_peer(&self, peer: &str) -> Result<(), ClientError> {
     let mut client = self.pool.connect(peer).await?;
-    let local_address = self.local_address().await.unwrap_or_default();
 
-    let remote_root = match timeout(RPC_TIMEOUT, client.membership.merkle_root()).await {
+    let remote_root = match timeout(RPC_TIMEOUT, client.merkle_root()).await {
       Ok(Ok(root)) => root,
       Ok(Err(error)) => {
         tracing::warn!(%peer, %error, "merkle root failed, falling back to full sync");
@@ -150,10 +151,7 @@ impl ClusterSync {
 
     let local_root = self.service.merkle_root().await;
     if remote_root == local_root.to_vec() {
-      let now = now_ms();
-      if let Err(error) = self.node.peers().mark_seen(peer, now) {
-        tracing::warn!(%peer, %error, "failed to mark peer seen");
-      }
+      self.record_sync_success(peer);
       return Ok(());
     }
 
@@ -162,12 +160,7 @@ impl ClusterSync {
     let fetched = if diff.need_from_remote.is_empty() {
       Vec::new()
     } else {
-      match timeout(
-        RPC_TIMEOUT,
-        client.membership.fetch_registers(diff.need_from_remote),
-      )
-      .await
-      {
+      match timeout(RPC_TIMEOUT, client.fetch_registers(diff.need_from_remote)).await {
         Ok(result) => result?,
         Err(_) => return Err(crate::peer_timeout("fetch registers")),
       }
@@ -188,12 +181,7 @@ impl ClusterSync {
     if !local_registers.is_empty() {
       // Pushing is best-effort: the peer pulls the same registers on its next
       // diff round, so a failure only costs propagation delay.
-      match timeout(
-        RPC_TIMEOUT,
-        client.membership.push_registers(local_registers),
-      )
-      .await
-      {
+      match timeout(RPC_TIMEOUT, client.push_registers(local_registers)).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => tracing::warn!(%peer, %error, "failed to push local registers"),
         Err(_) => tracing::warn!(%peer, "pushing local registers timed out"),
@@ -208,11 +196,9 @@ impl ClusterSync {
       self.spawn_dispatch(actions).await;
     }
 
-    self.seed_known_peers(&local_address).await;
+    self.seed_member_nodes().await;
 
-    if let Err(error) = self.node.peers().mark_seen(peer, now_ms()) {
-      tracing::warn!(%peer, %error, "failed to mark peer seen");
-    }
+    self.record_sync_success(peer);
     Ok(())
   }
 
@@ -222,7 +208,7 @@ impl ClusterSync {
   /// is pure and transport-free); this method only drives the RPC round
   /// trips and converts between wire types and membership types.
   async fn merkle_diff_with_peer(
-    &self, client: &mut lycoris_client::PeerClient, peer: &str,
+    &self, client: &mut MembershipPeerClient, peer: &str,
   ) -> Result<DiffResult, ClientError> {
     let tree = self.service.merkle_tree_snapshot().await;
     let mut diff = MerkleDiff::new(&tree);
@@ -248,11 +234,11 @@ impl ClusterSync {
   }
 
   async fn request_merkle_nodes(
-    &self, client: &mut lycoris_client::PeerClient, peer: &str,
+    &self, client: &mut MembershipPeerClient, peer: &str,
     refs: Vec<lycoris_proto::node::MerkleNodeRef>,
   ) -> Result<lycoris_proto::node::MerkleNodesResponse, ClientError> {
     let request = lycoris_proto::node::MerkleNodesRequest { nodes: refs };
-    match timeout(RPC_TIMEOUT, client.membership.merkle_nodes(request)).await {
+    match timeout(RPC_TIMEOUT, client.merkle_nodes(request)).await {
       Ok(Ok(response)) => Ok(response),
       Ok(Err(error)) => {
         tracing::warn!(%peer, %error, "merkle nodes failed");
@@ -278,49 +264,26 @@ impl ClusterSync {
     let mut client = self.pool.connect(peer).await?;
     let snapshot = self.service.list_nodes(&HashMap::new()).await;
     let snapshot: Vec<_> = snapshot.iter().map(register_to_proto).collect();
-    let response = client.sync.sync_nodes(snapshot).await?;
+    let response = client.sync_nodes(snapshot).await?;
     let (_, actions) = self
       .service
       .sync_nodes(response.nodes.iter().map(proto_to_register).collect())
       .await;
     self.spawn_dispatch(actions).await;
-    let local_address = self.local_address().await.unwrap_or_default();
-    self.seed_known_peers(&local_address).await;
+    self.seed_member_nodes().await;
 
-    if let Err(error) = self.node.peers().mark_seen(peer, now_ms()) {
-      tracing::warn!(%peer, %error, "failed to mark peer seen");
-    }
+    self.record_sync_success(peer);
     Ok(())
   }
 
-  /// Seed every known member address (except the local one) into the peer
-  /// bookkeeping, so endpoints learned through membership become sync
-  /// candidates.
-  async fn seed_known_peers(&self, local_address: &str) {
-    for register in self.service.list_nodes(&HashMap::new()).await {
-      if register.address() != local_address
-        && let Err(error) = self.node.peers().seed(register.address())
-      {
-        tracing::warn!(address = %register.address(), %error, "failed to seed known peer");
-      }
-    }
-  }
-
-  /// Serve an incoming `SyncNodes` exchange: seed the peer's endpoints, merge
-  /// its registers, and return the local snapshot after the merge.
+  /// Serve an incoming `SyncNodes` exchange: merge the peer's registers and
+  /// return the local snapshot after the merge.
   pub async fn serve_sync_nodes(&self, nodes: Vec<ProtoNodeInfo>) -> Vec<ProtoNodeInfo> {
-    let local_address = self.local_address().await.unwrap_or_default();
-    for info in &nodes {
-      if info.address != local_address
-        && let Err(error) = self.node.peers().seed(&info.address)
-      {
-        tracing::warn!(address = %info.address, %error, "failed to seed peer address");
-      }
-    }
     let (snapshot, actions) = self
       .service
       .sync_nodes(nodes.iter().map(proto_to_register).collect())
       .await;
+    self.seed_member_nodes().await;
     self.spawn_dispatch(actions).await;
     snapshot.iter().map(register_to_proto).collect()
   }

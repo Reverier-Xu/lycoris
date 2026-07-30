@@ -1,34 +1,43 @@
 //! Daemon-side bootstrap of the libp2p overlay: node identity, authorization
-//! registry, the admission dispatcher, and registry exchange.
+//! registry, admission, registry exchange, and protocol dispatch.
 //!
-//! The membership, resource, and extension planes still ride the legacy gRPC
-//! transport and move onto this module's `LinkHandle` in their own commits;
-//! this module already owns who the node is (`NodeIdentity`), which cluster it
-//! belongs to (the persisted `AuthorizationRegistry`), and how new nodes
+//! Membership now rides this module's `LinkHandle`; shared resources and
+//! extension forwarding remain on their legacy carriers until their focused
+//! cutovers. This module owns who the node is (`NodeIdentity`), which cluster
+//! it belongs to (the persisted `AuthorizationRegistry`), and how new nodes
 //! enroll (the bounded admission protocol plus checkpoint gossip).
 
 use std::{
   path::Path,
-  sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-  },
+  sync::Arc,
   time::{SystemTime, UNIX_EPOCH},
 };
 
 use lycoris_core::ClusterKey;
 use lycoris_overlay::{
-  AdmissionRequest, AdmissionResponse, AuthorizationRecord, AuthorizationRegistry, ClusterId,
-  Enrollment, Envelope, EnvelopeHeader, IdentityError, LinkConfig, LinkError, LinkHandle,
-  LinkRuntime, MessageKind, Multiaddr, NodeId, NodeIdentity, PROTOCOL_VERSION, ProtocolId,
-  RequestId,
+  AdmissionCandidate, AdmissionError, AdmissionRequest, AdmissionResponse, AuthorizationRecord,
+  AuthorizationRegistry, ClusterId, Enrollment, Envelope, EnvelopeHeader, IdentityError, JoinProof,
+  LinkConfig, LinkError, LinkHandle, LinkRuntime, MessageKind, Multiaddr, NodeId, NodeIdentity,
+  PROTOCOL_VERSION, ProtocolId,
 };
+use lycoris_proto::node::{NodeRequest, NodeResponse};
 use lycoris_storage::NodeDomain;
+use prost::Message as _;
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
+
+use crate::overlay_transport::OverlayPool;
 
 const REGISTRY_REQUEST_TIMEOUT_MS: i64 = 5_000;
 const REGISTRY_REQUEST_HOPS: u8 = 0;
+const JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Handler for inbound membership-plane requests arriving over the overlay.
+/// Installed after `ClusterSync` is built (the sync layer implements it).
+#[async_trait::async_trait]
+pub(crate) trait NodeRequestHandler: Send + Sync {
+  async fn handle(&self, request: NodeRequest) -> NodeResponse;
+}
 
 #[derive(Debug, Error)]
 pub enum OverlayError {
@@ -44,6 +53,14 @@ pub enum OverlayError {
   InvalidListenAddress(String),
   #[error("stored authorization records contain no genesis record")]
   MissingGenesis,
+  #[error(transparent)]
+  Postcard(#[from] postcard::Error),
+  #[error(transparent)]
+  Admission(#[from] AdmissionError),
+  #[error("join rejected by sponsor: {0}")]
+  JoinRejected(String),
+  #[error("join failed: {0}")]
+  JoinFailed(String),
 }
 
 /// The daemon's overlay identity, registry, and messaging handle.
@@ -53,7 +70,7 @@ pub struct OverlayNode {
   identity: NodeIdentity,
   enrollment: Arc<Mutex<Enrollment>>,
   node: NodeDomain,
-  request_nonce: AtomicU64,
+  node_handler: Arc<RwLock<Option<Arc<dyn NodeRequestHandler>>>>,
 }
 
 impl OverlayNode {
@@ -74,7 +91,7 @@ impl OverlayNode {
       identity,
       enrollment: Arc::new(Mutex::new(Enrollment::new(registry, cluster_key))),
       node,
-      request_nonce: AtomicU64::new(0),
+      node_handler: Arc::new(RwLock::new(None)),
     })
   }
 
@@ -84,6 +101,107 @@ impl OverlayNode {
 
   pub fn handle(&self) -> LinkHandle {
     self.handle.clone()
+  }
+
+  /// Build the membership-plane pool from the current adopted registry.
+  pub(crate) async fn membership_pool(&self) -> OverlayPool {
+    let cluster_id = self.enrollment.lock().await.registry().cluster_id();
+    OverlayPool::for_daemon(
+      self.handle.clone(),
+      self.node_id(),
+      cluster_id,
+      self.enrollment.clone(),
+    )
+  }
+
+  /// Install the membership-plane request handler (called once `ClusterSync`
+  /// exists).
+  pub(crate) async fn set_node_handler(&self, handler: Arc<dyn NodeRequestHandler>) {
+    *self.node_handler.write().await = Some(handler);
+  }
+
+  /// True when the registry contains only this node's genesis record, i.e.
+  /// the node has not joined an existing cluster yet.
+  pub(crate) async fn registry_is_solo(&self) -> bool {
+    let registry = self.enrollment.lock().await.registry().clone();
+    registry.records().len() == 1
+      && registry
+        .records()
+        .first()
+        .is_some_and(|record| record.node_id() == self.node_id())
+  }
+
+  /// Enroll into an existing cluster through a sponsor's bootstrap address.
+  /// On success the sponsor's registry checkpoint replaces the local one
+  /// (persisted, adopted into the link actor, and adopted into enrollment).
+  pub async fn join(&self, address: Multiaddr, join_key: &ClusterKey) -> Result<(), OverlayError> {
+    self.handle.dial_admission(address).await?;
+    let deadline = std::time::Instant::now() + JOIN_TIMEOUT;
+    while self.handle.snapshot().quarantined_count == 0 {
+      if std::time::Instant::now() > deadline {
+        return Err(OverlayError::JoinFailed(
+          "sponsor connection was not quarantined in time".to_string(),
+        ));
+      }
+      tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let candidate = AdmissionCandidate::new(&self.identity)?;
+    let sentinel = NodeId::from_bytes([0; NodeId::BYTE_LENGTH]);
+    let sentinel_cluster = ClusterId::from_bytes([0; ClusterId::BYTE_LENGTH]);
+    let challenge = match self
+      .admission_call(
+        sentinel,
+        sentinel_cluster,
+        &AdmissionRequest::Begin(candidate.clone()),
+      )
+      .await?
+    {
+      AdmissionResponse::Challenge(challenge) => challenge,
+      AdmissionResponse::Rejected(reason) => return Err(OverlayError::JoinRejected(reason)),
+      other => {
+        return Err(OverlayError::JoinFailed(format!(
+          "sponsor answered begin with {other:?}"
+        )));
+      }
+    };
+    let proof = JoinProof::create(join_key, candidate, challenge.clone())?;
+    let outcome = match self
+      .admission_call(
+        sentinel,
+        challenge.cluster_id(),
+        &AdmissionRequest::Prove(proof),
+      )
+      .await?
+    {
+      AdmissionResponse::Admitted(outcome) => outcome,
+      AdmissionResponse::Rejected(reason) => return Err(OverlayError::JoinRejected(reason)),
+      other => {
+        return Err(OverlayError::JoinFailed(format!(
+          "sponsor answered prove with {other:?}"
+        )));
+      }
+    };
+    let registry =
+      AuthorizationRegistry::from_records(challenge.cluster_id(), outcome.records().to_vec())?;
+    self.node.authorization().replace(&registry.records())?;
+    self.handle.adopt_authorization(registry.clone()).await?;
+    self.enrollment.lock().await.adopt_registry(registry);
+    Ok(())
+  }
+
+  async fn admission_call(
+    &self, destination: NodeId, cluster_id: ClusterId, request: &AdmissionRequest,
+  ) -> Result<AdmissionResponse, OverlayError> {
+    let payload = postcard::to_stdvec(request)?;
+    let Some(envelope) =
+      self.request_envelope(destination, cluster_id, ProtocolId::Admission, payload)
+    else {
+      return Err(OverlayError::JoinFailed(
+        "admission request exceeds the frame budget".to_string(),
+      ));
+    };
+    let response = self.handle.request(envelope).await?;
+    Ok(postcard::from_bytes(response.payload())?)
   }
 
   /// Stop the link actor; tolerates a dispatcher that already stopped it.
@@ -103,6 +221,7 @@ impl OverlayNode {
       match inbound.envelope.header().protocol {
         ProtocolId::Admission => self.handle_admission(inbound).await,
         ProtocolId::Registry => self.handle_registry(inbound).await,
+        ProtocolId::Membership => self.handle_membership(inbound).await,
         _ => {}
       }
     }
@@ -173,12 +292,35 @@ impl OverlayNode {
         return;
       }
     };
+    self.send_reply_payload(inbound, payload).await;
+  }
+
+  async fn send_reply_payload(&self, inbound: &lycoris_overlay::InboundEnvelope, payload: Vec<u8>) {
     let Some(reply) = response_envelope(&inbound.envelope, self.node_id(), payload) else {
       return;
     };
     if let Err(error) = self.handle.respond(inbound.token, reply).await {
       tracing::debug!(%error, "failed to send an overlay reply");
     }
+  }
+
+  async fn handle_membership(&self, inbound: lycoris_overlay::InboundEnvelope) {
+    let request = match NodeRequest::decode(inbound.envelope.payload()) {
+      Ok(request) => request,
+      Err(error) => {
+        tracing::debug!(%error, "dropping a malformed membership request");
+        return;
+      }
+    };
+    let handler = self.node_handler.read().await.clone();
+    let Some(handler) = handler else {
+      tracing::debug!("dropping a membership request before the handler is installed");
+      return;
+    };
+    let response = handler.handle(request).await;
+    self
+      .send_reply_payload(&inbound, response.encode_to_vec())
+      .await;
   }
 
   async fn handle_registry(&self, inbound: lycoris_overlay::InboundEnvelope) {
@@ -299,7 +441,7 @@ impl OverlayNode {
     let header = EnvelopeHeader {
       version: PROTOCOL_VERSION,
       cluster_id,
-      request_id: self.next_request_id(),
+      request_id: self.handle.next_request_id(),
       source: self.node_id(),
       destination,
       protocol,
@@ -314,11 +456,6 @@ impl OverlayNode {
         None
       }
     }
-  }
-
-  fn next_request_id(&self) -> RequestId {
-    let nonce = self.request_nonce.fetch_add(1, Ordering::Relaxed) + 1;
-    RequestId::derive(self.node_id(), nonce)
   }
 }
 

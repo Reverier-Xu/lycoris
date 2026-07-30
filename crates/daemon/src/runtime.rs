@@ -12,6 +12,7 @@ use crate::{
   llm::LlmRouter,
   membership::{LOCAL_INCARNATION_KEY, MemberRegister, MembershipService, SwimConfig},
   overlay::{OverlayError, OverlayNode},
+  overlay_transport::MembershipRequestHandler,
   resource::ResourceMapper,
   rpc::{extension::ExtensionService, server::ClusterService},
   sync::{ClusterSync, ResourceSync},
@@ -171,6 +172,21 @@ async fn run_inner(
     &config.cluster.overlay_listen,
   )?);
 
+  // Join an existing cluster before any sync plane starts: enrollment adopts
+  // the sponsor's authorization registry, and every later plane inherits it.
+  if let Some(join_address) = &config.cluster.join
+    && overlay.registry_is_solo().await
+  {
+    let key = cluster_key.as_ref().ok_or_else(|| {
+      OverlayError::JoinFailed("joining a cluster requires the cluster key".to_string())
+    })?;
+    let address: lycoris_overlay::Multiaddr = join_address
+      .parse()
+      .map_err(|_| OverlayError::InvalidListenAddress(join_address.clone()))?;
+    overlay.join(address, key).await?;
+  }
+
+  let node_id = overlay.node_id().to_string();
   let tls_bundle = ensure_tls_bundle(
     &config.tls.ca_cert,
     &config.tls.ca_key,
@@ -209,12 +225,8 @@ async fn run_inner(
   // resumes at 0, so its first rejoin lands on incarnation 1.
   let resumed_incarnation =
     crate::persisted_counter(node.meta(), LOCAL_INCARNATION_KEY).unwrap_or(0);
-  let mut local_register = MemberRegister::new(
-    &config.node.id,
-    &config.node.address,
-    resumed_incarnation,
-    0,
-  );
+  let mut local_register =
+    MemberRegister::new(&node_id, &config.node.address, resumed_incarnation, 0);
   local_register.rejoin(&config.node.address, now_ms());
   local_register.set_labels(node.local().labels().unwrap_or_default());
   local_register.set_annotations(node.local().annotations().unwrap_or_default());
@@ -229,7 +241,7 @@ async fn run_inner(
   }
 
   let membership_service = Arc::new(
-    MembershipService::new(&config.node.id, SwimConfig::default(), local_register)
+    MembershipService::new(&node_id, SwimConfig::default(), local_register)
       .with_meta(node.meta().clone()),
   );
 
@@ -247,11 +259,12 @@ async fn run_inner(
 
   let pool = PeerPool::new(&tls_bundle, cluster_key.as_ref().map(ClusterKey::to_hex));
   let resources = ResourceSync::new(mapper.clone(), node.clone(), pool.clone());
+  let membership_pool = overlay.membership_pool().await;
   let cluster_sync = ClusterSync::new(
-    config.node.id.clone(),
+    node_id,
     membership_service.clone(),
     node.clone(),
-    pool.clone(),
+    membership_pool,
     resources.clone(),
   );
   let extension_manager = Arc::new(
@@ -259,6 +272,14 @@ async fn run_inner(
       .with_cluster_sync(cluster_sync.clone())
       .with_peer_pool(pool),
   );
+
+  // The overlay dispatcher serves membership-plane requests through the same
+  // serve methods the gRPC services use.
+  overlay
+    .set_node_handler(Arc::new(MembershipRequestHandler::new(
+      cluster_sync.clone(),
+    )))
+    .await;
 
   let cluster_service = ClusterService::new(membership_service.clone(), storage.clone(), mapper)
     .with_cluster_sync(cluster_sync.clone())

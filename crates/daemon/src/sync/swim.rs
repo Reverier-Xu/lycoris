@@ -55,13 +55,7 @@ impl ClusterSync {
           let _ = self.send_probe_to(&target, seq).await;
         }
         OutboundAction::Alive { register } => {
-          let sequence = self.sequence.next();
-          let origin = self.local_node_id.clone();
-          self
-            .seen_pushes
-            .lock()
-            .await
-            .insert((origin.clone(), sequence));
+          let (origin, sequence) = self.allocate_push().await;
           self
             .broadcast_push(register_to_proto(&register), origin, sequence)
             .await;
@@ -127,26 +121,18 @@ impl ClusterSync {
       .await;
   }
 
-  /// Send one SWIM probe to a member. Failures share the reachability
-  /// bookkeeping of every other peer RPC in this module tree (failed attempt
-  /// mark + channel eviction): probe targets and sync endpoints are the same
-  /// addresses, and the single selection policy (D9) should back off from a
-  /// member that probes cannot reach either.
+  /// Send one routed SWIM probe to a member. The target id is the overlay
+  /// `NodeId` text, so no address lookup or endpoint channel is involved.
   async fn send_probe_to(&self, target_id: &str, seq: u64) -> bool {
-    let address = match self.resolve_address(target_id).await {
-      Some(addr) => addr,
-      None => return false,
-    };
-
-    let mut client = match self.pool.connect(&address).await {
+    let mut client = match self.pool.connect(target_id).await {
       Ok(client) => client,
       Err(_) => {
-        self.record_peer_failure(&address).await;
+        self.record_peer_failure(target_id).await;
         return false;
       }
     };
 
-    match timeout(RPC_TIMEOUT, client.membership.probe(seq, "")).await {
+    match timeout(RPC_TIMEOUT, client.probe(seq, "")).await {
       Ok(Ok(response)) => {
         if response.ack {
           self
@@ -158,19 +144,15 @@ impl ClusterSync {
       }
       Ok(Err(error)) => {
         tracing::warn!(%target_id, %error, "probe failed");
-        self.record_peer_failure(&address).await;
+        self.record_peer_failure(target_id).await;
         false
       }
       Err(_) => {
         tracing::warn!(%target_id, "probe timed out");
-        self.record_peer_failure(&address).await;
+        self.record_peer_failure(target_id).await;
         false
       }
     }
-  }
-
-  async fn resolve_address(&self, node_id: &str) -> Option<String> {
-    self.service.member_address(node_id).await
   }
 
   /// Handle an incoming SWIM probe, returning whether to ack.

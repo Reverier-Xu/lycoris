@@ -1,5 +1,9 @@
 use std::{
   collections::{BTreeMap, BTreeSet},
+  sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+  },
   time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -53,6 +57,7 @@ impl LinkRuntime {
     let (snapshot_tx, snapshots) = watch::channel(state.snapshot());
     let (commands, command_rx) = mpsc::channel(config.command_capacity());
     let (inbound_tx, inbound_rx) = mpsc::channel(config.command_capacity());
+    let request_nonce = Arc::new(AtomicU64::new(0));
     let actor = LinkActor {
       swarm,
       command_rx,
@@ -68,12 +73,12 @@ impl LinkRuntime {
       pending_forwards: BTreeMap::new(),
       broadcast_requests: BTreeSet::new(),
       next_inbound_token: 0,
-      request_nonce: 0,
+      request_nonce: request_nonce.clone(),
       last_link_state_sequence: 0,
     };
     let task = tokio::spawn(actor.run());
     Ok(Self {
-      handle: LinkHandle::new(commands, snapshots, inbound_rx),
+      handle: LinkHandle::new(commands, snapshots, inbound_rx, request_nonce),
       task: Some(task),
     })
   }
@@ -128,7 +133,7 @@ struct LinkActor {
   pending_forwards: BTreeMap<request_response::OutboundRequestId, ForwardContext>,
   broadcast_requests: BTreeSet<request_response::OutboundRequestId>,
   next_inbound_token: u64,
-  request_nonce: u64,
+  request_nonce: Arc<AtomicU64>,
   last_link_state_sequence: u64,
 }
 
@@ -657,9 +662,9 @@ impl LinkActor {
     }
   }
 
-  fn next_request_id(&mut self) -> RequestId {
-    self.request_nonce += 1;
-    RequestId::derive(self.state.node_id, self.request_nonce)
+  fn next_request_id(&self) -> RequestId {
+    let nonce = self.request_nonce.fetch_add(1, Ordering::Relaxed) + 1;
+    RequestId::derive(self.state.node_id, nonce)
   }
 
   fn set_authorization(

@@ -46,8 +46,9 @@ impl LinkConfig {
     self
   }
 
-  #[cfg(test)]
-  pub(crate) fn with_lan_discovery(mut self, enabled: bool) -> Self {
+  /// Enable or disable LAN discovery. Daemons keep it enabled by default;
+  /// topology tests and WAN-only deployments may pin explicit links.
+  pub fn with_lan_discovery(mut self, enabled: bool) -> Self {
     self.lan_discovery = enabled;
     self
   }

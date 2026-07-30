@@ -119,8 +119,9 @@ pub(crate) async fn join_cluster(
     })?
     .with_cluster_key(key);
 
+  let node_id = configured_node_id(&daemon_config)?;
   let node = NodeInfo::new(
-    daemon_config.node.id.clone(),
+    node_id.clone(),
     daemon_config.node.address.clone(),
     std::collections::HashMap::new(),
     std::collections::HashMap::new(),
@@ -135,7 +136,7 @@ pub(crate) async fn join_cluster(
     .map_err(ShellError::SetPrimary)?;
 
   tracing::info!(
-    node_id = %daemon_config.node.id,
+    %node_id,
     %peer,
     "node joined cluster"
   );
@@ -145,12 +146,10 @@ pub(crate) async fn join_cluster(
 #[tracing::instrument(name = "leave_cluster", skip_all)]
 pub(crate) async fn leave_cluster(client_config: &ClientConfig) -> Result<(), ShellError> {
   let daemon_config = DaemonConfig::load(None)?;
+  let node_id = configured_node_id(&daemon_config)?;
   let mut client = connect_cluster(client_config).await?;
-  client
-    .leave(&daemon_config.node.id)
-    .await
-    .map_err(ShellError::Leave)?;
-  tracing::info!(node_id = %daemon_config.node.id, "node leaving cluster");
+  client.leave(&node_id).await.map_err(ShellError::Leave)?;
+  tracing::info!(%node_id, "node leaving cluster");
   Ok(())
 }
 
@@ -168,16 +167,8 @@ pub(crate) fn show_key() -> Result<(), ShellError> {
 async fn connect_cluster(client_config: &ClientConfig) -> Result<ClusterClient, ShellError> {
   // A missing key is not fatal here: the server rejects unauthenticated
   // calls anyway. A key that exists but fails to load (e.g. corrupted) is
-  // suspicious though, so surface it instead of silently degrading to "no
-  // key".
-  let key = match load_cluster_key(client_config) {
-    Ok(key) => Some(key),
-    Err(ShellError::ClusterKeyNotFound) => None,
-    Err(error) => {
-      tracing::warn!("failed to load cluster key, continuing without one: {error}");
-      None
-    }
-  };
+  // surfaced instead of silently degrading to "no key".
+  let key = resolve_optional_cluster_key(client_config);
   let tls = lycoris_tls::load_tls_bundle(
     &client_config.cert,
     &client_config.key,
@@ -198,14 +189,7 @@ async fn connect_cluster(client_config: &ClientConfig) -> Result<ClusterClient, 
 /// Connect to the cluster-key-guarded `Extension` service; same key and TLS
 /// handling as [`connect_cluster`].
 async fn connect_extension(client_config: &ClientConfig) -> Result<ExtensionClient, ShellError> {
-  let key = match load_cluster_key(client_config) {
-    Ok(key) => Some(key),
-    Err(ShellError::ClusterKeyNotFound) => None,
-    Err(error) => {
-      tracing::warn!("failed to load cluster key, continuing without one: {error}");
-      None
-    }
-  };
+  let key = resolve_optional_cluster_key(client_config);
   let tls = lycoris_tls::load_tls_bundle(
     &client_config.cert,
     &client_config.key,
@@ -240,6 +224,27 @@ fn load_cluster_key(client_config: &ClientConfig) -> Result<String, ShellError> 
   Ok(ClusterKey::load(&path)?.to_hex())
 }
 
+fn configured_node_id(config: &DaemonConfig) -> Result<String, ShellError> {
+  Ok(
+    lycoris_overlay::NodeIdentity::load(
+      std::path::Path::new(&config.data_dir).join("node.identity"),
+    )?
+    .node_id()
+    .to_string(),
+  )
+}
+
+fn resolve_optional_cluster_key(client_config: &ClientConfig) -> Option<String> {
+  match load_cluster_key(client_config) {
+    Ok(key) => Some(key),
+    Err(ShellError::ClusterKeyNotFound) => None,
+    Err(error) => {
+      tracing::warn!("failed to load cluster key, continuing without one: {error}");
+      None
+    }
+  }
+}
+
 /// Best-effort local node id used to mark the current node in listings.
 ///
 /// The daemon configuration is read once per command; a failure is surfaced
@@ -247,7 +252,13 @@ fn load_cluster_key(client_config: &ClientConfig) -> Result<String, ShellError> 
 /// being swallowed silently.
 fn local_node_id() -> String {
   match DaemonConfig::load(None) {
-    Ok(config) => config.node.id,
+    Ok(config) => match configured_node_id(&config) {
+      Ok(node_id) => node_id,
+      Err(error) => {
+        tracing::warn!(%error, "failed to load node identity, local node will not be marked");
+        String::new()
+      }
+    },
     Err(error) => {
       tracing::warn!(%error, "failed to load daemon config, local node will not be marked");
       String::new()
