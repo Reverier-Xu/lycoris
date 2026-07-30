@@ -37,8 +37,7 @@ pub(crate) const RPC_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Orchestrates peer-to-peer membership synchronization.
 ///
-/// `ClusterSync` owns the background loops and the inbound business logic
-/// behind the `Sync`/`Membership` RPCs (served in `crate::rpc::cluster`).
+/// `ClusterSync` owns the background loops and inbound overlay business logic.
 /// Membership and resource requests use overlay-backed pools in production;
 /// the storage node domain remains the source for CRDT persistence.
 #[derive(Debug, Clone)]
@@ -47,7 +46,6 @@ pub struct ClusterSync {
   service: Arc<MembershipService>,
   node: NodeDomain,
   pool: MembershipPool,
-  resources: ResourceSync,
   seen_pushes: Arc<Mutex<DedupSet<(String, u64)>>>,
   seen_states: Arc<Mutex<DedupSet<(String, u64, u8)>>>,
   sequence: PersistedSequence,
@@ -59,7 +57,7 @@ pub struct ClusterSync {
 impl ClusterSync {
   pub(crate) fn new(
     local_node_id: String, service: Arc<MembershipService>, node: NodeDomain,
-    pool: impl Into<MembershipPool>, resources: ResourceSync,
+    pool: impl Into<MembershipPool>,
   ) -> Self {
     let sequence = PersistedSequence::load(node.meta().clone());
     Self {
@@ -67,7 +65,6 @@ impl ClusterSync {
       service,
       node,
       pool: pool.into(),
-      resources,
       seen_pushes: Arc::new(Mutex::new(DedupSet::new(MAX_SEEN_PUSHES))),
       seen_states: Arc::new(Mutex::new(DedupSet::new(MAX_SEEN_STATES))),
       sequence,
@@ -134,12 +131,6 @@ impl ClusterSync {
         })
         .await;
     }
-  }
-
-  /// Access the resource anti-entropy task (used by the rpc boundary to serve
-  /// incoming `SyncResources` requests).
-  pub(crate) fn resources(&self) -> &ResourceSync {
-    &self.resources
   }
 
   pub(super) async fn local_address(&self) -> Option<String> {

@@ -427,10 +427,7 @@ mod tests {
   use tonic::{Request, Response, Status};
 
   use super::*;
-  use crate::{
-    membership::MembershipService, resource::ResourceMapper, sync::ResourceSync,
-    transport::PeerPool,
-  };
+  use crate::{membership::MembershipService, transport::PeerPool};
 
   fn wire_result(depth: u32, index: u64, hash_len: usize) -> MerkleNodeResult {
     MerkleNodeResult {
@@ -649,16 +646,8 @@ mod tests {
       SwimConfig::default(),
       local,
     ));
-    let mapper = ResourceMapper::new(storage.clone(), service.clone());
     let pool = PeerPool::new(tls, None);
-    let resources = ResourceSync::new(mapper, node.clone(), pool.clone());
-    let sync = ClusterSync::new(
-      "local".to_string(),
-      service.clone(),
-      node.clone(),
-      pool,
-      resources,
-    );
+    let sync = ClusterSync::new("local".to_string(), service.clone(), node.clone(), pool);
     TestNode {
       _dir: dir,
       sync,

@@ -38,7 +38,7 @@ the completed work reaches `main`.
 - [x] Move membership traffic and routed probes onto the overlay.
 - [x] Move shared-resource synchronization onto `ResourceCarrier`.
 - [x] Move extension forwarding onto `ExtensionRouter`.
-- [ ] Remove `PeerPool` and node-facing gRPC while retaining client control
+- [x] Remove `PeerPool` and node-facing gRPC while retaining client control
   gRPC.
 - [ ] Replace E2E with CLI-driven single-node, merge, partition, LAN-heal, and
   unrelated-peer recovery scenarios using a 10-second convergence deadline.

@@ -162,10 +162,8 @@ async fn run_inner(
   let storage = Storage::open(data_dir.join("lycoris.redb"))?;
   let node = storage.node();
 
-  // The overlay owns node identity and cluster authorization: the identity
-  // file is the single source of who this node is, and the persisted
-  // authorization registry is the single source of which cluster it belongs
-  // to. The legacy gRPC sync plane moves onto this handle in later commits.
+  // The overlay owns node identity, cluster authorization, and every
+  // daemon-to-daemon protocol plane.
   let overlay = Arc::new(OverlayNode::start(
     &data_dir,
     node.clone(),
@@ -266,7 +264,6 @@ async fn run_inner(
     membership_service.clone(),
     node.clone(),
     overlay_pool.clone(),
-    resources.clone(),
   );
   let extension_manager = Arc::new(
     extension_manager
@@ -347,22 +344,12 @@ async fn run_inner(
     }
   });
 
-  let (sync_service, membership_service_rpc) = cluster_sync.servers();
-
   let addr: SocketAddr = config.cluster.listen_address.parse()?;
   tracing::info!(%addr, "node api server listening");
 
   let server_shutdown = shutdown.clone();
-  // Authentication boundary (deliberate layering): the cluster-key
-  // interceptor guards the admission plane — the Cluster service reached by
-  // operators and joining members, and the Extension service whose invocations
-  // (direct or forwarded) are admission-level operations (extension system
-  // design, section 7). The Sync and Membership services are node-to-node;
-  // node identity there comes from the mTLS handshake against the cluster CA,
-  // so they carry no cluster-key check.
-  // The message limits live on the inner servers, so they are applied before
-  // wrapping them into the intercepted services (`with_interceptor` only
-  // takes the raw inner service).
+  // Cluster and Extension are the only gRPC services. Every daemon-to-daemon
+  // plane is authenticated and routed by the overlay.
   let admission = crate::rpc::interceptor::cluster_key_interceptor(cluster_key.map(Arc::new));
   let cluster_server = lycoris_proto::node::cluster_server::ClusterServer::new(cluster_service)
     .max_decoding_message_size(lycoris_client::MAX_RPC_MESSAGE_BYTES)
@@ -380,8 +367,6 @@ async fn run_inner(
     .timeout(Duration::from_secs(30))
     .add_service(cluster_server)
     .add_service(extension_server)
-    .add_service(sync_service)
-    .add_service(membership_service_rpc)
     .serve_with_shutdown(addr, wait_shutdown(server_shutdown))
     .await;
 
