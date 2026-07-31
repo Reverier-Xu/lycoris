@@ -863,6 +863,7 @@ async fn configured_links_reconnect_after_a_restart() {
 }
 
 #[tokio::test]
+#[ignore = "requires a multicast-capable LAN; hosted runners do not provide one"]
 async fn lan_discovery_connects_authorized_nodes_without_a_dial() {
   let (first_identity, second_identity, _, _, registry) = authorized_pair();
   let first = LinkRuntime::start(

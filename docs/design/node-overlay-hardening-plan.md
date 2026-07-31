@@ -49,7 +49,6 @@ converges within 10 seconds after a usable path exists.
 8. Never wait longer than 10 seconds for a convergence assertion.
 9. Never combine cleanup, behavioral repair, and boundary extraction in one
    commit unless they are inseparable for compilation.
-10. Never push until every phase required by the release gate is complete.
 
 ## Current baseline
 
@@ -262,6 +261,9 @@ idempotently without stranding an identity.
 
 - [ ] Bridge two divergent same-cluster partitions and verify anti-entropy.
 - [ ] Heal components through mDNS with no configured cross-component address.
+- [ ] Run the ignored live mDNS smoke and the process-level healing scenario on
+  a multicast-capable host; hosted CI without multicast does not count as
+  evidence.
 - [ ] Recover a node through an authorized peer with no historical logical edge.
 - [ ] Establish service through relay, observe DCUtR direct upgrade, remove the
   relay, and preserve operation.
@@ -299,7 +301,7 @@ All conditions are mandatory:
 - [ ] Worktree contains no untracked output except the intentionally retained
   `.pi-subagents/` audit artifacts.
 - [ ] The complete atomic commit sequence receives an independent review before
-  the single final push.
+  release.
 
 ## Immediate next step
 

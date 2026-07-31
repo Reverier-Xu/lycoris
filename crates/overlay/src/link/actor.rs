@@ -1,7 +1,7 @@
 use std::{
   collections::{BTreeMap, BTreeSet},
   sync::Arc,
-  time::{Instant, SystemTime, UNIX_EPOCH},
+  time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use futures_util::StreamExt;
@@ -409,21 +409,17 @@ impl LinkActor {
     match event {
       mdns::Event::Discovered(discovered) => {
         for (peer_id, address) in discovered {
-          if let Some(node_id) = self.state.authorization.node_for_peer(&peer_id) {
-            self.state.directory.record(
-              node_id,
-              peer_id,
-              address,
-              AddressSource::Mdns,
-              now,
-              self.config.discovered_address_ttl(),
-            );
-          }
+          self.state.record_discovered_address(
+            peer_id,
+            address,
+            now,
+            self.config.discovered_address_ttl(),
+          );
         }
       }
       mdns::Event::Expired(expired) => {
         for (peer_id, address) in expired {
-          self.state.directory.remove(peer_id, &address);
+          self.state.expire_discovered_address(peer_id, &address);
         }
       }
     }
@@ -1077,6 +1073,20 @@ impl LinkState {
     self.authorization.active_peer_for_node(node_id)
   }
 
+  fn record_discovered_address(
+    &mut self, peer_id: PeerId, address: Multiaddr, now: Instant, ttl: Duration,
+  ) {
+    if let Some(node_id) = self.authorization.node_for_peer(&peer_id) {
+      self
+        .directory
+        .record(node_id, peer_id, address, AddressSource::Mdns, now, ttl);
+    }
+  }
+
+  fn expire_discovered_address(&mut self, peer_id: PeerId, address: &Multiaddr) {
+    self.directory.remove(peer_id, address);
+  }
+
   fn has_listener_with_prefix(&self, prefix: &Multiaddr) -> bool {
     self.listeners.iter().any(|address| {
       let mut protocols = address.iter();
@@ -1351,6 +1361,41 @@ mod tests {
       role_override: Endpoint::Dialer,
       port_use: PortUse::New,
     }
+  }
+
+  #[test]
+  fn mdns_events_update_only_authorized_directory_entries() {
+    let sponsor = NodeIdentity::generate();
+    let discovered = NodeIdentity::generate();
+    let (cluster_id, genesis) = must(AuthorizationRecord::genesis(&sponsor));
+    let admission = must(AuthorizationRecord::admit(
+      cluster_id,
+      &discovered.public_identity(),
+      &genesis,
+      &genesis,
+      &sponsor,
+    ));
+    let registry = must(AuthorizationRegistry::from_records(
+      cluster_id,
+      [genesis, admission],
+    ));
+    let mut state = LinkState::new(sponsor.node_id(), sponsor.peer_id(), registry);
+    let now = Instant::now();
+    let ttl = Duration::from_secs(30);
+    let address: Multiaddr = must("/ip4/192.0.2.10/udp/4001/quic-v1".parse());
+
+    state.record_discovered_address(discovered.peer_id(), address.clone(), now, ttl);
+    assert_eq!(
+      state.directory.candidate(discovered.node_id(), now),
+      Some((discovered.peer_id(), address.clone()))
+    );
+
+    let unknown = NodeIdentity::generate();
+    state.record_discovered_address(unknown.peer_id(), address.clone(), now, ttl);
+    assert_eq!(state.directory.candidate(unknown.node_id(), now), None);
+
+    state.expire_discovered_address(discovered.peer_id(), &address);
+    assert_eq!(state.directory.candidate(discovered.node_id(), now), None);
   }
 
   #[test]
