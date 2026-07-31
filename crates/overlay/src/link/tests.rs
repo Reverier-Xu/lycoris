@@ -507,6 +507,71 @@ async fn direct_requests_echo_through_the_overlay() {
 }
 
 #[tokio::test]
+async fn expired_requests_evict_stale_connections_and_redial() {
+  let (first_identity, second_identity, _, _, registry) = authorized_pair();
+  let first = LinkRuntime::start(
+    &first_identity,
+    LinkConfig::new(vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()])
+      .with_lan_discovery(false)
+      .with_reconnect_timing(
+        Duration::from_secs(1),
+        Duration::from_millis(50),
+        Duration::from_millis(50),
+      ),
+    registry.clone(),
+  )
+  .unwrap();
+  let second = start_quiet_tcp(&second_identity, registry.clone());
+  let first_handle = first.handle();
+  let second_handle = second.handle();
+  let second_node = second_identity.node_id();
+  let second_address = wait_for_listener(&second_handle, |address| {
+    address
+      .iter()
+      .any(|protocol| matches!(protocol, Protocol::Tcp(_)))
+  })
+  .await;
+  first_handle
+    .dial(second_node, second_address)
+    .await
+    .unwrap();
+  first_handle
+    .wait_connected(second_node, WAIT)
+    .await
+    .unwrap();
+
+  let envelope = request_envelope_with_deadline(
+    first_identity.node_id(),
+    second_node,
+    registry.cluster_id(),
+    9,
+    b"stall",
+    lycoris_core::now_ms() + 100,
+  );
+  let requester = first_handle.clone();
+  let request = tokio::spawn(async move { requester.request(envelope).await });
+  let inbound = tokio::time::timeout(WAIT, second_handle.next_inbound())
+    .await
+    .expect("stalled request did not reach the receiver")
+    .expect("receiver stopped before the stalled request arrived");
+  let result = request.await.expect("stalled request task failed");
+  assert!(matches!(result, Err(LinkError::Timeout)));
+  wait_for_disconnected(&first_handle, second_node).await;
+  let late_response = response_envelope(&inbound.envelope, second_identity.node_id(), Vec::new());
+  assert!(matches!(
+    second_handle.respond(inbound.token, late_response).await,
+    Err(LinkError::UnknownInbound)
+  ));
+  first_handle
+    .wait_connected(second_node, WAIT)
+    .await
+    .unwrap();
+
+  second.shutdown().await.unwrap();
+  first.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn routed_requests_cross_a_sparse_chain() {
   let (middle_identity, first_identity, second_identity, registry) = authorized_trio();
   let middle = start_quiet_tcp(&middle_identity, registry.clone());
@@ -785,6 +850,20 @@ fn response_envelope(request: &Envelope, source: NodeId, payload: Vec<u8>) -> En
 fn request_envelope(
   source: NodeId, destination: NodeId, cluster_id: ClusterId, nonce: u8, payload: &[u8],
 ) -> Envelope {
+  request_envelope_with_deadline(
+    source,
+    destination,
+    cluster_id,
+    nonce,
+    payload,
+    FAR_FUTURE_MS,
+  )
+}
+
+fn request_envelope_with_deadline(
+  source: NodeId, destination: NodeId, cluster_id: ClusterId, nonce: u8, payload: &[u8],
+  deadline_unix_ms: i64,
+) -> Envelope {
   let header = EnvelopeHeader {
     version: PROTOCOL_VERSION,
     cluster_id,
@@ -793,7 +872,7 @@ fn request_envelope(
     destination,
     protocol: ProtocolId::Membership,
     kind: MessageKind::Request,
-    deadline_unix_ms: FAR_FUTURE_MS,
+    deadline_unix_ms,
     remaining_hops: 8,
   };
   Envelope::new(header, payload.to_vec()).unwrap()

@@ -34,6 +34,9 @@ use crate::{
   authorization::AuthorizationError,
 };
 
+const MAX_PENDING_INBOUND: usize = 256;
+const MAX_INBOUND_LIFETIME_MS: i64 = 10_000;
+
 pub struct LinkRuntime {
   handle: LinkHandle,
   task: Option<JoinHandle<()>>,
@@ -89,6 +92,7 @@ impl LinkRuntime {
       inbound_tx,
       pending_outbound: BTreeMap::new(),
       pending_inbound: BTreeMap::new(),
+      inbound_requests: BTreeMap::new(),
       pending_forwards: BTreeMap::new(),
       broadcast_requests: BTreeSet::new(),
       next_inbound_token: 0,
@@ -137,6 +141,13 @@ struct PendingRequest {
   reply: oneshot::Sender<Result<Envelope, LinkError>>,
 }
 
+struct PendingInbound {
+  request_id: request_response::InboundRequestId,
+  peer_id: PeerId,
+  deadline_unix_ms: i64,
+  channel: request_response::ResponseChannel<Envelope>,
+}
+
 struct ForwardContext {
   channel: request_response::ResponseChannel<Envelope>,
   expected: ResponseExpectation,
@@ -150,6 +161,7 @@ struct ResponseExpectation {
   source: NodeId,
   destination: NodeId,
   protocol: ProtocolId,
+  deadline_unix_ms: i64,
 }
 
 impl ResponseExpectation {
@@ -162,6 +174,7 @@ impl ResponseExpectation {
       source: header.source,
       destination: header.destination,
       protocol: header.protocol,
+      deadline_unix_ms: header.deadline_unix_ms,
     }
   }
 
@@ -195,7 +208,8 @@ struct LinkActor {
   router: Router,
   inbound_tx: mpsc::Sender<InboundEnvelope>,
   pending_outbound: BTreeMap<request_response::OutboundRequestId, PendingRequest>,
-  pending_inbound: BTreeMap<u64, request_response::ResponseChannel<Envelope>>,
+  pending_inbound: BTreeMap<u64, PendingInbound>,
+  inbound_requests: BTreeMap<request_response::InboundRequestId, u64>,
   pending_forwards: BTreeMap<request_response::OutboundRequestId, ForwardContext>,
   broadcast_requests: BTreeSet<request_response::OutboundRequestId>,
   next_inbound_token: u64,
@@ -206,6 +220,10 @@ struct LinkActor {
 impl LinkActor {
   async fn run(mut self) {
     loop {
+      let deadline_wait = self
+        .next_pending_deadline()
+        .map(|deadline| Duration::from_millis(deadline.saturating_sub(now_unix_ms()).max(0) as u64))
+        .unwrap_or(Duration::from_secs(3_600));
       tokio::select! {
         command = self.command_rx.recv() => {
           let Some(command) = command else {
@@ -217,6 +235,7 @@ impl LinkActor {
         }
         event = self.swarm.select_next_some() => self.handle_event(event),
         _ = self.maintenance.tick() => self.maintain(),
+        _ = tokio::time::sleep(deadline_wait) => self.expire_pending_requests(now_unix_ms()),
       }
     }
   }
@@ -385,6 +404,7 @@ impl LinkActor {
 
   fn maintain(&mut self) {
     let now = Instant::now();
+    self.expire_pending_requests(now_unix_ms());
     self.state.directory.expire(now);
     for (node_id, peer_id, address) in self.state.directory.candidates(now) {
       if self.state.node_is_connected(node_id) || self.state.pending_for_node(node_id) {
@@ -401,6 +421,112 @@ impl LinkActor {
       if let Err(error) = self.reserve_via(node_id, relayed_address) {
         tracing::warn!(%node_id, %error, "overlay relay reservation listener failed");
       }
+    }
+  }
+
+  fn next_pending_deadline(&self) -> Option<i64> {
+    self
+      .pending_outbound
+      .values()
+      .map(|pending| pending.expected.deadline_unix_ms)
+      .chain(
+        self
+          .pending_forwards
+          .values()
+          .map(|forward| forward.expected.deadline_unix_ms),
+      )
+      .chain(
+        self
+          .pending_inbound
+          .values()
+          .map(|pending| pending.deadline_unix_ms),
+      )
+      .min()
+  }
+
+  fn expire_pending_requests(&mut self, now_unix_ms: i64) {
+    let expired_outbound: Vec<_> = self
+      .pending_outbound
+      .iter()
+      .filter_map(|(request_id, pending)| {
+        (pending.expected.deadline_unix_ms <= now_unix_ms).then_some(*request_id)
+      })
+      .collect();
+    let expired_forwards: Vec<_> = self
+      .pending_forwards
+      .iter()
+      .filter_map(|(request_id, forward)| {
+        (forward.expected.deadline_unix_ms <= now_unix_ms).then_some(*request_id)
+      })
+      .collect();
+    let expired_inbound: Vec<_> = self
+      .pending_inbound
+      .iter()
+      .filter_map(|(token, pending)| (pending.deadline_unix_ms <= now_unix_ms).then_some(*token))
+      .collect();
+    let mut failed_peers = BTreeSet::new();
+    for request_id in expired_outbound {
+      if let Some(pending) = self.pending_outbound.remove(&request_id) {
+        failed_peers.insert(pending.expected.expected_peer);
+        let _ = pending.reply.send(Err(LinkError::Timeout));
+      }
+    }
+    for request_id in expired_forwards {
+      if let Some(forward) = self.pending_forwards.remove(&request_id) {
+        failed_peers.insert(forward.expected.expected_peer);
+        self.router.complete_forward();
+        drop(forward.channel);
+      }
+    }
+    for token in expired_inbound {
+      self.remove_pending_inbound(token);
+    }
+    for peer_id in failed_peers {
+      self.close_timed_out_peer(peer_id);
+    }
+  }
+
+  fn close_timed_out_peer(&mut self, peer_id: PeerId) {
+    let connections: Vec<_> = self
+      .state
+      .connections
+      .iter()
+      .filter_map(|(connection_id, connection)| {
+        (connection.peer_id == peer_id).then_some(*connection_id)
+      })
+      .collect();
+    let connection = if connections.len() == 1 {
+      connections.first().copied()
+    } else {
+      connections
+        .into_iter()
+        .find(|connection_id| !self.state.healthy_connections.contains(connection_id))
+    };
+    if let Some(connection_id) = connection {
+      self.swarm.close_connection(connection_id);
+    }
+  }
+
+  fn remove_pending_inbound(&mut self, token: u64) {
+    if let Some(pending) = self.pending_inbound.remove(&token) {
+      self.inbound_requests.remove(&pending.request_id);
+    }
+  }
+
+  fn remove_pending_inbound_request(&mut self, request_id: request_response::InboundRequestId) {
+    if let Some(token) = self.inbound_requests.remove(&request_id) {
+      self.pending_inbound.remove(&token);
+    }
+  }
+
+  fn remove_pending_inbound_peer(&mut self, peer_id: PeerId) {
+    let tokens: Vec<_> = self
+      .pending_inbound
+      .iter()
+      .filter_map(|(token, pending)| (pending.peer_id == peer_id).then_some(*token))
+      .collect();
+    for token in tokens {
+      self.remove_pending_inbound(token);
     }
   }
 
@@ -465,6 +591,10 @@ impl LinkActor {
     &mut self, peer_id: PeerId, envelope: Envelope,
     reply: oneshot::Sender<Result<Envelope, LinkError>>,
   ) {
+    if envelope.header().deadline_unix_ms <= now_unix_ms() {
+      let _ = reply.send(Err(LinkError::Timeout));
+      return;
+    }
     let expected = ResponseExpectation::from_request(&envelope, peer_id);
     let request_id = self
       .swarm
@@ -501,15 +631,19 @@ impl LinkActor {
   }
 
   fn respond(&mut self, token: InboundToken, envelope: Envelope) -> Result<(), LinkError> {
-    let channel = self
+    let pending = self
       .pending_inbound
       .remove(&token.0)
       .ok_or(LinkError::UnknownInbound)?;
+    self.inbound_requests.remove(&pending.request_id);
+    if pending.deadline_unix_ms <= now_unix_ms() {
+      return Err(LinkError::Timeout);
+    }
     self
       .swarm
       .behaviour_mut()
       .messaging
-      .send_response(channel, envelope)
+      .send_response(pending.channel, envelope)
       .map_err(|_| LinkError::Transport("failed to flush the overlay response".to_string()))
   }
 
@@ -517,26 +651,37 @@ impl LinkActor {
     match event {
       request_response::Event::Message { peer, message, .. } => match message {
         request_response::Message::Request {
-          request, channel, ..
-        } => self.handle_inbound_request(peer, request, channel),
+          request_id,
+          request,
+          channel,
+        } => self.handle_inbound_request(peer, request_id, request, channel),
         request_response::Message::Response {
           request_id,
           response,
         } => {
           if let Some(pending) = self.pending_outbound.remove(&request_id) {
-            let result = pending
-              .expected
-              .validate(&response, peer)
-              .map(|()| response);
+            let result = if pending.expected.deadline_unix_ms <= now_unix_ms() {
+              self.close_timed_out_peer(peer);
+              Err(LinkError::Timeout)
+            } else {
+              pending
+                .expected
+                .validate(&response, peer)
+                .map(|()| response)
+            };
             let _ = pending.reply.send(result);
           } else if let Some(forward) = self.pending_forwards.remove(&request_id) {
             self.router.complete_forward();
-            if forward.expected.validate(&response, peer).is_ok() {
+            if forward.expected.deadline_unix_ms > now_unix_ms()
+              && forward.expected.validate(&response, peer).is_ok()
+            {
               let _ = self
                 .swarm
                 .behaviour_mut()
                 .messaging
                 .send_response(forward.channel, response);
+            } else {
+              self.close_timed_out_peer(peer);
             }
           } else if !self.broadcast_requests.remove(&request_id) {
             tracing::debug!(?request_id, "ignoring orphan overlay response");
@@ -557,7 +702,10 @@ impl LinkActor {
           self.broadcast_requests.remove(&request_id);
         }
       }
-      request_response::Event::InboundFailure { error, .. } => {
+      request_response::Event::InboundFailure {
+        request_id, error, ..
+      } => {
+        self.remove_pending_inbound_request(request_id);
         tracing::debug!(%error, "overlay inbound request failed");
       }
       request_response::Event::ResponseSent { .. } => {}
@@ -565,7 +713,7 @@ impl LinkActor {
   }
 
   fn handle_inbound_request(
-    &mut self, peer_id: PeerId, envelope: Envelope,
+    &mut self, peer_id: PeerId, request_id: request_response::InboundRequestId, envelope: Envelope,
     channel: request_response::ResponseChannel<Envelope>,
   ) {
     let header = envelope.header();
@@ -580,14 +728,14 @@ impl LinkActor {
         .values()
         .any(|connection| connection.peer_id == peer_id);
       if quarantined && envelope.header().protocol == ProtocolId::Admission {
-        self.deliver(peer_id, envelope, channel);
+        self.deliver(peer_id, request_id, envelope, channel);
       } else {
         tracing::debug!(%peer_id, "dropping overlay message from an unauthorized peer");
       }
       return;
     }
     if header.protocol == ProtocolId::Admission {
-      self.deliver(peer_id, envelope, channel);
+      self.deliver(peer_id, request_id, envelope, channel);
       return;
     }
     if header.cluster_id != self.state.authorization.cluster_id() {
@@ -600,7 +748,9 @@ impl LinkActor {
       return;
     }
     match self.router.handle(envelope, now_unix_ms()) {
-      RouteDecision::Deliver(envelope) => self.deliver(peer_id, envelope, channel),
+      RouteDecision::Deliver(envelope) => {
+        self.deliver(peer_id, request_id, envelope, channel);
+      }
       RouteDecision::Forward { next_hop, envelope } => {
         let Some(next_peer) = self.state.active_peer_for_node(next_hop) else {
           self.router.complete_forward();
@@ -623,9 +773,22 @@ impl LinkActor {
   }
 
   fn deliver(
-    &mut self, peer_id: PeerId, envelope: Envelope,
+    &mut self, peer_id: PeerId, request_id: request_response::InboundRequestId, envelope: Envelope,
     channel: request_response::ResponseChannel<Envelope>,
   ) {
+    let now = now_unix_ms();
+    if envelope.header().deadline_unix_ms <= now {
+      tracing::debug!(%peer_id, "dropping an expired overlay request");
+      return;
+    }
+    if self.pending_inbound.len() >= MAX_PENDING_INBOUND {
+      tracing::warn!(%peer_id, "overlay pending inbound limit reached; dropping request");
+      return;
+    }
+    let deadline_unix_ms = envelope
+      .header()
+      .deadline_unix_ms
+      .min(now.saturating_add(MAX_INBOUND_LIFETIME_MS));
     let token = self.next_inbound_token;
     self.next_inbound_token += 1;
     if self
@@ -637,7 +800,16 @@ impl LinkActor {
       })
       .is_ok()
     {
-      self.pending_inbound.insert(token, channel);
+      self.pending_inbound.insert(
+        token,
+        PendingInbound {
+          request_id,
+          peer_id,
+          deadline_unix_ms,
+          channel,
+        },
+      );
+      self.inbound_requests.insert(request_id, token);
     } else {
       tracing::warn!("overlay inbound queue is full; dropping a delivered envelope");
     }
@@ -877,6 +1049,15 @@ impl LinkActor {
         self.state.pending_dials.remove(&connection_id);
         let quarantined_closed = self.state.quarantined.remove(&connection_id).is_some();
         let changed = self.state.connection_closed(peer_id, connection_id) || quarantined_closed;
+        let peer_still_connected = self.state.peer_is_connected(peer_id)
+          || self
+            .state
+            .quarantined
+            .values()
+            .any(|connection| connection.peer_id == peer_id);
+        if !peer_still_connected {
+          self.remove_pending_inbound_peer(peer_id);
+        }
         if let Some(node_id) = node_id
           && !self.state.node_is_connected(node_id)
         {
@@ -905,9 +1086,11 @@ impl LinkActor {
           .set_connection_health(event.peer, event.connection, true),
         Err(error) => {
           tracing::debug!(peer_id = %event.peer, %error, "overlay ping failed");
-          self
+          let changed = self
             .state
-            .set_connection_health(event.peer, event.connection, false)
+            .set_connection_health(event.peer, event.connection, false);
+          self.swarm.close_connection(event.connection);
+          changed
         }
       },
       SwarmEvent::Behaviour(LinkBehaviourEvent::Mdns(event)) => {
@@ -1109,6 +1292,13 @@ impl LinkState {
       .connections
       .values()
       .any(|connection| connection.node_id == node_id)
+  }
+
+  fn peer_is_connected(&self, peer_id: PeerId) -> bool {
+    self
+      .connections
+      .values()
+      .any(|connection| connection.peer_id == peer_id)
   }
 
   fn pending_for_node(&self, node_id: NodeId) -> bool {
