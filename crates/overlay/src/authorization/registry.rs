@@ -122,12 +122,18 @@ impl AuthorizationRegistry {
   }
 
   pub fn node_for_peer(&self, peer_id: &PeerId) -> Option<NodeId> {
-    self.records.values().find_map(|record| {
+    let mut matches = BTreeSet::new();
+    for record in self.records.values() {
       let AuthorizationStatus::Active(active) = self.status(record.node_id()) else {
-        return None;
+        continue;
       };
-      (active.peer_id() == peer_id.to_bytes()).then_some(active.node_id())
-    })
+      if active.peer_id() == peer_id.to_bytes() {
+        matches.insert(active.node_id());
+      }
+    }
+    let mut matches = matches.into_iter();
+    let node_id = matches.next()?;
+    matches.next().is_none().then_some(node_id)
   }
 
   pub fn active_record_for_node(&self, node_id: NodeId) -> Option<&AuthorizationRecord> {
@@ -139,7 +145,8 @@ impl AuthorizationRegistry {
 
   pub fn active_peer_for_node(&self, node_id: NodeId) -> Option<PeerId> {
     let record = self.active_record_for_node(node_id)?;
-    PeerId::from_bytes(record.peer_id()).ok()
+    let peer_id = PeerId::from_bytes(record.peer_id()).ok()?;
+    (self.node_for_peer(&peer_id) == Some(node_id)).then_some(peer_id)
   }
 
   pub fn authorizer_head(

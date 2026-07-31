@@ -74,7 +74,18 @@ cargo +nightly fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 cargo build --release --target x86_64-unknown-linux-musl -p lycoris --locked
+cargo xwin clippy --workspace --all-targets --all-features --locked \
+  --target x86_64-pc-windows-msvc -- -D warnings
+cargo xwin test --workspace --lib --tests --all-features --locked \
+  --target x86_64-pc-windows-msvc --no-run
 ```
+
+The `cargo xwin` checks are mandatory when `cargo-xwin` is available and verify
+that the Windows MSVC target remains warning-free and that every test binary
+cross-links. They do not replace the native Windows test run. Apple targets
+require the Apple SDK, so source review on non-Apple hosts is not release
+evidence; the native `macos-latest` quality job and `aarch64-apple-darwin`
+release build must pass before the final push is accepted.
 
 Run Lens diagnostics on all edited files. Workflow changes additionally require
 `act`. Commit messages use gitmoji, lowercase imperative summaries, and list-form
@@ -92,12 +103,18 @@ Merge work is prohibited until this phase passes.
   - Reject admission or checkpoint application on any failure.
   - Cover storage failure, actor failure, restart, and no-partial-checkpoint
     behavior.
-- [ ] **1.2 Make admission resumable and idempotent.**
+- [x] **1.2 Make admission resumable and idempotent.**
   - Permit an exact active identity/key match to prove the join key again and
     retrieve its existing record plus current checkpoint.
-  - Continue rejecting every NodeId, initial-key, current-key, peer-id, or epoch
-    mismatch.
-  - Cover lost response, sponsor restart, joiner restart, wrong key, and replay.
+  - Reject every NodeId, initial-key, current-key, or peer-id mismatch; resume
+    uses the sponsor's current record epoch rather than caller-supplied state.
+  - Scope request IDs with a secure random 128-bit boot identifier and a
+    monotonic sequence that fails closed before wrap. Cross-boot collisions are
+    bounded by the 128-bit wire identifier rather than claimed impossible.
+  - Bind every admission challenge and outcome to the dialed sponsor PeerId,
+    exact candidate identity, and a uniquely authorized checkpoint record.
+  - Cover a discarded committed outcome, sponsor restart, joiner restart, wrong
+    key, response mismatch, sequence exhaustion, and replay.
 - [ ] **1.3 bind persisted registry to local identity at startup.**
   - Never generate a new identity when authorization state already exists.
   - Require the local NodeId, PeerId, and current key to match one active record.
@@ -277,7 +294,8 @@ All conditions are mandatory:
 - [ ] Daemon business code does not depend on client/tonic transport errors.
 - [ ] Real CLI E2E enforces the 10-second convergence deadline.
 - [ ] Fmt, Clippy, workspace tests, Linux musl, Lens, and applicable `act` runs pass.
-- [ ] macOS and Windows GitHub CI pass after merge to `main`.
+- [ ] Native macOS and Windows GitHub CI and release builds pass for the final
+  commit on `main`.
 - [ ] Worktree contains no untracked output except the intentionally retained
   `.pi-subagents/` audit artifacts.
 - [ ] The complete atomic commit sequence receives an independent review before
@@ -285,8 +303,8 @@ All conditions are mandatory:
 
 ## Immediate next step
 
-Implement **1.1 Commit authorization checkpoints atomically**. Do not begin merge
-wire types or dual-plane routing before every Phase 1 gate passes.
+Implement **1.3 Bind persisted registry to local identity at startup**. Do not
+begin merge wire types or dual-plane routing before every Phase 1 gate passes.
 
 Verify this document remains actionable:
 

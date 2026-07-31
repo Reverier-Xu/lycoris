@@ -83,6 +83,10 @@ async fn commit_enrollment(
   committer: &impl RegistryCommitter, store: AuthorizationStorage, current: &mut Enrollment,
   proposed: Enrollment,
 ) -> Result<(), OverlayError> {
+  if current.registry().records() == proposed.registry().records() {
+    *current = proposed;
+    return Ok(());
+  }
   committer
     .commit_registry(store, proposed.registry().clone(), false)
     .await?;
@@ -229,27 +233,23 @@ impl OverlayNode {
   /// On success the sponsor's registry checkpoint replaces the local one
   /// (persisted, adopted into the link actor, and adopted into enrollment).
   pub async fn join(&self, address: Multiaddr, join_key: &ClusterKey) -> Result<(), OverlayError> {
-    self.handle.dial_admission(address).await?;
-    let deadline = std::time::Instant::now() + JOIN_TIMEOUT;
-    while self.handle.snapshot().quarantined_count == 0 {
-      if std::time::Instant::now() > deadline {
-        return Err(OverlayError::JoinFailed(
-          "sponsor connection was not quarantined in time".to_string(),
-        ));
-      }
-      tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    let sponsor_peer_id = self.handle.dial_admission(address).await?;
+    self
+      .handle
+      .wait_quarantined(sponsor_peer_id, JOIN_TIMEOUT)
+      .await?;
     let candidate = AdmissionCandidate::new(&self.identity)?;
     let sentinel = NodeId::from_bytes([0; NodeId::BYTE_LENGTH]);
     let sentinel_cluster = ClusterId::from_bytes([0; ClusterId::BYTE_LENGTH]);
-    let challenge = match self
+    let (begin_source, begin_response) = self
       .admission_call(
+        sponsor_peer_id,
         sentinel,
         sentinel_cluster,
         &AdmissionRequest::Begin(candidate.clone()),
       )
-      .await?
-    {
+      .await?;
+    let challenge = match begin_response {
       AdmissionResponse::Challenge(challenge) => challenge,
       AdmissionResponse::Rejected(reason) => return Err(OverlayError::JoinRejected(reason)),
       other => {
@@ -258,15 +258,21 @@ impl OverlayNode {
         )));
       }
     };
-    let proof = JoinProof::create(join_key, candidate, challenge.clone())?;
-    let outcome = match self
+    if begin_source != challenge.sponsor_node_id() {
+      return Err(OverlayError::JoinFailed(
+        "admission challenge source does not match its sponsor identity".to_string(),
+      ));
+    }
+    let proof = JoinProof::create(join_key, candidate.clone(), challenge.clone())?;
+    let (_, prove_response) = self
       .admission_call(
-        sentinel,
+        sponsor_peer_id,
+        challenge.sponsor_node_id(),
         challenge.cluster_id(),
         &AdmissionRequest::Prove(proof),
       )
-      .await?
-    {
+      .await?;
+    let outcome = match prove_response {
       AdmissionResponse::Admitted(outcome) => outcome,
       AdmissionResponse::Rejected(reason) => return Err(OverlayError::JoinRejected(reason)),
       other => {
@@ -275,8 +281,7 @@ impl OverlayNode {
         )));
       }
     };
-    let registry =
-      AuthorizationRegistry::from_records(challenge.cluster_id(), outcome.records().to_vec())?;
+    let registry = outcome.validate_for(&candidate, &challenge, &sponsor_peer_id)?;
     let records = registry.records();
     let store = self.node.authorization().clone();
     self
@@ -303,18 +308,20 @@ impl OverlayNode {
   }
 
   async fn admission_call(
-    &self, destination: NodeId, cluster_id: ClusterId, request: &AdmissionRequest,
-  ) -> Result<AdmissionResponse, OverlayError> {
+    &self, sponsor: lycoris_overlay::PeerId, destination: NodeId, cluster_id: ClusterId,
+    request: &AdmissionRequest,
+  ) -> Result<(NodeId, AdmissionResponse), OverlayError> {
     let payload = postcard::to_stdvec(request)?;
     let Some(envelope) =
-      self.request_envelope(destination, cluster_id, ProtocolId::Admission, payload)
+      self.request_envelope(destination, cluster_id, ProtocolId::Admission, payload)?
     else {
       return Err(OverlayError::JoinFailed(
         "admission request exceeds the frame budget".to_string(),
       ));
     };
-    let response = self.handle.request(envelope).await?;
-    Ok(postcard::from_bytes(response.payload())?)
+    let response = self.handle.request_admission(sponsor, envelope).await?;
+    let source = response.header().source;
+    Ok((source, postcard::from_bytes(response.payload())?))
   }
 
   /// Stop the link actor; tolerates a dispatcher that already stopped it.
@@ -528,13 +535,18 @@ impl OverlayNode {
     };
     let cluster_id = registry.cluster_id();
     for destination in self.handle.snapshot().connected_nodes {
-      let Some(envelope) = self.request_envelope(
+      let envelope = match self.request_envelope(
         destination,
         cluster_id,
         ProtocolId::Registry,
         payload.clone(),
-      ) else {
-        return;
+      ) {
+        Ok(Some(envelope)) => envelope,
+        Ok(None) => return,
+        Err(error) => {
+          tracing::error!(%error, "stopping registry publication");
+          return;
+        }
       };
       let handle = self.handle.clone();
       let enrollment = self.enrollment.clone();
@@ -575,11 +587,11 @@ impl OverlayNode {
 
   fn request_envelope(
     &self, destination: NodeId, cluster_id: ClusterId, protocol: ProtocolId, payload: Vec<u8>,
-  ) -> Option<Envelope> {
+  ) -> Result<Option<Envelope>, LinkError> {
     let header = EnvelopeHeader {
       version: PROTOCOL_VERSION,
       cluster_id,
-      request_id: self.handle.next_request_id(),
+      request_id: self.handle.next_request_id()?,
       source: self.node_id(),
       destination,
       protocol,
@@ -588,10 +600,10 @@ impl OverlayNode {
       remaining_hops: REGISTRY_REQUEST_HOPS,
     };
     match Envelope::new(header, payload) {
-      Ok(envelope) => Some(envelope),
+      Ok(envelope) => Ok(Some(envelope)),
       Err(error) => {
         tracing::warn!(%error, "registry checkpoint exceeds the overlay frame budget");
-        None
+        Ok(None)
       }
     }
   }
@@ -756,6 +768,30 @@ mod tests {
 
     assert_eq!(current.registry().records().len(), 2);
     assert!(committer.called.load(Ordering::SeqCst));
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn unchanged_registry_adopts_without_a_durable_rewrite() -> TestResult {
+    let dir = tempfile::TempDir::new()?;
+    let storage = lycoris_storage::Storage::open(dir.path().join("lycoris.redb"))?;
+    let committer = TestRegistryCommitter {
+      called: AtomicBool::new(false),
+      fail: true,
+    };
+    let (mut current, _) = test_enrollments()?;
+    let proposed = current.clone();
+
+    commit_enrollment(
+      &committer,
+      storage.node().authorization().clone(),
+      &mut current,
+      proposed,
+    )
+    .await?;
+
+    assert!(!committer.called.load(Ordering::SeqCst));
+    assert_eq!(current.registry().records().len(), 1);
     Ok(())
   }
 

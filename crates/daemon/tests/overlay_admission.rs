@@ -5,10 +5,9 @@ use lycoris_config::{ClusterConfig, DaemonConfig, ExtensionsConfig, NodeConfig, 
 use lycoris_core::ClusterKey;
 use lycoris_daemon::{overlay_transport::OverlayPool, runtime::NodeHandles};
 use lycoris_overlay::{
-  AdmissionCandidate, AdmissionRequest, AdmissionResponse, AuthorizationRecord,
+  AdmissionCandidate, AdmissionOutcome, AdmissionRequest, AdmissionResponse, AuthorizationRecord,
   AuthorizationRegistry, ClusterId, Envelope, EnvelopeHeader, JoinProof, LinkConfig, LinkHandle,
   LinkRuntime, MessageKind, Multiaddr, NodeId, NodeIdentity, PROTOCOL_VERSION, ProtocolId,
-  RequestId,
 };
 use lycoris_proto::node::{
   RegisterExtensionRequest, ResourceKind, ResourceScope as ProtoResourceScope,
@@ -281,23 +280,27 @@ async fn wait_for_tcp_listen(handle: &LinkHandle) -> Multiaddr {
 }
 
 async fn admission_call(
-  handle: &LinkHandle, source: NodeId, cluster_id: ClusterId, nonce: u8, request: &AdmissionRequest,
-) -> AdmissionResponse {
+  handle: &LinkHandle, sponsor: lycoris_overlay::PeerId, source: NodeId, destination: NodeId,
+  cluster_id: ClusterId, request: &AdmissionRequest,
+) -> (NodeId, AdmissionResponse) {
   let payload = postcard::to_stdvec(request).unwrap();
   let header = EnvelopeHeader {
     version: PROTOCOL_VERSION,
     cluster_id,
-    request_id: RequestId::from_bytes([nonce; RequestId::BYTE_LENGTH]),
+    request_id: handle.next_request_id().unwrap(),
     source,
-    destination: NodeId::from_bytes([0; NodeId::BYTE_LENGTH]),
+    destination,
     protocol: ProtocolId::Admission,
     kind: MessageKind::Request,
     deadline_unix_ms: FAR_FUTURE_MS,
     remaining_hops: 0,
   };
   let envelope = Envelope::new(header, payload).unwrap();
-  let response = handle.request(envelope).await.unwrap();
-  postcard::from_bytes(response.payload()).unwrap()
+  let response = handle.request_admission(sponsor, envelope).await.unwrap();
+  (
+    response.header().source,
+    postcard::from_bytes(response.payload()).unwrap(),
+  )
 }
 
 fn start_client(identity: &NodeIdentity) -> LinkRuntime {
@@ -311,118 +314,162 @@ fn start_client(identity: &NodeIdentity) -> LinkRuntime {
   .unwrap()
 }
 
-/// Drive the full join-key enrollment of a test-side client against a sponsor
-/// address, adopting the sponsor's registry checkpoint. Returns the cluster id.
-async fn enroll_client(
+/// Drive join-key proof against a sponsor without adopting the returned
+/// checkpoint. Callers can deliberately discard the outcome after the
+/// sponsor's durable commit to model a joiner that never adopts it.
+async fn request_enrollment(
   handle: &LinkHandle, identity: &NodeIdentity, sponsor_address: Multiaddr,
   cluster_key: &ClusterKey,
-) -> ClusterId {
-  handle.dial_admission(sponsor_address).await.unwrap();
-  let quarantined = tokio::time::timeout(WAIT, async {
-    loop {
-      if handle.snapshot().quarantined_count > 0 {
-        return;
-      }
-      tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-  })
-  .await;
-  assert!(
-    quarantined.is_ok(),
-    "admission connection was not quarantined"
-  );
+) -> (ClusterId, Box<AdmissionOutcome>) {
+  let sponsor_peer = handle.dial_admission(sponsor_address).await.unwrap();
+  handle.wait_quarantined(sponsor_peer, WAIT).await.unwrap();
 
   let candidate = AdmissionCandidate::new(identity).unwrap();
   let begin = AdmissionRequest::Begin(candidate.clone());
-  let AdmissionResponse::Challenge(challenge) = admission_call(
+  let (begin_source, AdmissionResponse::Challenge(challenge)) = admission_call(
     handle,
+    sponsor_peer,
     identity.node_id(),
+    NodeId::from_bytes([0; NodeId::BYTE_LENGTH]),
     ClusterId::from_bytes([0; 32]),
-    31,
     &begin,
   )
   .await
   else {
     panic!("expected an admission challenge");
   };
-  let proof = JoinProof::create(cluster_key, candidate, challenge.clone()).unwrap();
+  assert_eq!(begin_source, challenge.sponsor_node_id());
+  let proof = JoinProof::create(cluster_key, candidate.clone(), challenge.clone()).unwrap();
   let prove = AdmissionRequest::Prove(proof);
-  let AdmissionResponse::Admitted(outcome) = admission_call(
+  let (_, AdmissionResponse::Admitted(outcome)) = admission_call(
     handle,
+    sponsor_peer,
     identity.node_id(),
+    challenge.sponsor_node_id(),
     challenge.cluster_id(),
-    33,
     &prove,
   )
   .await
   else {
     panic!("expected an admission outcome");
   };
+  outcome
+    .validate_for(&candidate, &challenge, &sponsor_peer)
+    .unwrap();
   assert_eq!(outcome.record().node_id(), identity.node_id());
+  (challenge.cluster_id(), outcome)
+}
+
+/// Complete test-side enrollment and adopt the sponsor checkpoint.
+async fn enroll_client(
+  handle: &LinkHandle, identity: &NodeIdentity, sponsor_address: Multiaddr,
+  cluster_key: &ClusterKey,
+) -> ClusterId {
+  let (cluster_id, outcome) =
+    request_enrollment(handle, identity, sponsor_address, cluster_key).await;
   let adopted =
-    AuthorizationRegistry::from_records(challenge.cluster_id(), outcome.records().to_vec())
-      .unwrap();
+    AuthorizationRegistry::from_records(cluster_id, outcome.records().to_vec()).unwrap();
   handle
     .commit_adopt_authorization(adopted, || Ok::<(), std::io::Error>(()))
     .await
     .unwrap();
-  challenge.cluster_id()
+  cluster_id
 }
 
 #[tokio::test]
-async fn joiner_enrolls_against_a_live_daemon() {
+async fn committed_admission_resumes_after_joiner_discards_outcome_and_both_restart() {
   let _ = lycoris_tls::install_crypto_provider();
   let cluster_key = ClusterKey::generate().unwrap();
-  let daemon = spawn_daemon(
+  let sponsor = spawn_daemon(
     TempDir::new().unwrap(),
     vec!["/ip4/127.0.0.1/tcp/0".to_string()],
     None,
     &cluster_key,
   )
   .await;
-  let daemon_node = daemon.node_id();
-  let cluster_id = ClusterId::from_genesis(daemon_node);
-  let daemon_address = daemon.overlay_tcp_address().await;
+  let sponsor_node = sponsor.node_id();
+  let cluster_id = ClusterId::from_genesis(sponsor_node);
+  let sponsor_address = sponsor.overlay_tcp_address().await;
 
-  let joiner_identity = NodeIdentity::generate();
-  let joiner = start_client(&joiner_identity);
-  let joiner_handle = joiner.handle();
+  // Start and stop a real standalone daemon so the later join attempt is a
+  // restart from its original durable identity and genesis checkpoint.
+  let standalone_joiner = spawn_daemon(
+    TempDir::new().unwrap(),
+    vec!["/ip4/127.0.0.1/tcp/0".to_string()],
+    None,
+    &cluster_key,
+  )
+  .await;
+  let joiner_identity = standalone_joiner.identity();
+  let joiner_dir = standalone_joiner.stop().await;
+  {
+    let storage = Storage::open(joiner_dir.path().join("lycoris.redb")).unwrap();
+    assert_eq!(storage.node().authorization().records().unwrap().len(), 1);
+  }
+
+  let first_joiner = start_client(&joiner_identity);
+  let first_handle = first_joiner.handle();
   let admission_address: Multiaddr =
-    format!("{daemon_address}/p2p/{}", daemon.identity().peer_id())
+    format!("{sponsor_address}/p2p/{}", sponsor.identity().peer_id())
       .parse()
       .unwrap();
-  let adopted_cluster = enroll_client(
-    &joiner_handle,
+  let (committed_cluster, discarded_outcome) = request_enrollment(
+    &first_handle,
     &joiner_identity,
     admission_address,
     &cluster_key,
   )
   .await;
-  assert_eq!(adopted_cluster, cluster_id);
+  assert_eq!(committed_cluster, cluster_id);
+  assert_eq!(discarded_outcome.records().len(), 2);
+  drop(discarded_outcome);
+  first_joiner.shutdown().await.unwrap();
+  {
+    let reopened = Storage::open(joiner_dir.path().join("lycoris.redb")).unwrap();
+    assert_eq!(reopened.node().authorization().records().unwrap().len(), 1);
+  }
 
-  joiner_handle
-    .wait_connected(daemon_node, WAIT)
+  let sponsor_dir = sponsor.stop().await;
+  let restarted_sponsor = spawn_daemon(
+    sponsor_dir,
+    vec!["/ip4/127.0.0.1/tcp/0".to_string()],
+    None,
+    &cluster_key,
+  )
+  .await;
+  assert_eq!(restarted_sponsor.node_id(), sponsor_node);
+  let restarted_address = restarted_sponsor.overlay_tcp_address().await;
+  let restarted_join: String = format!(
+    "{restarted_address}/p2p/{}",
+    restarted_sponsor.identity().peer_id()
+  );
+
+  // Real daemon startup reopens the joiner's standalone checkpoint and must
+  // resume the sponsor's already committed admission instead of appending one.
+  let restarted_joiner = spawn_daemon(
+    joiner_dir,
+    vec!["/ip4/127.0.0.1/tcp/0".to_string()],
+    Some(restarted_join),
+    &cluster_key,
+  )
+  .await;
+  assert_eq!(restarted_joiner.node_id(), joiner_identity.node_id());
+  restarted_joiner
+    .handles
+    .overlay
+    .wait_connected(sponsor_node, WAIT)
     .await
     .unwrap();
-  let daemon_seen = tokio::time::timeout(WAIT, async {
-    loop {
-      if daemon
-        .handles
-        .overlay
-        .snapshot()
-        .connected_nodes
-        .contains(&joiner_identity.node_id())
-      {
-        return;
-      }
-      tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-  })
-  .await;
-  assert!(daemon_seen.is_ok(), "daemon never saw the admitted joiner");
 
-  joiner.shutdown().await.unwrap();
-  daemon.stop().await;
+  let joiner_dir = restarted_joiner.stop().await;
+  let sponsor_dir = restarted_sponsor.stop().await;
+  for path in [
+    joiner_dir.path().join("lycoris.redb"),
+    sponsor_dir.path().join("lycoris.redb"),
+  ] {
+    let reopened = Storage::open(path).unwrap();
+    assert_eq!(reopened.node().authorization().records().unwrap().len(), 2);
+  }
 }
 
 #[tokio::test]

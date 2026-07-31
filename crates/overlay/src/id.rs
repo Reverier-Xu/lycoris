@@ -69,14 +69,19 @@ impl NodeId {
 }
 
 impl RequestId {
-  /// Derive a deterministic, unique-per-`(node, nonce)` request identifier.
-  /// Callers keep their own monotonic nonce, so ids never collide across
-  /// reboots and never repeat within a node.
-  pub fn derive(node_id: NodeId, nonce: u64) -> Self {
-    let mut input = Vec::with_capacity(40);
-    input.extend_from_slice(node_id.as_bytes());
-    input.extend_from_slice(&nonce.to_be_bytes());
-    let hash = blake3::hash(&input);
+  /// Derive a request identifier scoped to one random runtime boot namespace.
+  ///
+  /// A monotonic sequence prevents reuse within one boot. Independent 128-bit
+  /// boot identifiers make cross-boot input reuse probabilistic at the same
+  /// security level as this 128-bit wire identifier.
+  pub(crate) fn derive(node_id: NodeId, boot_id: &[u8; 16], sequence: u64) -> Self {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"lycoris/request-id/2");
+    hasher.update(&[0]);
+    hasher.update(node_id.as_bytes());
+    hasher.update(boot_id);
+    hasher.update(&sequence.to_be_bytes());
+    let hash = hasher.finalize();
     let mut bytes = [0_u8; Self::BYTE_LENGTH];
     bytes.copy_from_slice(&hash.as_bytes()[..Self::BYTE_LENGTH]);
     Self::from_bytes(bytes)

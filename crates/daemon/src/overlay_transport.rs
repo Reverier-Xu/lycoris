@@ -159,7 +159,7 @@ impl OverlayPeerRoute {
     let header = EnvelopeHeader {
       version: PROTOCOL_VERSION,
       cluster_id: self.cluster_id,
-      request_id: self.handle.next_request_id(),
+      request_id: self.handle.next_request_id().map_err(unavailable)?,
       source: self.local,
       destination: self.peer,
       protocol,

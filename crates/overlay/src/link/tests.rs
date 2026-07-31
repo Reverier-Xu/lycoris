@@ -12,7 +12,7 @@ use super::*;
 use crate::{
   AdmissionCandidate, AdmissionOutcome, AdmissionRequest, AdmissionResponse, AuthorizationRecord,
   AuthorizationRegistry, ClusterId, Enrollment, Envelope, EnvelopeHeader, JoinProof, MessageKind,
-  NodeId, NodeIdentity, PROTOCOL_VERSION, ProtocolId, RequestId,
+  NodeId, NodeIdentity, PROTOCOL_VERSION, PeerId, ProtocolId, RequestId,
 };
 
 const WAIT: Duration = Duration::from_secs(5);
@@ -25,7 +25,94 @@ async fn cloned_handles_share_one_request_id_sequence() -> Result<(), LinkError>
   let first = runtime.handle();
   let second = runtime.handle();
 
-  assert_ne!(first.next_request_id(), second.next_request_id());
+  assert_ne!(first.next_request_id()?, second.next_request_id()?);
+  runtime.shutdown().await?;
+  Ok(())
+}
+
+#[tokio::test]
+async fn boot_namespace_changes_request_ids_deterministically() -> Result<(), LinkError> {
+  let identity = NodeIdentity::generate();
+  let registry = single_registry(&identity);
+  let first_boot = [1; 16];
+  let first = LinkRuntime::start_with_request_sequence(
+    &identity,
+    LinkConfig::new(vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()]),
+    registry.clone(),
+    first_boot,
+    0,
+  )?;
+  let first_id = first.handle().next_request_id()?;
+  first.shutdown().await?;
+
+  let second_boot = [2; 16];
+  let second = LinkRuntime::start_with_request_sequence(
+    &identity,
+    LinkConfig::new(vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()]),
+    registry,
+    second_boot,
+    0,
+  )?;
+  let second_id = second.handle().next_request_id()?;
+
+  assert_eq!(
+    first_id,
+    RequestId::derive(identity.node_id(), &first_boot, 0)
+  );
+  assert_eq!(
+    second_id,
+    RequestId::derive(identity.node_id(), &second_boot, 0)
+  );
+  assert_ne!(first_id, second_id);
+  second.shutdown().await?;
+  Ok(())
+}
+
+#[tokio::test]
+async fn request_sequence_fails_closed_at_exhaustion() -> Result<(), LinkError> {
+  let identity = NodeIdentity::generate();
+  let runtime = LinkRuntime::start_with_request_sequence(
+    &identity,
+    LinkConfig::new(vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()]),
+    single_registry(&identity),
+    [3; 16],
+    u64::MAX,
+  )?;
+  let handle = runtime.handle();
+
+  assert!(matches!(
+    handle.next_request_id(),
+    Err(LinkError::RequestSequenceExhausted)
+  ));
+  assert!(matches!(
+    handle.next_request_id(),
+    Err(LinkError::RequestSequenceExhausted)
+  ));
+  runtime.shutdown().await?;
+  Ok(())
+}
+
+#[tokio::test]
+async fn admission_requests_require_an_explicit_available_peer() -> Result<(), LinkError> {
+  let identity = NodeIdentity::generate();
+  let runtime = start_tcp(&identity, single_registry(&identity));
+  let handle = runtime.handle();
+  let envelope = admission_envelope(
+    identity.node_id(),
+    NodeId::from_bytes([0; NodeId::BYTE_LENGTH]),
+    ClusterId::from_bytes([0; ClusterId::BYTE_LENGTH]),
+    31,
+    Vec::new(),
+  );
+
+  assert!(matches!(
+    handle.request(envelope.clone()).await,
+    Err(LinkError::InvalidAdmissionRequest)
+  ));
+  assert!(matches!(
+    handle.request_admission(PeerId::random(), envelope).await,
+    Err(LinkError::AdmissionPeerUnavailable(_))
+  ));
   runtime.shutdown().await?;
   Ok(())
 }
@@ -584,21 +671,29 @@ async fn quarantined_peers_enroll_and_promote_to_a_logical_edge() {
     format!("{sponsor_address}/p2p/{}", sponsor_identity.peer_id())
       .parse()
       .unwrap();
-  joiner_handle
+  let sponsor_peer = joiner_handle
     .dial_admission(admission_address)
     .await
     .unwrap();
-  wait_for_snapshot(&joiner_handle, |snapshot| snapshot.quarantined_count > 0).await;
+  joiner_handle
+    .wait_quarantined(sponsor_peer, WAIT)
+    .await
+    .unwrap();
   assert!(sponsor_handle.snapshot().connected_nodes.is_empty());
 
   let candidate = AdmissionCandidate::new(&joiner_identity).unwrap();
   let begin = AdmissionRequest::Begin(candidate.clone());
   let challenge_response = joiner_handle
-    .request(admission_envelope(
-      joiner_identity.node_id(),
-      21,
-      postcard::to_stdvec(&begin).unwrap(),
-    ))
+    .request_admission(
+      sponsor_peer,
+      admission_envelope(
+        joiner_identity.node_id(),
+        NodeId::from_bytes([0; NodeId::BYTE_LENGTH]),
+        ClusterId::from_bytes([0; ClusterId::BYTE_LENGTH]),
+        21,
+        postcard::to_stdvec(&begin).unwrap(),
+      ),
+    )
     .await
     .unwrap();
   let AdmissionResponse::Challenge(challenge) =
@@ -607,15 +702,21 @@ async fn quarantined_peers_enroll_and_promote_to_a_logical_edge() {
     panic!("expected an admission challenge");
   };
   assert_eq!(challenge.cluster_id(), cluster_id);
+  assert_eq!(challenge.sponsor_node_id(), sponsor_identity.node_id());
 
-  let proof = JoinProof::create(&join_key, candidate, challenge).unwrap();
+  let proof = JoinProof::create(&join_key, candidate.clone(), challenge.clone()).unwrap();
   let prove = AdmissionRequest::Prove(proof);
   let admitted_response = joiner_handle
-    .request(admission_envelope(
-      joiner_identity.node_id(),
-      23,
-      postcard::to_stdvec(&prove).unwrap(),
-    ))
+    .request_admission(
+      sponsor_peer,
+      admission_envelope(
+        joiner_identity.node_id(),
+        challenge.sponsor_node_id(),
+        challenge.cluster_id(),
+        23,
+        postcard::to_stdvec(&prove).unwrap(),
+      ),
+    )
     .await
     .unwrap();
   let AdmissionResponse::Admitted(outcome) =
@@ -624,8 +725,9 @@ async fn quarantined_peers_enroll_and_promote_to_a_logical_edge() {
     panic!("expected an admission outcome");
   };
   assert_eq!(outcome.record().node_id(), joiner_identity.node_id());
-  let adopted =
-    AuthorizationRegistry::from_records(cluster_id, outcome.records().to_vec()).unwrap();
+  let adopted = outcome
+    .validate_for(&candidate, &challenge, &sponsor_peer)
+    .unwrap();
   joiner_handle
     .commit_adopt_authorization(adopted, || Ok::<(), std::io::Error>(()))
     .await
@@ -647,13 +749,15 @@ async fn quarantined_peers_enroll_and_promote_to_a_logical_edge() {
   sponsor.shutdown().await.unwrap();
 }
 
-fn admission_envelope(source: NodeId, nonce: u8, payload: Vec<u8>) -> Envelope {
+fn admission_envelope(
+  source: NodeId, destination: NodeId, cluster_id: ClusterId, nonce: u8, payload: Vec<u8>,
+) -> Envelope {
   let header = EnvelopeHeader {
     version: PROTOCOL_VERSION,
-    cluster_id: ClusterId::from_bytes([0; ClusterId::BYTE_LENGTH]),
+    cluster_id,
     request_id: RequestId::from_bytes([nonce; RequestId::BYTE_LENGTH]),
     source,
-    destination: NodeId::from_bytes([0; NodeId::BYTE_LENGTH]),
+    destination,
     protocol: ProtocolId::Admission,
     kind: MessageKind::Request,
     deadline_unix_ms: FAR_FUTURE_MS,
@@ -676,23 +780,6 @@ fn response_envelope(request: &Envelope, source: NodeId, payload: Vec<u8>) -> En
     remaining_hops: request_header.remaining_hops,
   };
   Envelope::new(header, payload).unwrap()
-}
-
-async fn wait_for_snapshot(handle: &LinkHandle, predicate: impl Fn(&LinkSnapshot) -> bool) {
-  let mut snapshots = handle.subscribe();
-  let observed = tokio::time::timeout(WAIT, async {
-    loop {
-      if predicate(&snapshots.borrow()) {
-        return;
-      }
-      snapshots.changed().await.unwrap();
-    }
-  })
-  .await;
-  assert!(
-    observed.is_ok(),
-    "snapshot did not reach the expected state"
-  );
 }
 
 fn request_envelope(

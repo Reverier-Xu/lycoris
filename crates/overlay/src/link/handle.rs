@@ -14,6 +14,33 @@ use crate::{
   AuthorizationRegistry, Envelope, NodeId, RequestId, authorization::AuthorizationError,
 };
 
+pub(super) const REQUEST_BOOT_ID_BYTES: usize = 16;
+
+#[derive(Debug)]
+pub(super) struct RequestSequence {
+  boot_id: [u8; REQUEST_BOOT_ID_BYTES],
+  next: AtomicU64,
+}
+
+impl RequestSequence {
+  pub(super) const fn new(boot_id: [u8; REQUEST_BOOT_ID_BYTES], next: u64) -> Self {
+    Self {
+      boot_id,
+      next: AtomicU64::new(next),
+    }
+  }
+
+  pub(super) fn allocate(&self, node_id: NodeId) -> Result<RequestId, LinkError> {
+    let sequence = self
+      .next
+      .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        current.checked_add(1)
+      })
+      .map_err(|_| LinkError::RequestSequenceExhausted)?;
+    Ok(RequestId::derive(node_id, &self.boot_id, sequence))
+  }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct LinkSnapshot {
   pub node_id: NodeId,
@@ -21,7 +48,8 @@ pub struct LinkSnapshot {
   pub connected_nodes: Vec<NodeId>,
   pub healthy_nodes: Vec<NodeId>,
   pub connection_count: usize,
-  /// Unauthorized connections currently confined to the admission protocol.
+  /// Unauthorized peers currently confined to the admission protocol.
+  pub quarantined_peers: Vec<libp2p::PeerId>,
   pub quarantined_count: usize,
 }
 
@@ -44,7 +72,7 @@ pub struct LinkHandle {
   commands: mpsc::Sender<LinkCommand>,
   snapshots: watch::Receiver<LinkSnapshot>,
   inbound: Arc<Mutex<mpsc::Receiver<InboundEnvelope>>>,
-  request_nonce: Arc<AtomicU64>,
+  request_ids: Arc<RequestSequence>,
 }
 
 impl LinkHandle {
@@ -108,6 +136,21 @@ impl LinkHandle {
   pub async fn request(&self, envelope: Envelope) -> Result<Envelope, LinkError> {
     let (reply, response) = oneshot::channel();
     self.send(LinkCommand::Request { envelope, reply }).await?;
+    response.await.map_err(|_| LinkError::ActorStopped)?
+  }
+
+  /// Send admission traffic only to the explicitly dialed sponsor peer.
+  pub async fn request_admission(
+    &self, sponsor: libp2p::PeerId, envelope: Envelope,
+  ) -> Result<Envelope, LinkError> {
+    let (reply, response) = oneshot::channel();
+    self
+      .send(LinkCommand::RequestAdmission {
+        sponsor,
+        envelope,
+        reply,
+      })
+      .await?;
     response.await.map_err(|_| LinkError::ActorStopped)?
   }
 
@@ -183,6 +226,16 @@ impl LinkHandle {
       .await
   }
 
+  pub async fn wait_quarantined(
+    &self, peer_id: libp2p::PeerId, timeout: Duration,
+  ) -> Result<(), LinkError> {
+    self
+      .wait_for(timeout, |snapshot| {
+        snapshot.quarantined_peers.contains(&peer_id)
+      })
+      .await
+  }
+
   pub async fn wait_healthy(&self, node_id: NodeId, timeout: Duration) -> Result<(), LinkError> {
     self
       .wait_for(timeout, |snapshot| {
@@ -193,9 +246,8 @@ impl LinkHandle {
 
   /// Allocate the next request id from the runtime-wide sequence shared by
   /// link-state broadcasts and every upper protocol.
-  pub fn next_request_id(&self) -> RequestId {
-    let nonce = self.request_nonce.fetch_add(1, Ordering::Relaxed) + 1;
-    RequestId::derive(self.snapshot().node_id, nonce)
+  pub fn next_request_id(&self) -> Result<RequestId, LinkError> {
+    self.request_ids.allocate(self.snapshot().node_id)
   }
 
   pub(crate) async fn shutdown(&self) -> Result<(), LinkError> {
@@ -204,15 +256,15 @@ impl LinkHandle {
     response.await.map_err(|_| LinkError::ActorStopped)
   }
 
-  pub(crate) fn new(
+  pub(super) fn new(
     commands: mpsc::Sender<LinkCommand>, snapshots: watch::Receiver<LinkSnapshot>,
-    inbound: mpsc::Receiver<InboundEnvelope>, request_nonce: Arc<AtomicU64>,
+    inbound: mpsc::Receiver<InboundEnvelope>, request_ids: Arc<RequestSequence>,
   ) -> Self {
     Self {
       commands,
       snapshots,
       inbound: Arc::new(Mutex::new(inbound)),
-      request_nonce,
+      request_ids,
     }
   }
 
@@ -249,6 +301,11 @@ pub(crate) type AuthorizationCommit = Box<dyn FnOnce() -> Result<(), String> + S
 
 pub(crate) enum LinkCommand {
   Request {
+    envelope: Envelope,
+    reply: oneshot::Sender<Result<Envelope, LinkError>>,
+  },
+  RequestAdmission {
+    sponsor: libp2p::PeerId,
     envelope: Envelope,
     reply: oneshot::Sender<Result<Envelope, LinkError>>,
   },
@@ -298,10 +355,20 @@ pub enum LinkError {
   NotConnected(NodeId),
   #[error("no overlay route to node {0}")]
   NoRoute(NodeId),
+  #[error("direct admission request used a non-admission protocol")]
+  InvalidAdmissionRequest,
+  #[error("admission peer {0} is not quarantined or authorized")]
+  AdmissionPeerUnavailable(libp2p::PeerId),
   #[error("inbound envelope token is unknown")]
   UnknownInbound,
   #[error("link state did not reach the requested condition before the deadline")]
   Timeout,
+  #[error("overlay response metadata does not match its request")]
+  InvalidResponse,
+  #[error("failed to generate a random request boot namespace")]
+  RandomGeneration,
+  #[error("the per-boot request sequence is exhausted")]
+  RequestSequenceExhausted,
   #[error("authorization checkpoint commit failed: {0}")]
   AuthorizationCommit(String),
   #[error(transparent)]

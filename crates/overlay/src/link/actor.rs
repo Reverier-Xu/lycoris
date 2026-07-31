@@ -1,9 +1,6 @@
 use std::{
   collections::{BTreeMap, BTreeSet},
-  sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-  },
+  sync::Arc,
   time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -19,6 +16,7 @@ use libp2p::{
   },
   tcp, yamux,
 };
+use ring::rand::{SecureRandom, SystemRandom};
 use tokio::{
   sync::{mpsc, oneshot, watch},
   task::JoinHandle,
@@ -27,7 +25,7 @@ use tokio::{
 use super::{
   LinkCommand, LinkConfig, LinkError, LinkHandle, LinkSnapshot,
   directory::{AddressSource, PeerDirectory},
-  handle::{InboundEnvelope, InboundToken},
+  handle::{InboundEnvelope, InboundToken, REQUEST_BOOT_ID_BYTES, RequestSequence},
   messaging::{EnvelopeCodec, OVERLAY_STREAM_PROTOCOL},
 };
 use crate::{
@@ -45,6 +43,27 @@ impl LinkRuntime {
   pub fn start(
     identity: &NodeIdentity, config: LinkConfig, authorization: AuthorizationRegistry,
   ) -> Result<Self, LinkError> {
+    Self::start_inner(
+      identity,
+      config,
+      authorization,
+      random_request_boot_id()?,
+      0,
+    )
+  }
+
+  #[cfg(test)]
+  pub(crate) fn start_with_request_sequence(
+    identity: &NodeIdentity, config: LinkConfig, authorization: AuthorizationRegistry,
+    boot_id: [u8; REQUEST_BOOT_ID_BYTES], next_sequence: u64,
+  ) -> Result<Self, LinkError> {
+    Self::start_inner(identity, config, authorization, boot_id, next_sequence)
+  }
+
+  fn start_inner(
+    identity: &NodeIdentity, config: LinkConfig, authorization: AuthorizationRegistry,
+    boot_id: [u8; REQUEST_BOOT_ID_BYTES], next_sequence: u64,
+  ) -> Result<Self, LinkError> {
     let mut swarm = build_swarm(identity, &config)?;
     for address in config.listen_addresses() {
       swarm
@@ -57,7 +76,7 @@ impl LinkRuntime {
     let (snapshot_tx, snapshots) = watch::channel(state.snapshot());
     let (commands, command_rx) = mpsc::channel(config.command_capacity());
     let (inbound_tx, inbound_rx) = mpsc::channel(config.command_capacity());
-    let request_nonce = Arc::new(AtomicU64::new(0));
+    let request_ids = Arc::new(RequestSequence::new(boot_id, next_sequence));
     let actor = LinkActor {
       swarm,
       command_rx,
@@ -73,12 +92,12 @@ impl LinkRuntime {
       pending_forwards: BTreeMap::new(),
       broadcast_requests: BTreeSet::new(),
       next_inbound_token: 0,
-      request_nonce: request_nonce.clone(),
+      request_ids: request_ids.clone(),
       last_link_state_sequence: 0,
     };
     let task = tokio::spawn(actor.run());
     Ok(Self {
-      handle: LinkHandle::new(commands, snapshots, inbound_rx, request_nonce),
+      handle: LinkHandle::new(commands, snapshots, inbound_rx, request_ids),
       task: Some(task),
     })
   }
@@ -113,8 +132,56 @@ struct LinkBehaviour {
   messaging: request_response::Behaviour<EnvelopeCodec>,
 }
 
+struct PendingRequest {
+  expected: ResponseExpectation,
+  reply: oneshot::Sender<Result<Envelope, LinkError>>,
+}
+
 struct ForwardContext {
   channel: request_response::ResponseChannel<Envelope>,
+  expected: ResponseExpectation,
+}
+
+#[derive(Clone)]
+struct ResponseExpectation {
+  expected_peer: PeerId,
+  cluster_id: crate::ClusterId,
+  request_id: RequestId,
+  source: NodeId,
+  destination: NodeId,
+  protocol: ProtocolId,
+}
+
+impl ResponseExpectation {
+  fn from_request(request: &Envelope, expected_peer: PeerId) -> Self {
+    let header = request.header();
+    Self {
+      expected_peer,
+      cluster_id: header.cluster_id,
+      request_id: header.request_id,
+      source: header.source,
+      destination: header.destination,
+      protocol: header.protocol,
+    }
+  }
+
+  fn validate(&self, response: &Envelope, responder: PeerId) -> Result<(), LinkError> {
+    let header = response.header();
+    let sentinel = NodeId::from_bytes([0; NodeId::BYTE_LENGTH]);
+    let source_matches = self.destination == sentinel || header.source == self.destination;
+    if responder != self.expected_peer
+      || header.version != PROTOCOL_VERSION
+      || header.cluster_id != self.cluster_id
+      || header.request_id != self.request_id
+      || header.destination != self.source
+      || header.protocol != self.protocol
+      || header.kind != MessageKind::Response
+      || !source_matches
+    {
+      return Err(LinkError::InvalidResponse);
+    }
+    Ok(())
+  }
 }
 
 struct LinkActor {
@@ -127,13 +194,12 @@ struct LinkActor {
   identity: NodeIdentity,
   router: Router,
   inbound_tx: mpsc::Sender<InboundEnvelope>,
-  pending_outbound:
-    BTreeMap<request_response::OutboundRequestId, oneshot::Sender<Result<Envelope, LinkError>>>,
+  pending_outbound: BTreeMap<request_response::OutboundRequestId, PendingRequest>,
   pending_inbound: BTreeMap<u64, request_response::ResponseChannel<Envelope>>,
   pending_forwards: BTreeMap<request_response::OutboundRequestId, ForwardContext>,
   broadcast_requests: BTreeSet<request_response::OutboundRequestId>,
   next_inbound_token: u64,
-  request_nonce: Arc<AtomicU64>,
+  request_ids: Arc<RequestSequence>,
   last_link_state_sequence: u64,
 }
 
@@ -159,6 +225,14 @@ impl LinkActor {
     match command {
       LinkCommand::Request { envelope, reply } => {
         self.send_routed_request(envelope, reply);
+        false
+      }
+      LinkCommand::RequestAdmission {
+        sponsor,
+        envelope,
+        reply,
+      } => {
+        self.send_admission_request(sponsor, envelope, reply);
         false
       }
       LinkCommand::Respond {
@@ -229,10 +303,7 @@ impl LinkActor {
   }
 
   fn dial_admission(&mut self, address: Multiaddr) -> Result<PeerId, LinkError> {
-    let peer_id = address.iter().find_map(|protocol| match protocol {
-      Protocol::P2p(peer_id) => Some(peer_id),
-      _ => None,
-    });
+    let peer_id = terminal_peer_id(&address);
     let Some(peer_id) = peer_id else {
       return Err(LinkError::Transport(
         "admission dial requires a /p2p/ peer id component".to_string(),
@@ -361,19 +432,52 @@ impl LinkActor {
   fn send_routed_request(
     &mut self, envelope: Envelope, reply: oneshot::Sender<Result<Envelope, LinkError>>,
   ) {
+    if envelope.header().protocol == ProtocolId::Admission {
+      let _ = reply.send(Err(LinkError::InvalidAdmissionRequest));
+      return;
+    }
     match self.route_outbound(&envelope) {
-      Ok(peer_id) => {
-        let request_id = self
-          .swarm
-          .behaviour_mut()
-          .messaging
-          .send_request(&peer_id, envelope);
-        self.pending_outbound.insert(request_id, reply);
-      }
+      Ok(peer_id) => self.send_peer_request(peer_id, envelope, reply),
       Err(error) => {
         let _ = reply.send(Err(error));
       }
     }
+  }
+
+  fn send_admission_request(
+    &mut self, sponsor: PeerId, envelope: Envelope,
+    reply: oneshot::Sender<Result<Envelope, LinkError>>,
+  ) {
+    if envelope.header().protocol != ProtocolId::Admission {
+      let _ = reply.send(Err(LinkError::InvalidAdmissionRequest));
+      return;
+    }
+    let quarantined = self
+      .state
+      .quarantined
+      .values()
+      .any(|connection| connection.peer_id == sponsor);
+    let authorized = self.state.authorization.node_for_peer(&sponsor).is_some();
+    if !quarantined && !authorized {
+      let _ = reply.send(Err(LinkError::AdmissionPeerUnavailable(sponsor)));
+      return;
+    }
+    self.send_peer_request(sponsor, envelope, reply);
+  }
+
+  fn send_peer_request(
+    &mut self, peer_id: PeerId, envelope: Envelope,
+    reply: oneshot::Sender<Result<Envelope, LinkError>>,
+  ) {
+    let expected = ResponseExpectation::from_request(&envelope, peer_id);
+    let request_id = self
+      .swarm
+      .behaviour_mut()
+      .messaging
+      .send_request(&peer_id, envelope);
+    self
+      .pending_outbound
+      .insert(request_id, PendingRequest { expected, reply });
   }
 
   fn route_outbound(&self, envelope: &Envelope) -> Result<PeerId, LinkError> {
@@ -381,26 +485,6 @@ impl LinkActor {
     let destination = header.destination;
     if header.version != PROTOCOL_VERSION || destination == self.state.node_id {
       return Err(LinkError::NoRoute(destination));
-    }
-    if header.protocol == ProtocolId::Admission
-      && self
-        .state
-        .authorization
-        .active_peer_for_node(destination)
-        .is_none()
-    {
-      let mut quarantined = self
-        .state
-        .quarantined
-        .values()
-        .map(|connection| connection.peer_id);
-      let Some(peer_id) = quarantined.next() else {
-        return Err(LinkError::NoRoute(destination));
-      };
-      if quarantined.next().is_some() {
-        return Err(LinkError::NoRoute(destination));
-      }
-      return Ok(peer_id);
     }
     if header.cluster_id != self.state.authorization.cluster_id() {
       return Err(LinkError::NoRoute(destination));
@@ -443,15 +527,21 @@ impl LinkActor {
           request_id,
           response,
         } => {
-          if let Some(reply) = self.pending_outbound.remove(&request_id) {
-            let _ = reply.send(Ok(response));
+          if let Some(pending) = self.pending_outbound.remove(&request_id) {
+            let result = pending
+              .expected
+              .validate(&response, peer)
+              .map(|()| response);
+            let _ = pending.reply.send(result);
           } else if let Some(forward) = self.pending_forwards.remove(&request_id) {
             self.router.complete_forward();
-            let _ = self
-              .swarm
-              .behaviour_mut()
-              .messaging
-              .send_response(forward.channel, response);
+            if forward.expected.validate(&response, peer).is_ok() {
+              let _ = self
+                .swarm
+                .behaviour_mut()
+                .messaging
+                .send_response(forward.channel, response);
+            }
           } else if !self.broadcast_requests.remove(&request_id) {
             tracing::debug!(?request_id, "ignoring orphan overlay response");
           }
@@ -460,8 +550,10 @@ impl LinkActor {
       request_response::Event::OutboundFailure {
         request_id, error, ..
       } => {
-        if let Some(reply) = self.pending_outbound.remove(&request_id) {
-          let _ = reply.send(Err(LinkError::Transport(error.to_string())));
+        if let Some(pending) = self.pending_outbound.remove(&request_id) {
+          let _ = pending
+            .reply
+            .send(Err(LinkError::Transport(error.to_string())));
         } else if let Some(forward) = self.pending_forwards.remove(&request_id) {
           self.router.complete_forward();
           drop(forward.channel);
@@ -480,6 +572,11 @@ impl LinkActor {
     &mut self, peer_id: PeerId, envelope: Envelope,
     channel: request_response::ResponseChannel<Envelope>,
   ) {
+    let header = envelope.header();
+    if header.version != PROTOCOL_VERSION {
+      tracing::debug!(%peer_id, "dropping overlay message with an unsupported version");
+      return;
+    }
     if self.state.authorization.node_for_peer(&peer_id).is_none() {
       let quarantined = self
         .state
@@ -493,20 +590,17 @@ impl LinkActor {
       }
       return;
     }
-    let header = envelope.header();
-    if header.version != PROTOCOL_VERSION
-      || header.cluster_id != self.state.authorization.cluster_id()
-    {
+    if header.protocol == ProtocolId::Admission {
+      self.deliver(peer_id, envelope, channel);
+      return;
+    }
+    if header.cluster_id != self.state.authorization.cluster_id() {
       tracing::debug!(%peer_id, "dropping overlay message from a foreign overlay");
       return;
     }
     if header.protocol == ProtocolId::Route && header.kind == MessageKind::Event {
       self.accept_link_state(&envelope);
       self.reply_empty(channel, &envelope);
-      return;
-    }
-    if header.protocol == ProtocolId::Admission {
-      self.deliver(peer_id, envelope, channel);
       return;
     }
     match self.router.handle(envelope, now_unix_ms()) {
@@ -516,6 +610,7 @@ impl LinkActor {
           self.router.complete_forward();
           return;
         };
+        let expected = ResponseExpectation::from_request(&envelope, next_peer);
         let request_id = self
           .swarm
           .behaviour_mut()
@@ -523,7 +618,7 @@ impl LinkActor {
           .send_request(&next_peer, envelope);
         self
           .pending_forwards
-          .insert(request_id, ForwardContext { channel });
+          .insert(request_id, ForwardContext { channel, expected });
       }
       RouteDecision::Drop(reason) => {
         tracing::debug!(?reason, "dropping routed overlay envelope");
@@ -642,10 +737,17 @@ impl LinkActor {
       .map(|connection| (connection.peer_id, connection.node_id))
       .collect();
     for (peer_id, node_id) in peers {
+      let request_id = match self.next_request_id() {
+        Ok(request_id) => request_id,
+        Err(error) => {
+          tracing::error!(%error, "stopping link-state publication");
+          return;
+        }
+      };
       let header = EnvelopeHeader {
         version: PROTOCOL_VERSION,
         cluster_id: self.state.authorization.cluster_id(),
-        request_id: self.next_request_id(),
+        request_id,
         source: self.state.node_id,
         destination: node_id,
         protocol: ProtocolId::Route,
@@ -665,9 +767,8 @@ impl LinkActor {
     }
   }
 
-  fn next_request_id(&self) -> RequestId {
-    let nonce = self.request_nonce.fetch_add(1, Ordering::Relaxed) + 1;
-    RequestId::derive(self.state.node_id, nonce)
+  fn next_request_id(&self) -> Result<RequestId, LinkError> {
+    self.request_ids.allocate(self.state.node_id)
   }
 
   fn validate_authorization(
@@ -1080,6 +1181,13 @@ impl LinkState {
       connected_nodes: connected_nodes.into_iter().collect(),
       healthy_nodes,
       connection_count: self.connections.len(),
+      quarantined_peers: self
+        .quarantined
+        .values()
+        .map(|connection| connection.peer_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect(),
       quarantined_count: self.quarantined.len(),
     }
   }
@@ -1135,6 +1243,24 @@ fn now_unix_ms() -> i64 {
     .duration_since(UNIX_EPOCH)
     .map(|duration| duration.as_millis() as i64)
     .unwrap_or(0)
+}
+
+fn terminal_peer_id(address: &Multiaddr) -> Option<PeerId> {
+  address
+    .iter()
+    .filter_map(|protocol| match protocol {
+      Protocol::P2p(peer_id) => Some(peer_id),
+      _ => None,
+    })
+    .last()
+}
+
+fn random_request_boot_id() -> Result<[u8; REQUEST_BOOT_ID_BYTES], LinkError> {
+  let mut bytes = [0_u8; REQUEST_BOOT_ID_BYTES];
+  SystemRandom::new()
+    .fill(&mut bytes)
+    .map_err(|_| LinkError::RandomGeneration)?;
+  Ok(bytes)
 }
 
 fn build_swarm(
@@ -1252,6 +1378,146 @@ mod tests {
     assert!(!state.snapshot().healthy_nodes.contains(&node));
     assert!(state.connection_closed(peer, first));
     assert!(!state.snapshot().connected_nodes.contains(&node));
+  }
+
+  #[test]
+  fn response_expectation_rejects_mismatched_metadata() {
+    let source = NodeId::from_bytes([1; NodeId::BYTE_LENGTH]);
+    let destination = NodeId::from_bytes([2; NodeId::BYTE_LENGTH]);
+    let cluster_id = crate::ClusterId::from_bytes([3; crate::ClusterId::BYTE_LENGTH]);
+    let request_id = RequestId::from_bytes([4; RequestId::BYTE_LENGTH]);
+    let request = must(Envelope::new(
+      EnvelopeHeader {
+        version: PROTOCOL_VERSION,
+        cluster_id,
+        request_id,
+        source,
+        destination,
+        protocol: ProtocolId::Membership,
+        kind: MessageKind::Request,
+        deadline_unix_ms: 1_000,
+        remaining_hops: 4,
+      },
+      Vec::new(),
+    ));
+    let expected_peer = PeerId::random();
+    let expected = ResponseExpectation::from_request(&request, expected_peer);
+    let response_header = EnvelopeHeader {
+      version: PROTOCOL_VERSION,
+      cluster_id,
+      request_id,
+      source: destination,
+      destination: source,
+      protocol: ProtocolId::Membership,
+      kind: MessageKind::Response,
+      deadline_unix_ms: 1_000,
+      remaining_hops: 3,
+    };
+    assert!(
+      expected
+        .validate(
+          &must(Envelope::new(response_header.clone(), Vec::new())),
+          expected_peer,
+        )
+        .is_ok()
+    );
+
+    let valid_response = must(Envelope::new(response_header.clone(), Vec::new()));
+    assert!(matches!(
+      expected.validate(&valid_response, PeerId::random()),
+      Err(LinkError::InvalidResponse)
+    ));
+
+    let invalid_headers = [
+      EnvelopeHeader {
+        version: PROTOCOL_VERSION + 1,
+        ..response_header.clone()
+      },
+      EnvelopeHeader {
+        cluster_id: crate::ClusterId::from_bytes([5; crate::ClusterId::BYTE_LENGTH]),
+        ..response_header.clone()
+      },
+      EnvelopeHeader {
+        request_id: RequestId::from_bytes([6; RequestId::BYTE_LENGTH]),
+        ..response_header.clone()
+      },
+      EnvelopeHeader {
+        source,
+        ..response_header.clone()
+      },
+      EnvelopeHeader {
+        destination,
+        ..response_header.clone()
+      },
+      EnvelopeHeader {
+        protocol: ProtocolId::Resource,
+        ..response_header.clone()
+      },
+      EnvelopeHeader {
+        kind: MessageKind::Request,
+        ..response_header
+      },
+    ];
+    for header in invalid_headers {
+      let response = must(Envelope::new(header, Vec::new()));
+      assert!(matches!(
+        expected.validate(&response, expected_peer),
+        Err(LinkError::InvalidResponse)
+      ));
+    }
+  }
+
+  #[test]
+  fn admission_response_allows_a_real_source_for_the_sentinel_destination() {
+    let source = NodeId::from_bytes([1; NodeId::BYTE_LENGTH]);
+    let sponsor = NodeId::from_bytes([2; NodeId::BYTE_LENGTH]);
+    let cluster_id = crate::ClusterId::from_bytes([0; crate::ClusterId::BYTE_LENGTH]);
+    let request_id = RequestId::from_bytes([3; RequestId::BYTE_LENGTH]);
+    let request = must(Envelope::new(
+      EnvelopeHeader {
+        version: PROTOCOL_VERSION,
+        cluster_id,
+        request_id,
+        source,
+        destination: NodeId::from_bytes([0; NodeId::BYTE_LENGTH]),
+        protocol: ProtocolId::Admission,
+        kind: MessageKind::Request,
+        deadline_unix_ms: 1_000,
+        remaining_hops: 0,
+      },
+      Vec::new(),
+    ));
+    let response = must(Envelope::new(
+      EnvelopeHeader {
+        version: PROTOCOL_VERSION,
+        cluster_id,
+        request_id,
+        source: sponsor,
+        destination: source,
+        protocol: ProtocolId::Admission,
+        kind: MessageKind::Response,
+        deadline_unix_ms: 1_000,
+        remaining_hops: 0,
+      },
+      Vec::new(),
+    ));
+
+    let expected_peer = PeerId::random();
+    assert!(
+      ResponseExpectation::from_request(&request, expected_peer)
+        .validate(&response, expected_peer)
+        .is_ok()
+    );
+  }
+
+  #[test]
+  fn admission_dial_uses_the_terminal_peer_after_a_relay() {
+    let relay = PeerId::random();
+    let sponsor = PeerId::random();
+    let address =
+      must(format!("/ip4/127.0.0.1/tcp/4001/p2p/{relay}/p2p-circuit/p2p/{sponsor}").parse());
+
+    assert_eq!(terminal_peer_id(&address), Some(sponsor));
   }
 
   #[test]
