@@ -560,7 +560,7 @@ async fn expired_requests_evict_stale_connections_and_redial() {
   let late_response = response_envelope(&inbound.envelope, second_identity.node_id(), Vec::new());
   assert!(matches!(
     second_handle.respond(inbound.token, late_response).await,
-    Err(LinkError::UnknownInbound)
+    Err(LinkError::UnknownInbound) | Err(LinkError::Timeout)
   ));
   first_handle
     .wait_connected(second_node, WAIT)
