@@ -91,12 +91,12 @@ fn canonical_binary_path() -> Result<std::path::PathBuf, ShellError> {
   {
     let local = env::var_os("LOCALAPPDATA")
       .ok_or_else(|| ShellError::setup("LOCALAPPDATA environment variable is not set"))?;
-    return Ok(
+    Ok(
       std::path::PathBuf::from(local)
         .join("lycoris")
         .join("bin")
         .join("lycoris.exe"),
-    );
+    )
   }
   #[cfg(not(target_os = "windows"))]
   {
@@ -117,19 +117,11 @@ fn canonical_binary_path() -> Result<std::path::PathBuf, ShellError> {
 }
 
 /// Return the current user's home directory.
+#[cfg(not(target_os = "windows"))]
 fn home_dir() -> Result<std::path::PathBuf, ShellError> {
-  #[cfg(not(target_os = "windows"))]
-  {
-    env::var("HOME")
-      .map(std::path::PathBuf::from)
-      .map_err(|_| ShellError::setup("HOME environment variable is not set"))
-  }
-  #[cfg(target_os = "windows")]
-  {
-    env::var("USERPROFILE")
-      .map(std::path::PathBuf::from)
-      .map_err(|_| ShellError::setup("USERPROFILE environment variable is not set"))
-  }
+  env::var("HOME")
+    .map(std::path::PathBuf::from)
+    .map_err(|_| ShellError::setup("HOME environment variable is not set"))
 }
 
 /// Ensure the server binary sits at a stable, PATH-accessible location.
@@ -369,6 +361,7 @@ fn install_service(
 mod tests {
   use super::*;
 
+  #[cfg(not(target_os = "windows"))]
   type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
   #[test]
@@ -377,9 +370,10 @@ mod tests {
     assert!(!is_in_path(&tmp));
   }
 
+  #[cfg(not(target_os = "windows"))]
   #[test]
   fn canonical_binary_path_for_normal_user_is_under_home() -> TestResult {
-    if cfg!(unix) && !is_root::is_root() {
+    if !is_root::is_root() {
       let path = canonical_binary_path()?;
       let home = home_dir()?;
       assert!(path.starts_with(home));
