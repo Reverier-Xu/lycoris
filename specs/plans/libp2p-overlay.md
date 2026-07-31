@@ -1,10 +1,15 @@
 ---
 type: implementation-plan
 context: approved node overlay rewrite
-status: active
+status: superseded
+superseded_by: docs/design/node-overlay-hardening-plan.md
 ---
 
 # Libp2p Overlay Implementation Plan
+
+> Historical cutover checklist. The active hardening, cleanup, boundary, E2E,
+> and foreign-cluster merge sequence is
+> [`docs/design/node-overlay-hardening-plan.md`](../../docs/design/node-overlay-hardening-plan.md).
 
 ## Quality gate for every code commit
 
