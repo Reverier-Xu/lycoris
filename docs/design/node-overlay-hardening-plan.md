@@ -113,14 +113,14 @@ Merge work is prohibited until this phase passes.
     exact candidate identity, and a uniquely authorized checkpoint record.
   - Cover a discarded committed outcome, sponsor restart, joiner restart, wrong
     key, response mismatch, sequence exhaustion, and replay.
-- [ ] **1.3 bind persisted registry to local identity at startup.**
+- [x] **1.3 bind persisted registry to local identity at startup.**
   - Never generate a new identity when authorization state already exists.
   - Require the local NodeId, PeerId, and current key to match one active record.
   - Publish identity files through synced atomic replacement and no-clobber first
     publication.
-  - Keep this gate open until native Linux, macOS, and Windows tests pass on the
-    final candidate; do not claim universal power-loss guarantees for untested
-    filesystems.
+  - Native Linux, macOS, and Windows filesystem behavior passed for implementation
+    commit `5d38217` in quality run `30655272596`; universal power-loss and
+    nonconforming filesystem claims remain excluded.
 - [ ] **1.4 authorize relay and bound quarantine.**
   - Reject relay reservation and circuit use by unknown or inactive PeerIds.
   - Add quarantine TTL, per-peer request limits, bounded pending responses, and
