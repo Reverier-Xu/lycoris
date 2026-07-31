@@ -26,6 +26,7 @@ use lycoris_client::{ClusterClient, ExtensionClient};
 use lycoris_config::{ClusterConfig, DaemonConfig, ExtensionsConfig, NodeConfig, TlsConfig};
 use lycoris_core::ClusterKey;
 use lycoris_extension::{ChatMessage, ChatRequest, LlmProvider, Role, Usage};
+use lycoris_overlay::{LinkHandle, NodeIdentity};
 use lycoris_proto::node::{
   RegisterExtensionRequest, ResourceKind, ResourceScope as ProtoResourceScope,
 };
@@ -88,21 +89,21 @@ async fn connect_extension_client(
 
 #[allow(clippy::too_many_arguments)]
 fn build_config(
-  id: &str, listen_port: u16, bootstrap_peers: Vec<String>, data_dir: PathBuf,
+  id: &str, control_port: u16, overlay_port: u16, join: Option<String>, data_dir: PathBuf,
   ca_cert_path: &std::path::Path, ca_key_path: &std::path::Path, cert_path: &std::path::Path,
   key_path: &std::path::Path,
 ) -> DaemonConfig {
   DaemonConfig {
     node: NodeConfig {
       id: id.to_string(),
-      address: format!("https://127.0.0.1:{listen_port}"),
+      address: format!("https://127.0.0.1:{control_port}"),
       labels: HashMap::new(),
     },
     cluster: ClusterConfig {
-      listen_address: format!("127.0.0.1:{listen_port}"),
-      bootstrap_peers,
-      overlay_listen: Vec::new(),
-      join: None,
+      listen_address: format!("127.0.0.1:{control_port}"),
+      bootstrap_peers: Vec::new(),
+      overlay_listen: vec![format!("/ip4/127.0.0.1/tcp/{overlay_port}")],
+      join,
     },
     tls: TlsConfig {
       ca_cert: ca_cert_path.to_string_lossy().to_string(),
@@ -115,15 +116,26 @@ fn build_config(
   }
 }
 
-fn spawn_runtime(config: DaemonConfig, key: ClusterKey) {
-  tokio::spawn(async move {
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    if let Err(e) =
-      lycoris_daemon::runtime::run_with_shutdown(config, shutdown_tx, shutdown_rx, Some(key)).await
-    {
-      eprintln!("runtime error: {e:?}");
+async fn wait_for_overlay_listener(handle: &LinkHandle) {
+  let mut snapshots = handle.subscribe();
+  let ready = time::timeout(Duration::from_secs(10), async {
+    loop {
+      if snapshots.borrow().listen_addresses.iter().any(|address| {
+        address.to_string().contains("/tcp/") && !address.to_string().ends_with("/tcp/0")
+      }) {
+        return;
+      }
+      snapshots
+        .changed()
+        .await
+        .expect("sponsor overlay snapshots closed before listener startup");
     }
-  });
+  })
+  .await;
+  assert!(
+    ready.is_ok(),
+    "sponsor overlay listener was not ready in time"
+  );
 }
 
 /// Spawn a node that hands its in-process typed facades (llm-provider
@@ -253,14 +265,28 @@ async fn wasm_openai_provider_serves_cluster_chat_from_the_capable_node() {
   let cluster_key = ClusterKey::generate().expect("generate cluster key");
   let key_hex = cluster_key.to_hex();
 
+  let identities: Vec<NodeIdentity> = data_dirs
+    .iter()
+    .map(|dir| {
+      NodeIdentity::load_or_generate(dir.path().join("node.identity"))
+        .expect("generate node identity")
+    })
+    .collect();
+  let sponsor_overlay_port = base_port + 51;
+  let sponsor_address = format!(
+    "/ip4/127.0.0.1/tcp/{sponsor_overlay_port}/p2p/{}",
+    identities[1].peer_id()
+  );
   let mut configs: Vec<DaemonConfig> = (0..node_count)
     .map(|i| {
-      let port = base_port + i as u16;
-      let peer = format!("https://127.0.0.1:{}", base_port + ((i + 1) % 2) as u16);
+      let control_port = base_port + i as u16;
+      let overlay_port = base_port + 50 + i as u16;
+      let join = (i == 0).then(|| sponsor_address.clone());
       build_config(
         &format!("node-{i}"),
-        port,
-        vec![peer],
+        control_port,
+        overlay_port,
+        join,
         data_dirs[i].path().to_path_buf(),
         &certs.ca_cert,
         &certs.ca_key,
@@ -286,7 +312,12 @@ async fn wasm_openai_provider_serves_cluster_chat_from_the_capable_node() {
     ]),
   );
 
-  spawn_runtime(configs[1].clone(), cluster_key.clone());
+  let sponsor_handles_rx = spawn_runtime_with_handles(configs[1].clone(), cluster_key.clone());
+  let sponsor_handles = time::timeout(Duration::from_secs(10), sponsor_handles_rx)
+    .await
+    .expect("node-1 did not hand out its handles in time")
+    .expect("node-1 handles channel closed before startup finished");
+  wait_for_overlay_listener(&sponsor_handles.overlay).await;
   let handles_rx = spawn_runtime_with_handles(configs[0].clone(), cluster_key.clone());
   let handles = time::timeout(Duration::from_secs(10), handles_rx)
     .await
@@ -325,7 +356,7 @@ async fn wasm_openai_provider_serves_cluster_chat_from_the_capable_node() {
     &mut node1_client,
     ResourceKind::Extension,
     "openai",
-    Duration::from_secs(30),
+    Duration::from_secs(10),
   )
   .await;
 
@@ -335,9 +366,9 @@ async fn wasm_openai_provider_serves_cluster_chat_from_the_capable_node() {
   let mut node0_client = connect_client(&node0_url, &client_tls, &key_hex).await;
   let announced = wait_for_annotation(
     &mut node0_client,
-    "node-1",
+    &identities[1].node_id().to_string(),
     "ext.openai",
-    Duration::from_secs(30),
+    Duration::from_secs(10),
   )
   .await;
   assert_eq!(announced, "0.1.0");
