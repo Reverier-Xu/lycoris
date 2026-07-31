@@ -6,10 +6,11 @@ services:
     image: lycoris-e2e
     container_name: lycoris-e2e-node-0
     hostname: node-0
+    command: ["--config", "/root/.config/lycoris/lycoris.toml"]
     volumes:
       - ./certs:/etc/lycoris/certs:ro
-      - ./config/node-0.toml:/etc/lycoris/lycoris.toml:ro
-      - ./keys/cluster.key:/var/lib/lycoris/cluster.key:ro
+      - ./config/node-0:/root/.config/lycoris
+      - ./fixtures:/fixtures:ro
       - node-0-data:/var/lib/lycoris
     networks:
       - left
@@ -21,10 +22,10 @@ services:
     image: lycoris-e2e
     container_name: lycoris-e2e-node-1
     hostname: node-1
+    command: ["--config", "/root/.config/lycoris/lycoris.toml"]
     volumes:
       - ./certs:/etc/lycoris/certs:ro
-      - ./config/node-1.toml:/etc/lycoris/lycoris.toml:ro
-      - ./keys/cluster.key:/var/lib/lycoris/cluster.key:ro
+      - ./config/node-1:/root/.config/lycoris
       - node-1-data:/var/lib/lycoris
     networks:
       - left
@@ -37,10 +38,10 @@ services:
     image: lycoris-e2e
     container_name: lycoris-e2e-node-2
     hostname: node-2
+    command: ["--config", "/root/.config/lycoris/lycoris.toml"]
     volumes:
       - ./certs:/etc/lycoris/certs:ro
-      - ./config/node-2.toml:/etc/lycoris/lycoris.toml:ro
-      - ./keys/cluster.key:/var/lib/lycoris/cluster.key:ro
+      - ./config/node-2:/root/.config/lycoris
       - node-2-data:/var/lib/lycoris
     networks:
       - right

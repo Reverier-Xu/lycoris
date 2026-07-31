@@ -5,8 +5,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CERTS_DIR="${SCRIPT_DIR}/certs"
 NODES=(node-0 node-1 node-2)
 
-rm -rf "${CERTS_DIR}"
 mkdir -p "${CERTS_DIR}"
+rm -f "${CERTS_DIR}"/ca.crt "${CERTS_DIR}"/ca.key "${CERTS_DIR}"/ca.srl \
+  "${CERTS_DIR}"/node-*.crt "${CERTS_DIR}"/node-*.key "${CERTS_DIR}"/node-*.csr
 cd "${CERTS_DIR}"
 
 # CA
