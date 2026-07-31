@@ -692,9 +692,14 @@ impl LinkActor {
         request_id, error, ..
       } => {
         if let Some(pending) = self.pending_outbound.remove(&request_id) {
-          let _ = pending
-            .reply
-            .send(Err(LinkError::Transport(error.to_string())));
+          let expired = pending.expected.deadline_unix_ms <= now_unix_ms();
+          let result = if expired {
+            self.close_timed_out_peer(pending.expected.expected_peer);
+            Err(LinkError::Timeout)
+          } else {
+            Err(LinkError::Transport(error.to_string()))
+          };
+          let _ = pending.reply.send(result);
         } else if let Some(forward) = self.pending_forwards.remove(&request_id) {
           self.router.complete_forward();
           drop(forward.channel);
