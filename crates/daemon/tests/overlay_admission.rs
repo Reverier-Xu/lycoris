@@ -56,7 +56,7 @@ struct TestDaemon {
 
 impl TestDaemon {
   fn identity(&self) -> NodeIdentity {
-    NodeIdentity::load_or_generate(self.dir.path().join("node.identity")).unwrap()
+    NodeIdentity::load(self.dir.path().join("node.identity")).unwrap()
   }
 
   fn node_id(&self) -> NodeId {
@@ -229,7 +229,8 @@ async fn wait_for_resource(client: &mut ClusterClient, id: &str) {
 }
 
 async fn seed_shared_memory(data_dir: &Path) -> Result<NodeId, Box<dyn std::error::Error>> {
-  let identity = NodeIdentity::load_or_generate(data_dir.join("node.identity"))?;
+  let identity = NodeIdentity::generate();
+  identity.save(data_dir.join("node.identity"))?;
   let content = b"overlay resource".to_vec();
   let storage = Storage::open(data_dir.join("lycoris.redb"))?;
   storage

@@ -268,8 +268,11 @@ async fn wasm_openai_provider_serves_cluster_chat_from_the_capable_node() {
   let identities: Vec<NodeIdentity> = data_dirs
     .iter()
     .map(|dir| {
-      NodeIdentity::load_or_generate(dir.path().join("node.identity"))
-        .expect("generate node identity")
+      let identity = NodeIdentity::generate();
+      identity
+        .save(dir.path().join("node.identity"))
+        .expect("persist node identity");
+      identity
     })
     .collect();
   let sponsor_overlay_port = base_port + 51;

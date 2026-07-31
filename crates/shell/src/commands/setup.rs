@@ -213,10 +213,7 @@ fn bootstrap_node_assets(
   ensure_dir(&cert_dir)?;
   ensure_dir(config_dir)?;
 
-  let identity = lycoris_overlay::NodeIdentity::load_or_generate(data_dir.join("node.identity"))?;
-  tracing::info!(node_id = %identity.node_id(), "overlay identity ready");
-
-  // 1. TLS certificates — idempotent.
+  // 1. TLS certificates - idempotent.
   let ca_cert = cert_dir.join("ca.crt");
   let ca_key = cert_dir.join("ca.key");
   let node_cert = cert_dir.join("node.crt");
@@ -361,13 +358,32 @@ fn install_service(
 mod tests {
   use super::*;
 
-  #[cfg(not(target_os = "windows"))]
   type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
   #[test]
   fn is_in_path_detects_entry() {
     let tmp = std::env::temp_dir();
     assert!(!is_in_path(&tmp));
+  }
+
+  #[test]
+  fn bootstrap_assets_leave_overlay_identity_to_the_daemon() -> TestResult {
+    let _ = lycoris_tls::install_crypto_provider();
+    let directory = tempfile::TempDir::new()?;
+    let config_dir = directory.path().join("config");
+    let data_dir = directory.path().join("data");
+
+    bootstrap_node_assets(
+      "test-node",
+      43_000,
+      "https://127.0.0.1:43000",
+      &config_dir,
+      &data_dir,
+    )?;
+
+    assert!(!data_dir.join("node.identity").exists());
+    assert!(config_dir.join(DAEMON_CONFIG_FILE_NAME).exists());
+    Ok(())
   }
 
   #[cfg(not(target_os = "windows"))]

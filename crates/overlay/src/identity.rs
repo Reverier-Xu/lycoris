@@ -100,23 +100,36 @@ impl NodeIdentity {
     match Self::load(path.as_ref()) {
       Ok(identity) => Ok(identity),
       Err(IdentityError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
-        let identity = Self::generate();
-        identity.save(path)?;
-        Ok(identity)
+        Self::publish_candidate(path.as_ref(), Self::generate()).map(|(identity, _)| identity)
       }
       Err(error) => Err(error),
     }
   }
 
   pub fn save(&self, path: impl AsRef<Path>) -> Result<(), IdentityError> {
+    lycoris_core::write_private_file(path, &self.encode_document()?)?;
+    Ok(())
+  }
+
+  fn publish_candidate(
+    path: &Path, candidate: Self,
+  ) -> Result<(Self, lycoris_core::PrivateFileCreate), IdentityError> {
+    let publication =
+      lycoris_core::write_private_file_if_absent(path, &candidate.encode_document()?)?;
+    let identity = match publication {
+      lycoris_core::PrivateFileCreate::Created => candidate,
+      lycoris_core::PrivateFileCreate::AlreadyExists => Self::load(path)?,
+    };
+    Ok((identity, publication))
+  }
+
+  fn encode_document(&self) -> Result<Vec<u8>, IdentityError> {
     let document = IdentityDocument {
       node_id: self.node_id,
       initial_public_key: self.initial_public_key.clone(),
       private_key: self.keypair.to_protobuf_encoding()?,
     };
-    let bytes = postcard::to_stdvec(&document)?;
-    lycoris_core::write_private_file(path, &bytes)?;
-    Ok(())
+    Ok(postcard::to_stdvec(&document)?)
   }
 
   pub const fn node_id(&self) -> NodeId {
@@ -226,6 +239,95 @@ mod tests {
     assert_eq!(second.node_id(), first.node_id());
     assert_eq!(second.peer_id(), first.peer_id());
     assert!(!format!("{first:?}").contains("private"));
+  }
+
+  #[test]
+  fn concurrent_generation_returns_one_persisted_winner() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("identity.key");
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let threads: Vec<_> = (0..8)
+      .map(|_| {
+        let barrier = barrier.clone();
+        let path = path.clone();
+        std::thread::spawn(move || {
+          barrier.wait();
+          NodeIdentity::load_or_generate(path)
+            .unwrap()
+            .public_identity()
+        })
+      })
+      .collect();
+    let identities: Vec<_> = threads
+      .into_iter()
+      .map(|thread| thread.join().unwrap())
+      .collect();
+
+    assert!(identities.iter().all(|identity| identity == &identities[0]));
+    assert_eq!(
+      NodeIdentity::load(&path).unwrap().public_identity(),
+      identities[0]
+    );
+  }
+
+  #[test]
+  fn no_clobber_loser_strictly_loads_the_creation_winner() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("identity.key");
+    let winner = NodeIdentity::generate();
+    let loser = NodeIdentity::generate();
+
+    let (created, first_outcome) = NodeIdentity::publish_candidate(&path, winner.clone()).unwrap();
+    let (selected, second_outcome) = NodeIdentity::publish_candidate(&path, loser).unwrap();
+
+    assert_eq!(first_outcome, lycoris_core::PrivateFileCreate::Created);
+    assert_eq!(
+      second_outcome,
+      lycoris_core::PrivateFileCreate::AlreadyExists
+    );
+    assert_eq!(created.public_identity(), winner.public_identity());
+    assert_eq!(selected.public_identity(), winner.public_identity());
+    assert_eq!(
+      NodeIdentity::load(path).unwrap().public_identity(),
+      winner.public_identity()
+    );
+  }
+
+  #[test]
+  fn no_clobber_loser_propagates_a_malformed_winner() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("identity.key");
+    let malformed = b"malformed winner";
+    std::fs::write(&path, malformed).unwrap();
+
+    assert!(NodeIdentity::publish_candidate(&path, NodeIdentity::generate()).is_err());
+    assert_eq!(std::fs::read(path).unwrap(), malformed);
+  }
+
+  #[test]
+  fn malformed_identity_is_never_replaced() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("identity.key");
+    let malformed = b"not an identity";
+    std::fs::write(&path, malformed).unwrap();
+
+    assert!(NodeIdentity::load_or_generate(&path).is_err());
+    assert_eq!(std::fs::read(path).unwrap(), malformed);
+  }
+
+  #[test]
+  fn save_atomically_replaces_an_existing_identity() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("identity.key");
+    let first = NodeIdentity::generate();
+    let second = NodeIdentity::generate();
+    first.save(&path).unwrap();
+    second.save(&path).unwrap();
+
+    assert_eq!(
+      NodeIdentity::load(path).unwrap().public_identity(),
+      second.public_identity()
+    );
   }
 
   #[cfg(unix)]

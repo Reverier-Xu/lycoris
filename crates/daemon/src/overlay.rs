@@ -137,6 +137,14 @@ pub enum OverlayError {
   InvalidListenAddress(String),
   #[error("stored authorization records contain no genesis record")]
   MissingGenesis,
+  #[error("persisted authorization exists but node.identity is missing")]
+  PersistedIdentityMissing,
+  #[error("identity {0} is a successor and cannot initialize a standalone registry")]
+  InitialIdentityRequired(NodeId),
+  #[error("local identity {0} is not uniquely active in the persisted registry")]
+  LocalIdentityNotActive(NodeId),
+  #[error("local identity {0} does not match its active authorization record")]
+  LocalIdentityMismatch(NodeId),
   #[error(transparent)]
   Postcard(#[from] postcard::Error),
   #[error(transparent)]
@@ -167,8 +175,7 @@ impl OverlayNode {
   pub fn start(
     data_dir: &Path, node: NodeDomain, cluster_key: Option<ClusterKey>, listen: &[String],
   ) -> Result<Self, OverlayError> {
-    let identity = NodeIdentity::load_or_generate(data_dir.join("node.identity"))?;
-    let registry = load_or_create_registry(&node, &identity)?;
+    let (identity, registry) = initialize_identity_and_registry(data_dir, &node)?;
     let addresses = parse_listen_addresses(listen)?;
     let runtime = LinkRuntime::start(&identity, LinkConfig::new(addresses), registry.clone())?;
     let handle = runtime.handle();
@@ -625,22 +632,61 @@ fn response_envelope(request: &Envelope, source: NodeId, payload: Vec<u8>) -> Op
   }
 }
 
-fn load_or_create_registry(
-  node: &NodeDomain, identity: &NodeIdentity,
-) -> Result<AuthorizationRegistry, OverlayError> {
+fn initialize_identity_and_registry(
+  data_dir: &Path, node: &NodeDomain,
+) -> Result<(NodeIdentity, AuthorizationRegistry), OverlayError> {
+  let identity_path = data_dir.join("node.identity");
   let records = node.authorization().records()?;
-  if records.is_empty() {
-    let (cluster_id, genesis) = AuthorizationRecord::genesis(identity)?;
+  let (identity, registry) = if records.is_empty() {
+    let identity = NodeIdentity::load_or_generate(&identity_path)?;
+    if !identity.public_identity().is_initial_identity() {
+      return Err(OverlayError::InitialIdentityRequired(identity.node_id()));
+    }
+    let (cluster_id, genesis) = AuthorizationRecord::genesis(&identity)?;
     node.authorization().put(&genesis)?;
     tracing::info!(cluster_id = %cluster_id, node_id = %identity.node_id(), "initialized a standalone cluster registry");
-    return Ok(AuthorizationRegistry::from_records(cluster_id, [genesis])?);
-  }
+    let committed = node.authorization().records()?;
+    (identity, registry_from_records(committed)?)
+  } else {
+    let identity = match NodeIdentity::load(&identity_path) {
+      Err(IdentityError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+        return Err(OverlayError::PersistedIdentityMissing);
+      }
+      result => result?,
+    };
+    (identity, registry_from_records(records)?)
+  };
+  bind_local_identity(&registry, &identity)?;
+  Ok((identity, registry))
+}
+
+fn registry_from_records(
+  records: Vec<AuthorizationRecord>,
+) -> Result<AuthorizationRegistry, OverlayError> {
   let genesis = records
     .iter()
     .find(|record| record.authorizer().is_none())
     .ok_or(OverlayError::MissingGenesis)?;
   let cluster_id = ClusterId::from_genesis(genesis.node_id());
   Ok(AuthorizationRegistry::from_records(cluster_id, records)?)
+}
+
+fn bind_local_identity(
+  registry: &AuthorizationRegistry, identity: &NodeIdentity,
+) -> Result<(), OverlayError> {
+  let node_id = identity.node_id();
+  let active = registry
+    .active_record_for_node(node_id)
+    .ok_or(OverlayError::LocalIdentityNotActive(node_id))?;
+  let matches_identity = active.node_id() == node_id
+    && active.initial_public_key() == identity.initial_public_key()
+    && active.public_key() == identity.public_key_bytes()
+    && active.peer_id() == identity.peer_id_bytes()
+    && registry.active_peer_for_node(node_id) == Some(identity.peer_id());
+  if !matches_identity {
+    return Err(OverlayError::LocalIdentityMismatch(node_id));
+  }
+  Ok(())
 }
 
 fn parse_listen_addresses(listen: &[String]) -> Result<Vec<Multiaddr>, OverlayError> {
@@ -867,18 +913,315 @@ mod tests {
     )?)
   }
 
+  fn persist_records(directory: &Path, records: &[AuthorizationRecord]) -> TestResult {
+    let storage = lycoris_storage::Storage::open(directory.join("lycoris.redb"))?;
+    storage.node().authorization().replace(records)?;
+    Ok(())
+  }
+
   #[test]
-  fn registry_is_created_once_and_reloaded() -> TestResult {
+  fn empty_registry_creates_bound_identity_and_reopens_exactly() -> TestResult {
     let dir = tempfile::TempDir::new()?;
-    let storage = lycoris_storage::Storage::open(dir.path().join("lycoris.redb"))?;
+    let first_public;
+    let first_records;
+    {
+      let storage = lycoris_storage::Storage::open(dir.path().join("lycoris.redb"))?;
+      let (identity, registry) = initialize_identity_and_registry(dir.path(), storage.node())?;
+      first_public = identity.public_identity();
+      first_records = registry.records();
+      let active = registry.active_record_for_node(identity.node_id()).unwrap();
+      assert_eq!(active.public_key(), identity.public_key_bytes());
+      assert_eq!(active.peer_id(), identity.peer_id_bytes());
+    }
+    {
+      let storage = lycoris_storage::Storage::open(dir.path().join("lycoris.redb"))?;
+      let (identity, registry) = initialize_identity_and_registry(dir.path(), storage.node())?;
+      assert_eq!(identity.public_identity(), first_public);
+      assert_eq!(registry.records(), first_records);
+    }
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn overlay_restart_rejects_missing_and_foreign_identity_without_mutation() -> TestResult {
+    let dir = tempfile::TempDir::new()?;
+    let database = dir.path().join("lycoris.redb");
+    let identity_path = dir.path().join("node.identity");
+    let original_bytes;
+    let records;
+    {
+      let storage = lycoris_storage::Storage::open(&database)?;
+      let overlay = OverlayNode::start(dir.path(), storage.node().clone(), None, &[])?;
+      original_bytes = std::fs::read(&identity_path)?;
+      records = storage.node().authorization().records()?;
+      overlay.shutdown().await;
+    }
+
+    std::fs::remove_file(&identity_path)?;
+    {
+      let storage = lycoris_storage::Storage::open(&database)?;
+      assert!(matches!(
+        OverlayNode::start(dir.path(), storage.node().clone(), None, &[]),
+        Err(OverlayError::PersistedIdentityMissing)
+      ));
+      assert!(!identity_path.exists());
+      assert_eq!(storage.node().authorization().records()?, records);
+    }
+
+    NodeIdentity::generate().save(&identity_path)?;
+    {
+      let storage = lycoris_storage::Storage::open(&database)?;
+      assert!(matches!(
+        OverlayNode::start(dir.path(), storage.node().clone(), None, &[]),
+        Err(OverlayError::LocalIdentityNotActive(_))
+      ));
+      assert_eq!(storage.node().authorization().records()?, records);
+    }
+
+    lycoris_core::write_private_file(&identity_path, &original_bytes)?;
+    {
+      let storage = lycoris_storage::Storage::open(&database)?;
+      let overlay = OverlayNode::start(dir.path(), storage.node().clone(), None, &[])?;
+      assert_eq!(storage.node().authorization().records()?, records);
+      overlay.shutdown().await;
+    }
+    Ok(())
+  }
+
+  #[test]
+  fn empty_registry_reuses_an_existing_initial_identity() -> TestResult {
+    let dir = tempfile::TempDir::new()?;
     let identity = NodeIdentity::generate();
+    let path = dir.path().join("node.identity");
+    identity.save(&path)?;
+    let before = std::fs::read(&path)?;
+    let storage = lycoris_storage::Storage::open(dir.path().join("lycoris.redb"))?;
 
-    let created = load_or_create_registry(storage.node(), &identity)?;
-    assert_eq!(created.records().len(), 1);
+    let (loaded, registry) = initialize_identity_and_registry(dir.path(), storage.node())?;
 
-    let reloaded = load_or_create_registry(storage.node(), &NodeIdentity::generate())?;
-    assert_eq!(reloaded.cluster_id(), created.cluster_id());
-    assert_eq!(reloaded.records().len(), 1);
+    assert_eq!(loaded.public_identity(), identity.public_identity());
+    assert_eq!(std::fs::read(path)?, before);
+    assert_eq!(registry.records().len(), 1);
+    Ok(())
+  }
+
+  #[test]
+  fn empty_registry_rejects_a_successor_identity() -> TestResult {
+    let dir = tempfile::TempDir::new()?;
+    let initial = NodeIdentity::generate();
+    let successor =
+      NodeIdentity::generate_successor(initial.node_id(), initial.initial_public_key().to_vec())?;
+    successor.save(dir.path().join("node.identity"))?;
+    let storage = lycoris_storage::Storage::open(dir.path().join("lycoris.redb"))?;
+
+    assert!(matches!(
+      initialize_identity_and_registry(dir.path(), storage.node()),
+      Err(OverlayError::InitialIdentityRequired(node_id)) if node_id == initial.node_id()
+    ));
+    assert!(storage.node().authorization().records()?.is_empty());
+    Ok(())
+  }
+
+  #[test]
+  fn populated_registry_never_generates_a_missing_identity() -> TestResult {
+    let dir = tempfile::TempDir::new()?;
+    let identity = NodeIdentity::generate();
+    let (_, genesis) = AuthorizationRecord::genesis(&identity)?;
+    persist_records(dir.path(), std::slice::from_ref(&genesis))?;
+    let storage = lycoris_storage::Storage::open(dir.path().join("lycoris.redb"))?;
+    let before = storage.node().authorization().records()?;
+
+    assert!(matches!(
+      initialize_identity_and_registry(dir.path(), storage.node()),
+      Err(OverlayError::PersistedIdentityMissing)
+    ));
+    assert!(!dir.path().join("node.identity").exists());
+    assert_eq!(storage.node().authorization().records()?, before);
+    Ok(())
+  }
+
+  #[test]
+  fn populated_registry_rejects_foreign_and_corrupt_identity_without_mutation() -> TestResult {
+    let dir = tempfile::TempDir::new()?;
+    let authorized = NodeIdentity::generate();
+    let (_, genesis) = AuthorizationRecord::genesis(&authorized)?;
+    persist_records(dir.path(), std::slice::from_ref(&genesis))?;
+    let identity_path = dir.path().join("node.identity");
+    let foreign = NodeIdentity::generate();
+    foreign.save(&identity_path)?;
+    let foreign_bytes = std::fs::read(&identity_path)?;
+    let storage = lycoris_storage::Storage::open(dir.path().join("lycoris.redb"))?;
+    let records = storage.node().authorization().records()?;
+
+    assert!(matches!(
+      initialize_identity_and_registry(dir.path(), storage.node()),
+      Err(OverlayError::LocalIdentityNotActive(node_id)) if node_id == foreign.node_id()
+    ));
+    assert_eq!(std::fs::read(&identity_path)?, foreign_bytes);
+    assert_eq!(storage.node().authorization().records()?, records);
+
+    let corrupt = b"corrupt identity";
+    std::fs::write(&identity_path, corrupt)?;
+    assert!(matches!(
+      initialize_identity_and_registry(dir.path(), storage.node()),
+      Err(OverlayError::Identity(IdentityError::Serialization(_)))
+    ));
+    assert_eq!(std::fs::read(identity_path)?, corrupt);
+    assert_eq!(storage.node().authorization().records()?, records);
+    Ok(())
+  }
+
+  #[test]
+  fn stale_rotation_key_fails_and_active_successor_reopens() -> TestResult {
+    let dir = tempfile::TempDir::new()?;
+    let initial = NodeIdentity::generate();
+    let (_, genesis) = AuthorizationRecord::genesis(&initial)?;
+    let successor =
+      NodeIdentity::generate_successor(initial.node_id(), initial.initial_public_key().to_vec())?;
+    let rotation = AuthorizationRecord::rotate(&genesis, &genesis, &successor, &initial)?;
+    persist_records(dir.path(), &[genesis, rotation])?;
+    let identity_path = dir.path().join("node.identity");
+    initial.save(&identity_path)?;
+    let identity_bytes = std::fs::read(&identity_path)?;
+    let storage = lycoris_storage::Storage::open(dir.path().join("lycoris.redb"))?;
+    let records = storage.node().authorization().records()?;
+
+    assert!(matches!(
+      initialize_identity_and_registry(dir.path(), storage.node()),
+      Err(OverlayError::LocalIdentityMismatch(node_id)) if node_id == initial.node_id()
+    ));
+    assert_eq!(std::fs::read(&identity_path)?, identity_bytes);
+    assert_eq!(storage.node().authorization().records()?, records);
+
+    successor.save(&identity_path)?;
+    let (loaded, _) = initialize_identity_and_registry(dir.path(), storage.node())?;
+    assert_eq!(loaded.public_identity(), successor.public_identity());
+    Ok(())
+  }
+
+  #[test]
+  fn successor_identity_with_predecessor_registry_fails_without_mutation() -> TestResult {
+    let dir = tempfile::TempDir::new()?;
+    let initial = NodeIdentity::generate();
+    let (_, genesis) = AuthorizationRecord::genesis(&initial)?;
+    persist_records(dir.path(), std::slice::from_ref(&genesis))?;
+    let successor =
+      NodeIdentity::generate_successor(initial.node_id(), initial.initial_public_key().to_vec())?;
+    let identity_path = dir.path().join("node.identity");
+    successor.save(&identity_path)?;
+    let identity_bytes = std::fs::read(&identity_path)?;
+    let storage = lycoris_storage::Storage::open(dir.path().join("lycoris.redb"))?;
+    let records = storage.node().authorization().records()?;
+
+    assert!(matches!(
+      initialize_identity_and_registry(dir.path(), storage.node()),
+      Err(OverlayError::LocalIdentityMismatch(node_id)) if node_id == successor.node_id()
+    ));
+    assert_eq!(std::fs::read(identity_path)?, identity_bytes);
+    assert_eq!(storage.node().authorization().records()?, records);
+    Ok(())
+  }
+
+  #[test]
+  fn revoked_and_conflicted_local_lineages_fail_closed() -> TestResult {
+    let revoked_dir = tempfile::TempDir::new()?;
+    let identity = NodeIdentity::generate();
+    let (_, genesis) = AuthorizationRecord::genesis(&identity)?;
+    let revocation =
+      AuthorizationRecord::revoke(&genesis, &genesis, &genesis, &genesis, &identity)?;
+    persist_records(revoked_dir.path(), &[genesis.clone(), revocation])?;
+    let revoked_identity_path = revoked_dir.path().join("node.identity");
+    identity.save(&revoked_identity_path)?;
+    let revoked_identity_bytes = std::fs::read(&revoked_identity_path)?;
+    let revoked_storage = lycoris_storage::Storage::open(revoked_dir.path().join("lycoris.redb"))?;
+    let revoked_records = revoked_storage.node().authorization().records()?;
+    assert!(matches!(
+      initialize_identity_and_registry(revoked_dir.path(), revoked_storage.node()),
+      Err(OverlayError::LocalIdentityNotActive(node_id)) if node_id == identity.node_id()
+    ));
+    assert_eq!(
+      std::fs::read(revoked_identity_path)?,
+      revoked_identity_bytes
+    );
+    assert_eq!(
+      revoked_storage.node().authorization().records()?,
+      revoked_records
+    );
+
+    let conflicted_dir = tempfile::TempDir::new()?;
+    let first =
+      NodeIdentity::generate_successor(identity.node_id(), identity.initial_public_key().to_vec())?;
+    let second =
+      NodeIdentity::generate_successor(identity.node_id(), identity.initial_public_key().to_vec())?;
+    let first_rotation = AuthorizationRecord::rotate(&genesis, &genesis, &first, &identity)?;
+    let second_rotation = AuthorizationRecord::rotate(&genesis, &genesis, &second, &identity)?;
+    persist_records(
+      conflicted_dir.path(),
+      &[genesis, first_rotation, second_rotation],
+    )?;
+    let conflicted_identity_path = conflicted_dir.path().join("node.identity");
+    identity.save(&conflicted_identity_path)?;
+    let conflicted_identity_bytes = std::fs::read(&conflicted_identity_path)?;
+    let conflicted_storage =
+      lycoris_storage::Storage::open(conflicted_dir.path().join("lycoris.redb"))?;
+    let conflicted_records = conflicted_storage.node().authorization().records()?;
+    assert!(matches!(
+      initialize_identity_and_registry(conflicted_dir.path(), conflicted_storage.node()),
+      Err(OverlayError::LocalIdentityNotActive(node_id)) if node_id == identity.node_id()
+    ));
+    assert_eq!(
+      std::fs::read(conflicted_identity_path)?,
+      conflicted_identity_bytes
+    );
+    assert_eq!(
+      conflicted_storage.node().authorization().records()?,
+      conflicted_records
+    );
+    Ok(())
+  }
+
+  #[test]
+  fn duplicate_active_peer_id_fails_exact_local_binding_without_mutation() -> TestResult {
+    let dir = tempfile::TempDir::new()?;
+    let sponsor = NodeIdentity::generate();
+    let (cluster_id, sponsor_record) = AuthorizationRecord::genesis(&sponsor)?;
+    let original = NodeIdentity::generate();
+    let admission = AuthorizationRecord::admit(
+      cluster_id,
+      &original.public_identity(),
+      &sponsor_record,
+      &sponsor_record,
+      &sponsor,
+    )?;
+    let successor =
+      NodeIdentity::generate_successor(original.node_id(), original.initial_public_key().to_vec())?;
+    let rotation = AuthorizationRecord::rotate(&admission, &admission, &successor, &original)?;
+    let alias_key = successor.public_key_bytes();
+    let alias_node = NodeId::from_initial_public_key(&alias_key);
+    let alias = lycoris_overlay::PublicIdentity::new(
+      alias_node,
+      successor.peer_id_bytes(),
+      alias_key.clone(),
+      alias_key,
+    )?;
+    let alias_record =
+      AuthorizationRecord::admit(cluster_id, &alias, &sponsor_record, &admission, &sponsor)?;
+    persist_records(
+      dir.path(),
+      &[sponsor_record, admission, rotation, alias_record],
+    )?;
+    let identity_path = dir.path().join("node.identity");
+    successor.save(&identity_path)?;
+    let identity_bytes = std::fs::read(&identity_path)?;
+    let storage = lycoris_storage::Storage::open(dir.path().join("lycoris.redb"))?;
+    let records = storage.node().authorization().records()?;
+
+    assert!(matches!(
+      initialize_identity_and_registry(dir.path(), storage.node()),
+      Err(OverlayError::LocalIdentityMismatch(node_id)) if node_id == original.node_id()
+    ));
+    assert_eq!(std::fs::read(identity_path)?, identity_bytes);
+    assert_eq!(storage.node().authorization().records()?, records);
     Ok(())
   }
 

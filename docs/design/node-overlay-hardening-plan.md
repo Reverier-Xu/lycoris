@@ -58,10 +58,9 @@ QUIC and TCP links, mDNS/relay/DCUtR wiring, routed membership/resource/extensio
 messages, two-daemon convergence tests, and a release daemon exposing only
 `Cluster` and `Extension` gRPC services.
 
-Blocking findings are one-hop link-state propagation, best-effort non-atomic
-authorization publication, unauthorized relay access, non-resumable admission,
-fail-open counters, old gRPC/URL peer surfaces, stale process E2E, and the absence
-of a populated foreign-cluster merge transaction.
+Blocking findings are one-hop link-state propagation, unauthorized relay access,
+fail-open counters, old gRPC/URL peer surfaces, incomplete process acceptance,
+and the absence of a populated foreign-cluster merge transaction.
 
 ## Delivery protocol
 
@@ -86,9 +85,9 @@ require the Apple SDK, so source review on non-Apple hosts is not release
 evidence; the native `macos-latest` quality job and `aarch64-apple-darwin`
 release build must pass before the final push is accepted.
 
-Run Lens diagnostics on all edited files. Workflow changes additionally require
-`act`. Commit messages use gitmoji, lowercase imperative summaries, and list-form
-bodies. `.pi-subagents/` remains untracked.
+Workflow changes additionally require `act`. Commit messages use gitmoji,
+lowercase imperative summaries, and list-form bodies. `.pi-subagents/` remains
+untracked.
 
 ## Phase 1: restore authorization and routing invariants
 
@@ -117,7 +116,11 @@ Merge work is prohibited until this phase passes.
 - [ ] **1.3 bind persisted registry to local identity at startup.**
   - Never generate a new identity when authorization state already exists.
   - Require the local NodeId, PeerId, and current key to match one active record.
-  - Write identity files through fsync plus atomic rename.
+  - Publish identity files through synced atomic replacement and no-clobber first
+    publication.
+  - Keep this gate open until native Linux, macOS, and Windows tests pass on the
+    final candidate; do not claim universal power-loss guarantees for untested
+    filesystems.
 - [ ] **1.4 authorize relay and bound quarantine.**
   - Reject relay reservation and circuit use by unknown or inactive PeerIds.
   - Add quarantine TTL, per-peer request limits, bounded pending responses, and
@@ -295,7 +298,7 @@ All conditions are mandatory:
   are absent.
 - [ ] Daemon business code does not depend on client/tonic transport errors.
 - [ ] Real CLI E2E enforces the 10-second convergence deadline.
-- [ ] Fmt, Clippy, workspace tests, Linux musl, Lens, and applicable `act` runs pass.
+- [ ] Fmt, Clippy, workspace tests, Linux musl, and applicable `act` runs pass.
 - [ ] Native macOS and Windows GitHub CI and release builds pass for the final
   commit on `main`.
 - [ ] Worktree contains no untracked output except the intentionally retained
@@ -305,8 +308,9 @@ All conditions are mandatory:
 
 ## Immediate next step
 
-Implement **1.3 Bind persisted registry to local identity at startup**. Do not
-begin merge wire types or dual-plane routing before every Phase 1 gate passes.
+After native final-candidate CI completes **1.3**, implement **1.4 Authorize relay
+and bound quarantine**. Do not begin merge wire types or dual-plane routing
+before every Phase 1 gate passes.
 
 Verify this document remains actionable:
 
