@@ -362,7 +362,10 @@ async fn enroll_client(
   let adopted =
     AuthorizationRegistry::from_records(challenge.cluster_id(), outcome.records().to_vec())
       .unwrap();
-  handle.adopt_authorization(adopted).await.unwrap();
+  handle
+    .commit_adopt_authorization(adopted, || Ok::<(), std::io::Error>(()))
+    .await
+    .unwrap();
   challenge.cluster_id()
 }
 
@@ -608,5 +611,9 @@ async fn daemon_joins_an_existing_cluster_on_startup() {
     .unwrap();
 
   restarted_b.stop().await;
-  daemon_a.stop().await;
+  let a_dir = daemon_a.stop().await;
+  let reopened = Storage::open(a_dir.path().join("lycoris.redb")).unwrap();
+  let records = reopened.node().authorization().records().unwrap();
+  let registry = AuthorizationRegistry::from_records(cluster_id, records).unwrap();
+  assert!(registry.active_record_for_node(b_node).is_some());
 }

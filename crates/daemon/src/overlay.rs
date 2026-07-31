@@ -23,7 +23,7 @@ use lycoris_proto::node::{
   ExtensionForwardResponse, ExtensionInvokeRequest, NodeRequest, NodeResponse,
   SyncResourcesRequest, SyncResourcesResponse,
 };
-use lycoris_storage::NodeDomain;
+use lycoris_storage::{AuthorizationStorage, NodeDomain};
 use prost::Message as _;
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock};
@@ -33,6 +33,12 @@ use crate::overlay_transport::OverlayPool;
 const REGISTRY_REQUEST_TIMEOUT_MS: i64 = 5_000;
 const REGISTRY_REQUEST_HOPS: u8 = 0;
 const JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[derive(Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+enum RegistryResponse {
+  Applied(Vec<AuthorizationRecord>),
+  Rejected(String),
+}
 
 /// Handler for inbound membership-plane requests arriving over the overlay.
 /// Installed after `ClusterSync` is built (the sync layer implements it).
@@ -49,6 +55,68 @@ pub(crate) trait ResourceRequestHandler: Send + Sync {
 #[async_trait::async_trait]
 pub(crate) trait ExtensionRequestHandler: Send + Sync {
   async fn handle(&self, request: ExtensionInvokeRequest) -> ExtensionForwardResponse;
+}
+
+#[async_trait::async_trait]
+trait RegistryCommitter: Send + Sync {
+  async fn commit_registry(
+    &self, store: AuthorizationStorage, registry: AuthorizationRegistry, adopt: bool,
+  ) -> Result<(), LinkError>;
+}
+
+#[async_trait::async_trait]
+impl RegistryCommitter for LinkHandle {
+  async fn commit_registry(
+    &self, store: AuthorizationStorage, registry: AuthorizationRegistry, adopt: bool,
+  ) -> Result<(), LinkError> {
+    let records = registry.records();
+    let persist = move || store.replace(&records);
+    if adopt {
+      self.commit_adopt_authorization(registry, persist).await
+    } else {
+      self.commit_authorization(registry, persist).await
+    }
+  }
+}
+
+async fn commit_enrollment(
+  committer: &impl RegistryCommitter, store: AuthorizationStorage, current: &mut Enrollment,
+  proposed: Enrollment,
+) -> Result<(), OverlayError> {
+  committer
+    .commit_registry(store, proposed.registry().clone(), false)
+    .await?;
+  *current = proposed;
+  Ok(())
+}
+
+async fn merge_registry_checkpoint(
+  committer: &impl RegistryCommitter, store: AuthorizationStorage, current: &mut Enrollment,
+  records: Vec<AuthorizationRecord>,
+) -> (RegistryResponse, bool) {
+  let mut proposed = current.clone();
+  match proposed.merge_checkpoint(records) {
+    Ok(changed) if changed > 0 => {
+      match commit_enrollment(committer, store, current, proposed).await {
+        Ok(()) => (
+          RegistryResponse::Applied(current.registry().records()),
+          true,
+        ),
+        Err(error) => {
+          tracing::error!(%error, "failed to commit a registry checkpoint");
+          (
+            RegistryResponse::Rejected("authorization commit failed".to_string()),
+            false,
+          )
+        }
+      }
+    }
+    Ok(_) => (
+      RegistryResponse::Applied(current.registry().records()),
+      false,
+    ),
+    Err(error) => (RegistryResponse::Rejected(error.to_string()), false),
+  }
 }
 
 #[derive(Debug, Error)]
@@ -209,8 +277,12 @@ impl OverlayNode {
     };
     let registry =
       AuthorizationRegistry::from_records(challenge.cluster_id(), outcome.records().to_vec())?;
-    self.node.authorization().replace(&registry.records())?;
-    self.handle.adopt_authorization(registry.clone()).await?;
+    let records = registry.records();
+    let store = self.node.authorization().clone();
+    self
+      .handle
+      .commit_adopt_authorization(registry.clone(), move || store.replace(&records))
+      .await?;
     self.enrollment.lock().await.adopt_registry(registry);
     Ok(())
   }
@@ -304,16 +376,27 @@ impl OverlayNode {
             AdmissionResponse::Challenge,
           ),
         AdmissionRequest::Prove(proof) => {
-          match enrollment.enroll_with_join_key(&proof, &inbound.sender, &self.identity) {
+          let mut proposed = enrollment.clone();
+          match proposed.enroll_with_join_key(&proof, &inbound.sender, &self.identity) {
             Ok(outcome) => {
-              let registry = enrollment.registry().clone();
               let admitted = outcome.record().clone();
               let records = outcome.records().to_vec();
-              drop(enrollment);
-              self.apply_registry(registry).await;
-              AdmissionResponse::Admitted(Box::new(lycoris_overlay::AdmissionOutcome::new(
-                admitted, records,
-              )))
+              match commit_enrollment(
+                &self.handle,
+                self.node.authorization().clone(),
+                &mut enrollment,
+                proposed,
+              )
+              .await
+              {
+                Ok(()) => AdmissionResponse::Admitted(Box::new(
+                  lycoris_overlay::AdmissionOutcome::new(admitted, records),
+                )),
+                Err(error) => {
+                  tracing::error!(%error, "failed to commit an admission checkpoint");
+                  AdmissionResponse::Rejected("authorization commit failed".to_string())
+                }
+              }
             }
             Err(error) => AdmissionResponse::Rejected(error.to_string()),
           }
@@ -405,44 +488,29 @@ impl OverlayNode {
     {
       Ok(records) => records,
       Err(error) => {
-        tracing::debug!(%error, "dropping a malformed registry checkpoint");
+        tracing::debug!(%error, "rejecting a malformed registry checkpoint");
+        self
+          .send_reply(
+            &inbound,
+            &RegistryResponse::Rejected("malformed registry checkpoint".to_string()),
+          )
+          .await;
         return;
       }
     };
-    let changed = {
+    let (response, changed) = {
       let mut enrollment = self.enrollment.lock().await;
-      match enrollment.merge_checkpoint(records) {
-        Ok(changed) => {
-          let registry = enrollment.registry().clone();
-          drop(enrollment);
-          if changed > 0 {
-            self.apply_registry(registry).await;
-          }
-          changed
-        }
-        Err(error) => {
-          tracing::debug!(%error, "rejected a registry checkpoint");
-          0
-        }
-      }
+      merge_registry_checkpoint(
+        &self.handle,
+        self.node.authorization().clone(),
+        &mut enrollment,
+        records,
+      )
+      .await
     };
-    let registry = self.enrollment.lock().await.registry().clone();
-    self.send_reply(&inbound, &registry.records()).await;
-    if changed > 0 {
+    self.send_reply(&inbound, &response).await;
+    if changed {
       self.broadcast_checkpoint().await;
-    }
-  }
-
-  /// Persist a registry mutation, push it into the link actor, and let the
-  /// actor promote any quarantined connections the mutation authorizes.
-  async fn apply_registry(&self, registry: AuthorizationRegistry) {
-    for record in registry.records() {
-      if let Err(error) = self.node.authorization().put(&record) {
-        tracing::warn!(%error, "failed to persist an authorization record");
-      }
-    }
-    if let Err(error) = self.handle.set_authorization(registry).await {
-      tracing::warn!(%error, "failed to apply an authorization registry");
     }
   }
 
@@ -474,34 +542,27 @@ impl OverlayNode {
       tokio::spawn(async move {
         match handle.request(envelope).await {
           Ok(response) => {
-            let records = match postcard::from_bytes::<Vec<AuthorizationRecord>>(response.payload())
-            {
-              Ok(records) => records,
+            let records = match postcard::from_bytes::<RegistryResponse>(response.payload()) {
+              Ok(RegistryResponse::Applied(records)) => records,
+              Ok(RegistryResponse::Rejected(reason)) => {
+                tracing::warn!(%destination, %reason, "peer rejected a registry checkpoint");
+                return;
+              }
               Err(error) => {
                 tracing::debug!(%error, "ignoring a malformed registry reply");
                 return;
               }
             };
-            let merged = {
-              let mut enrollment = enrollment.lock().await;
-              enrollment.merge_checkpoint(records)
-            };
-            match merged {
-              Ok(changed) if changed > 0 => {
-                let registry = enrollment.lock().await.registry().clone();
-                for record in registry.records() {
-                  if let Err(error) = node.authorization().put(&record) {
-                    tracing::warn!(%error, "failed to persist an authorization record");
-                  }
-                }
-                if let Err(error) = handle.set_authorization(registry).await {
-                  tracing::warn!(%error, "failed to apply an authorization registry");
-                }
-              }
-              Ok(_) => {}
-              Err(error) => {
-                tracing::debug!(%error, "rejected a registry reply");
-              }
+            let mut enrollment = enrollment.lock().await;
+            let (result, _) = merge_registry_checkpoint(
+              &handle,
+              node.authorization().clone(),
+              &mut enrollment,
+              records,
+            )
+            .await;
+            if let RegistryResponse::Rejected(reason) = result {
+              tracing::error!(%destination, %reason, "failed to merge a registry reply");
             }
           }
           Err(error) => {
@@ -600,9 +661,175 @@ fn now_unix_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
+  use std::sync::atomic::{AtomicBool, Ordering};
+
   use super::*;
 
+  #[derive(Debug)]
+  struct TestRegistryCommitter {
+    called: AtomicBool,
+    fail: bool,
+  }
+
+  #[async_trait::async_trait]
+  impl RegistryCommitter for TestRegistryCommitter {
+    async fn commit_registry(
+      &self, _store: AuthorizationStorage, _registry: AuthorizationRegistry, adopt: bool,
+    ) -> Result<(), LinkError> {
+      assert!(!adopt);
+      self.called.store(true, Ordering::SeqCst);
+      if self.fail {
+        return Err(LinkError::AuthorizationCommit(
+          "injected commit failure".to_string(),
+        ));
+      }
+      Ok(())
+    }
+  }
+
+  fn test_enrollments() -> TestResult<(Enrollment, Enrollment)> {
+    let sponsor = NodeIdentity::generate();
+    let (cluster_id, genesis) = AuthorizationRecord::genesis(&sponsor)?;
+    let current_registry = AuthorizationRegistry::from_records(cluster_id, vec![genesis.clone()])?;
+    let member = NodeIdentity::generate();
+    let admission = AuthorizationRecord::admit(
+      cluster_id,
+      &member.public_identity(),
+      &genesis,
+      &genesis,
+      &sponsor,
+    )?;
+    let proposed_registry =
+      AuthorizationRegistry::from_records(cluster_id, vec![genesis, admission])?;
+    Ok((
+      Enrollment::new(current_registry, None),
+      Enrollment::new(proposed_registry, None),
+    ))
+  }
+
   type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+  #[tokio::test]
+  async fn registry_commit_failure_keeps_the_current_enrollment() -> TestResult {
+    let dir = tempfile::TempDir::new()?;
+    let storage = lycoris_storage::Storage::open(dir.path().join("lycoris.redb"))?;
+    let committer = TestRegistryCommitter {
+      called: AtomicBool::new(false),
+      fail: true,
+    };
+    let (mut current, proposed) = test_enrollments()?;
+
+    let result = commit_enrollment(
+      &committer,
+      storage.node().authorization().clone(),
+      &mut current,
+      proposed,
+    )
+    .await;
+
+    assert!(matches!(
+      result,
+      Err(OverlayError::Link(LinkError::AuthorizationCommit(_)))
+    ));
+    assert_eq!(current.registry().records().len(), 1);
+    assert!(committer.called.load(Ordering::SeqCst));
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn registry_commit_success_adopts_the_proposal() -> TestResult {
+    let dir = tempfile::TempDir::new()?;
+    let storage = lycoris_storage::Storage::open(dir.path().join("lycoris.redb"))?;
+    let committer = TestRegistryCommitter {
+      called: AtomicBool::new(false),
+      fail: false,
+    };
+    let (mut current, proposed) = test_enrollments()?;
+
+    commit_enrollment(
+      &committer,
+      storage.node().authorization().clone(),
+      &mut current,
+      proposed,
+    )
+    .await?;
+
+    assert_eq!(current.registry().records().len(), 2);
+    assert!(committer.called.load(Ordering::SeqCst));
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn registry_checkpoint_commit_failure_returns_rejection() -> TestResult {
+    let dir = tempfile::TempDir::new()?;
+    let storage = lycoris_storage::Storage::open(dir.path().join("lycoris.redb"))?;
+    let committer = TestRegistryCommitter {
+      called: AtomicBool::new(false),
+      fail: true,
+    };
+    let (mut current, proposed) = test_enrollments()?;
+
+    let (response, changed) = merge_registry_checkpoint(
+      &committer,
+      storage.node().authorization().clone(),
+      &mut current,
+      proposed.registry().records(),
+    )
+    .await;
+
+    assert_eq!(
+      response,
+      RegistryResponse::Rejected("authorization commit failed".to_string())
+    );
+    assert!(!changed);
+    assert_eq!(current.registry().records().len(), 1);
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn foreign_registry_checkpoint_is_rejected_before_commit() -> TestResult {
+    let dir = tempfile::TempDir::new()?;
+    let storage = lycoris_storage::Storage::open(dir.path().join("lycoris.redb"))?;
+    let committer = TestRegistryCommitter {
+      called: AtomicBool::new(false),
+      fail: false,
+    };
+    let (mut current, _) = test_enrollments()?;
+    let foreign = test_registry_for_identity(&NodeIdentity::generate())?;
+
+    let (response, changed) = merge_registry_checkpoint(
+      &committer,
+      storage.node().authorization().clone(),
+      &mut current,
+      foreign.records(),
+    )
+    .await;
+
+    assert!(matches!(response, RegistryResponse::Rejected(_)));
+    assert!(!changed);
+    assert!(!committer.called.load(Ordering::SeqCst));
+    assert_eq!(current.registry().records().len(), 1);
+    Ok(())
+  }
+
+  #[test]
+  fn registry_rejection_round_trips_on_the_wire() -> TestResult {
+    let rejected = RegistryResponse::Rejected("malformed registry checkpoint".to_string());
+    let encoded = postcard::to_stdvec(&rejected)?;
+    assert_eq!(
+      postcard::from_bytes::<RegistryResponse>(&encoded)?,
+      rejected
+    );
+    Ok(())
+  }
+
+  fn test_registry_for_identity(identity: &NodeIdentity) -> TestResult<AuthorizationRegistry> {
+    let (cluster_id, genesis) = AuthorizationRecord::genesis(identity)?;
+    Ok(AuthorizationRegistry::from_records(
+      cluster_id,
+      vec![genesis],
+    )?)
+  }
 
   #[test]
   fn registry_is_created_once_and_reloaded() -> TestResult {

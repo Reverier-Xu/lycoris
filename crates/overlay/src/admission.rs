@@ -161,7 +161,7 @@ pub enum AdmissionResponse {
   Rejected(String),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Enrollment {
   registry: AuthorizationRegistry,
   join_key: Option<ClusterKey>,

@@ -129,23 +129,48 @@ impl LinkHandle {
     self.inbound.lock().await.recv().await
   }
 
-  /// Replace the authorization registry unconditionally. This is the
-  /// enrollment adoption path: a freshly admitted node exchanges its
-  /// standalone genesis registry for the sponsor's cluster checkpoint.
-  pub async fn adopt_authorization(
-    &self, registry: AuthorizationRegistry,
-  ) -> Result<(), LinkError> {
-    let (reply, response) = oneshot::channel();
+  /// Validate, durably persist, and install a same-cluster authorization
+  /// checkpoint in one actor turn. No swarm event can observe a registry
+  /// between the persistence and installation steps.
+  pub async fn commit_authorization<F, E>(
+    &self, registry: AuthorizationRegistry, persist: F,
+  ) -> Result<(), LinkError>
+  where
+    F: FnOnce() -> Result<(), E> + Send + 'static,
+    E: std::fmt::Display, {
     self
-      .send(LinkCommand::AdoptAuthorization { registry, reply })
-      .await?;
-    response.await.map_err(|_| LinkError::ActorStopped)?
+      .commit_authorization_inner(registry, true, persist)
+      .await
   }
 
-  pub async fn set_authorization(&self, registry: AuthorizationRegistry) -> Result<(), LinkError> {
-    let (reply, response) = oneshot::channel();
+  /// Commit a foreign checkpoint when a solo node adopts its sponsor's
+  /// cluster during initial enrollment.
+  pub async fn commit_adopt_authorization<F, E>(
+    &self, registry: AuthorizationRegistry, persist: F,
+  ) -> Result<(), LinkError>
+  where
+    F: FnOnce() -> Result<(), E> + Send + 'static,
+    E: std::fmt::Display, {
     self
-      .send(LinkCommand::SetAuthorization { registry, reply })
+      .commit_authorization_inner(registry, false, persist)
+      .await
+  }
+
+  async fn commit_authorization_inner<F, E>(
+    &self, registry: AuthorizationRegistry, check_cluster: bool, persist: F,
+  ) -> Result<(), LinkError>
+  where
+    F: FnOnce() -> Result<(), E> + Send + 'static,
+    E: std::fmt::Display, {
+    let (reply, response) = oneshot::channel();
+    let persist = Box::new(move || persist().map_err(|error| error.to_string()));
+    self
+      .send(LinkCommand::CommitAuthorization {
+        registry,
+        check_cluster,
+        persist,
+        reply,
+      })
       .await?;
     response.await.map_err(|_| LinkError::ActorStopped)?
   }
@@ -220,7 +245,8 @@ impl LinkHandle {
   }
 }
 
-#[derive(Debug)]
+pub(crate) type AuthorizationCommit = Box<dyn FnOnce() -> Result<(), String> + Send>;
+
 pub(crate) enum LinkCommand {
   Request {
     envelope: Envelope,
@@ -249,12 +275,10 @@ pub(crate) enum LinkCommand {
     node_id: NodeId,
     reply: oneshot::Sender<Result<(), LinkError>>,
   },
-  SetAuthorization {
+  CommitAuthorization {
     registry: AuthorizationRegistry,
-    reply: oneshot::Sender<Result<(), LinkError>>,
-  },
-  AdoptAuthorization {
-    registry: AuthorizationRegistry,
+    check_cluster: bool,
+    persist: AuthorizationCommit,
     reply: oneshot::Sender<Result<(), LinkError>>,
   },
   Shutdown {
@@ -278,6 +302,8 @@ pub enum LinkError {
   UnknownInbound,
   #[error("link state did not reach the requested condition before the deadline")]
   Timeout,
+  #[error("authorization checkpoint commit failed: {0}")]
+  AuthorizationCommit(String),
   #[error(transparent)]
   Authorization(#[from] AuthorizationError),
   #[error("link actor task failed: {0}")]

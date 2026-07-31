@@ -84,7 +84,7 @@ bodies. `.pi-subagents/` remains untracked.
 
 Merge work is prohibited until this phase passes.
 
-- [ ] **1.1 Commit authorization checkpoints atomically.**
+- [x] **1.1 Commit authorization checkpoints atomically.**
   - Build and validate a prospective registry without mutating the live one.
   - Replace the complete redb table in one transaction.
   - Publish the committed registry to the link actor, then adopt it in

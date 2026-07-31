@@ -1,4 +1,10 @@
-use std::time::Duration;
+use std::{
+  sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+  },
+  time::Duration,
+};
 
 use libp2p::{Multiaddr, multiaddr::Protocol};
 
@@ -46,6 +52,27 @@ async fn dropping_runtime_stops_its_actor() {
   })
   .await;
   assert!(observed.is_ok(), "runtime drop did not stop the actor");
+}
+
+#[tokio::test]
+async fn stopped_actor_never_executes_authorization_persistence() {
+  let identity = NodeIdentity::generate();
+  let registry = single_registry(&identity);
+  let runtime = start_tcp(&identity, registry.clone());
+  let handle = runtime.handle();
+  runtime.shutdown().await.unwrap();
+  let persisted = Arc::new(AtomicBool::new(false));
+  let persisted_for_commit = persisted.clone();
+
+  let result = handle
+    .commit_authorization(registry, move || {
+      persisted_for_commit.store(true, Ordering::SeqCst);
+      Ok::<(), std::io::Error>(())
+    })
+    .await;
+
+  assert!(matches!(result, Err(LinkError::ActorStopped)));
+  assert!(!persisted.load(Ordering::SeqCst));
 }
 
 #[tokio::test]
@@ -141,10 +168,16 @@ async fn revoking_authorization_closes_the_existing_link() {
     [first_record, second_record, revocation],
   )
   .unwrap();
+  let persisted = Arc::new(AtomicBool::new(false));
+  let persisted_for_commit = persisted.clone();
   first_handle
-    .set_authorization(revoked_registry)
+    .commit_authorization(revoked_registry, move || {
+      persisted_for_commit.store(true, Ordering::SeqCst);
+      Ok::<(), std::io::Error>(())
+    })
     .await
     .unwrap();
+  assert!(persisted.load(Ordering::SeqCst));
 
   wait_for_disconnected(&first_handle, second_node).await;
   assert!(matches!(
@@ -156,6 +189,69 @@ async fn revoking_authorization_closes_the_existing_link() {
 
   second.shutdown().await.unwrap();
   first.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_authorization_commit_keeps_the_current_registry() {
+  let (first_identity, second_identity, first_record, second_record, registry) = authorized_pair();
+  let runtime = start_tcp(&first_identity, registry);
+  let handle = runtime.handle();
+  let revocation = AuthorizationRecord::revoke(
+    &second_record,
+    &second_record,
+    &first_record,
+    &second_record,
+    &first_identity,
+  )
+  .unwrap();
+  let revoked_registry = AuthorizationRegistry::from_records(
+    first_record.cluster_id(),
+    [first_record, second_record, revocation],
+  )
+  .unwrap();
+
+  let result = handle
+    .commit_authorization(revoked_registry, || {
+      Err::<(), _>(std::io::Error::other("injected commit failure"))
+    })
+    .await;
+
+  assert!(matches!(result, Err(LinkError::AuthorizationCommit(_))));
+  let dial = handle
+    .dial(
+      second_identity.node_id(),
+      "/ip4/127.0.0.1/tcp/1".parse().unwrap(),
+    )
+    .await;
+  assert!(!matches!(dial, Err(LinkError::UnauthorizedNode(_))));
+  runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn foreign_authorization_is_rejected_before_persistence() {
+  let identity = NodeIdentity::generate();
+  let runtime = start_tcp(&identity, single_registry(&identity));
+  let handle = runtime.handle();
+  let foreign_identity = NodeIdentity::generate();
+  let foreign_registry = single_registry(&foreign_identity);
+  let persisted = Arc::new(AtomicBool::new(false));
+  let persisted_for_commit = persisted.clone();
+
+  let result = handle
+    .commit_authorization(foreign_registry, move || {
+      persisted_for_commit.store(true, Ordering::SeqCst);
+      Ok::<(), std::io::Error>(())
+    })
+    .await;
+
+  assert!(matches!(
+    result,
+    Err(LinkError::Authorization(
+      crate::AuthorizationError::ForeignCluster { .. }
+    ))
+  ));
+  assert!(!persisted.load(Ordering::SeqCst));
+  runtime.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -456,7 +552,9 @@ async fn quarantined_peers_enroll_and_promote_to_a_logical_edge() {
               let admitted = outcome.record().clone();
               let records = outcome.records().to_vec();
               responder_handle
-                .set_authorization(enrollment.registry().clone())
+                .commit_authorization(enrollment.registry().clone(), || {
+                  Ok::<(), std::io::Error>(())
+                })
                 .await
                 .unwrap();
               AdmissionResponse::Admitted(Box::new(AdmissionOutcome::new(admitted, records)))
@@ -528,7 +626,10 @@ async fn quarantined_peers_enroll_and_promote_to_a_logical_edge() {
   assert_eq!(outcome.record().node_id(), joiner_identity.node_id());
   let adopted =
     AuthorizationRegistry::from_records(cluster_id, outcome.records().to_vec()).unwrap();
-  joiner_handle.adopt_authorization(adopted).await.unwrap();
+  joiner_handle
+    .commit_adopt_authorization(adopted, || Ok::<(), std::io::Error>(()))
+    .await
+    .unwrap();
 
   sponsor_handle
     .wait_connected(joiner_identity.node_id(), WAIT)

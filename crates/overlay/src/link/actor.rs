@@ -208,13 +208,16 @@ impl LinkActor {
         let _ = reply.send(result);
         false
       }
-      LinkCommand::SetAuthorization { registry, reply } => {
-        let result = self.set_authorization(registry, true);
-        let _ = reply.send(result);
-        false
-      }
-      LinkCommand::AdoptAuthorization { registry, reply } => {
-        let result = self.set_authorization(registry, false);
+      LinkCommand::CommitAuthorization {
+        registry,
+        check_cluster,
+        persist,
+        reply,
+      } => {
+        let result = self
+          .validate_authorization(&registry, check_cluster)
+          .and_then(|()| persist().map_err(LinkError::AuthorizationCommit))
+          .map(|()| self.install_authorization(registry));
         let _ = reply.send(result);
         false
       }
@@ -667,8 +670,8 @@ impl LinkActor {
     RequestId::derive(self.state.node_id, nonce)
   }
 
-  fn set_authorization(
-    &mut self, registry: AuthorizationRegistry, check_cluster: bool,
+  fn validate_authorization(
+    &self, registry: &AuthorizationRegistry, check_cluster: bool,
   ) -> Result<(), LinkError> {
     if check_cluster && registry.cluster_id() != self.state.authorization.cluster_id() {
       return Err(
@@ -679,6 +682,10 @@ impl LinkActor {
         .into(),
       );
     }
+    Ok(())
+  }
+
+  fn install_authorization(&mut self, registry: AuthorizationRegistry) {
     self.state.authorization = registry;
     let authorization = self.state.authorization.clone();
     self
@@ -732,7 +739,6 @@ impl LinkActor {
     }
     self.snapshot_tx.send_replace(self.state.snapshot());
     self.advertise_link_state();
-    Ok(())
   }
 
   fn handle_event(&mut self, event: SwarmEvent<LinkBehaviourEvent>) {
